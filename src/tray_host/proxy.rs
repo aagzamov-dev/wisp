@@ -73,13 +73,16 @@ pub(super) fn run(shared: Arc<Shared>, ready: mpsc::Sender<Result<usize, String>
     match setup(shared) {
         Ok(host) => {
             let control = host.control.0 as usize;
+            let ready_for_icons = host.outranked == 0;
             HOST.with(|h| *h.borrow_mut() = Some(host));
             // The dock gave up waiting; don't leave a proxy nobody owns.
             if ready.send(Ok(control)).is_err() {
                 teardown();
                 return;
             }
-            refresh_icons();
+            if ready_for_icons {
+                refresh_icons();
+            }
             pump();
         }
         Err(message) => {
@@ -341,10 +344,20 @@ impl Host {
             Ok(()) => {
                 eprintln!("Tray host: attached to the new Explorer");
                 // Apps re-added their icons straight to the new Explorer.
-                refresh_icons();
+                if self.outranked == 0 {
+                    refresh_icons();
+                }
             }
             Err(message) => eprintln!("Tray host: {message}"),
         }
+    }
+
+    fn tray_reclaimed(&mut self) {
+        // Apps that added icons while Explorer had priority need to send them again.
+        if self.outranked >= OUTRANKED_REFRESH {
+            refresh_icons();
+        }
+        self.outranked = 0;
     }
 
     fn check(&mut self) {
@@ -369,12 +382,7 @@ impl Host {
                     }
                     self.outranked += 1;
                 } else {
-                    // Apps that added icons meanwhile reached Explorer. Only
-                    // for long spells: brief ones come and go with flyouts.
-                    if self.outranked >= OUTRANKED_REFRESH {
-                        refresh_icons();
-                    }
-                    self.outranked = 0;
+                    self.tray_reclaimed();
                 }
             }
             None => {
@@ -633,7 +641,9 @@ fn reg_binary(key: HKEY, sub: PCWSTR, value: PCWSTR) -> Vec<u8> {
 unsafe extern "system" fn control_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_OUTRANK => with_host(|host| {
-            host.outrank();
+            if host.outrank() && host.outranked >= OUTRANKED_REFRESH {
+                host.tray_reclaimed();
+            }
         }),
         WM_TIMER if wp.0 == CHECK_TIMER => with_host(Host::check),
         WM_TIMER if wp.0 == SETTINGS_TIMER => {

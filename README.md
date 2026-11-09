@@ -52,7 +52,7 @@ The dock appears when the pointer touches the bottom edge of a screen, and hides
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |
 | Right-click **⌄** | Show the taskbar, or open taskbar settings |
-| Click the volume | Mute or unmute |
+| Click the volume | Open Sound with a volume slider and mute control |
 | Scroll over the volume | Change the volume |
 | Right-click the volume | Open sound settings |
 | Click the clock | Open notifications and the calendar |
@@ -122,7 +122,10 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `dock` | `true` | Shows the dock |
 | `dock_autohide` | `true` | Hides the dock until the pointer touches the bottom edge. `false` keeps it visible. |
 | `window_list` | `"multiple"` | `"multiple"` lists an app's windows when it has more than one; `"always"` or `"off"` |
-| `dock_icon_size` | `32` | App icon size in the dock, 24–40 DIP. The dock's height, spacing and status area scale with it. |
+| `dock_icon_size` | `24` | App icon size in the dock, 24–40 DIP. The dock's height, spacing and status area scale with it. |
+| `dock_open_ms` | `180` | Dock opening animation time, 0–500 ms. |
+| `dock_close_ms` | `140` | Dock closing animation time, 0–500 ms. |
+| `dock_fade` | `true` | Fade icons and status during dock motion. |
 | `hide_taskbar` | `true` | Hides the Windows taskbar while Wisp runs |
 | `position` | `"bottom"` | `"bottom"` grows the launcher from the dock; `"center"` opens it in the middle |
 | `theme` | `"system"` | `"system"`, `"dark"` or `"light"` |

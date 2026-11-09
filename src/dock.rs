@@ -54,6 +54,7 @@ const WM_TRAY_CHANGED: u32 = WM_APP + 22;
 /// dock lacks.
 pub const WM_DOCK_SHOW_TASKBAR: u32 = WM_APP + 23;
 const WM_CLOSE_FLYOUT: u32 = WM_APP + 24;
+pub const WM_SHOW_SOUND: u32 = WM_APP + 25;
 /// Shows a notification icon's tooltip after a short hover.
 const TIP_TIMER: usize = 104;
 const TIP_MS: u32 = 450;
@@ -73,7 +74,6 @@ const POLL_MS: u32 = 100;
 const HIDE_AFTER: u8 = 5;
 /// Steps the slide-in animation.
 const SLIDE_TIMER: usize = 103;
-const SLIDE_MS: f32 = 180.0;
 const HOVER_TIMER: usize = 105;
 const HOVER_MS: f32 = 110.0;
 /// Hides the desktop pill after a scroll.
@@ -125,6 +125,10 @@ struct State {
     slide: Option<Instant>,
     slide_from: f32,
     slide_to: f32,
+    slide_ms: u32,
+    open_ms: u32,
+    close_ms: u32,
+    fade: bool,
     hover_levels: Vec<f32>,
     hover_tick: Option<Instant>,
     /// Wheel delta over the volume not yet spent on a whole percent.
@@ -219,6 +223,10 @@ impl Dock {
             slide: None,
             slide_from: 0.0,
             slide_to: 0.0,
+            slide_ms: 0,
+            open_ms: 180,
+            close_ms: 140,
+            fade: true,
             hover_levels: Vec::new(),
             hover_tick: None,
             wheel: 0,
@@ -505,6 +513,13 @@ impl Dock {
         }
     }
 
+    pub fn set_animation(&mut self, open_ms: u32, close_ms: u32, fade: bool) {
+        let mut s = self.state.borrow_mut();
+        s.open_ms = open_ms;
+        s.close_ms = close_ms;
+        s.fade = fade;
+    }
+
     pub fn refresh(&mut self) {
         self.state.borrow_mut().refresh();
     }
@@ -674,6 +689,7 @@ impl State {
     fn paint(&mut self, rt: Option<&windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget>) -> Result<()> {
         let hwnd = self.hwnd;
         let parts = self.parts();
+        let opacity = if self.fade { 1.0 - self.slide_value() } else { 1.0 };
         let State {
             renderer,
             items,
@@ -693,6 +709,7 @@ impl State {
             ..
         } = self;
         let frame = &render::Frame {
+            opacity,
             dpi: *dpi,
             palette,
             items,
@@ -921,7 +938,7 @@ impl State {
         logic::slide_value(
             self.slide_from,
             self.slide_to,
-            start.elapsed().as_secs_f32() * 1000.0 / crate::util::perf::slowdown() / SLIDE_MS,
+            start.elapsed().as_secs_f32() * 1000.0 / crate::util::perf::slowdown() / self.slide_ms as f32,
         )
     }
 
@@ -932,7 +949,17 @@ impl State {
         crate::util::perf::event("slide_begin");
         self.slide_from = self.slide_value();
         self.slide_to = to;
-        self.slide = Some(Instant::now());
+        self.slide_ms = if to > 0.5 { self.close_ms } else { self.open_ms };
+        self.slide = (self.slide_ms > 0).then(Instant::now);
+        if self.slide.is_none() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
+                if !self.revealed {
+                    let _ = ShowWindow(self.hwnd, SW_HIDE);
+                }
+            }
+            return;
+        }
         if !self.frame_paced {
             unsafe {
                 SetTimer(Some(self.hwnd), SLIDE_TIMER, 10, None);
@@ -964,20 +991,22 @@ impl State {
         unsafe {
             let _ = GetWindowRect(self.hwnd, &mut rect);
             let offset = self.slide_offset(rect.bottom - rect.top);
-            let _ = SetWindowPos(
-                self.hwnd,
-                None,
-                rect.left,
-                self.top + offset,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            self.publish_rects();
-            if self
-                .slide
-                .is_some_and(|start| start.elapsed().as_secs_f32() * 1000.0 / crate::util::perf::slowdown() >= SLIDE_MS)
-            {
+            if rect.top != self.top + offset {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    rect.left,
+                    self.top + offset,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                self.publish_rects();
+            }
+            if self.fade {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+            if elapsed / f64::from(crate::util::perf::slowdown()) >= f64::from(self.slide_ms) {
                 self.slide = None;
                 let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
                 if !self.revealed {
@@ -1223,7 +1252,7 @@ impl State {
         if stale {
             self.hide_tip();
         }
-        if self.tray_host.is_none() {
+        if self.tray.is_empty() {
             self.close_flyout();
         }
         self.place();
@@ -1268,6 +1297,9 @@ impl State {
     }
 
     fn open_flyout(&mut self) {
+        if self.tray.is_empty() {
+            return;
+        }
         self.hide_tip();
         self.hide_windows();
         self.flyout_open = true;
@@ -1694,7 +1726,7 @@ impl State {
         )
     }
 
-    /// The speaker toggles mute; the clock opens the calendar and notifications;
+    /// The speaker opens Sound; the clock opens the calendar and notifications;
     /// the battery opens its settings. The chevron toggles the flyout, and
     /// notification icons get the click.
     fn click_part(&mut self, part: logic::Part) {
@@ -1708,12 +1740,9 @@ impl State {
                 return;
             }
             logic::Part::Volume => {
-                if let Some(volume) = self.status.volume
-                    && let Err(error) = crate::commands::audio::set_mute(!volume.muted)
-                {
-                    eprintln!("Dock mute: {error}");
+                unsafe {
+                    let _ = PostMessageW(Some(self.owner), WM_SHOW_SOUND, WPARAM(0), LPARAM(0));
                 }
-                self.update_status();
                 return;
             }
             logic::Part::Clock => "ms-actioncenter:",

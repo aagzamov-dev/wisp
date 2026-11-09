@@ -6,6 +6,9 @@ keywords = ["sound", "audio", "mixer", "volume mixer", "app volume"]
 kind = "volume"
 
 [[part]]
+kind = "mute"
+
+[[part]]
 kind = "outputs"
 
 [[part]]

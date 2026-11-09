@@ -23,6 +23,9 @@ pub struct Config {
     pub dock: bool,
     pub dock_autohide: bool,
     pub dock_icon_size: i64,
+    pub dock_open_ms: i64,
+    pub dock_close_ms: i64,
+    pub dock_fade: bool,
     pub hide_taskbar: bool,
     pub window_list: String,
 }
@@ -62,6 +65,13 @@ impl Config {
             .filter(|value| *value >= 0)
             .ok_or("dock_icon_size must be a positive whole number of DIP.")?
             .clamp(24, 40);
+        let duration = |key| {
+            get(key)
+                .as_integer()
+                .filter(|value| (0..=i64::from(u32::MAX)).contains(value))
+                .map(|value| value.min(500))
+                .ok_or_else(|| format!("{key} must be a non-negative whole number of milliseconds."))
+        };
         let max_results = get("max_results")
             .as_integer()
             .filter(|value| *value >= 0)
@@ -90,6 +100,9 @@ impl Config {
             dock: boolean("dock")?,
             dock_autohide: boolean("dock_autohide")?,
             dock_icon_size,
+            dock_open_ms: duration("dock_open_ms")?,
+            dock_close_ms: duration("dock_close_ms")?,
+            dock_fade: boolean("dock_fade")?,
             hide_taskbar: boolean("hide_taskbar")?,
             window_list,
         })
@@ -198,6 +211,9 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         "dock_icon_size" if !value.as_integer().is_some_and(|size| (24..=40).contains(&size)) => {
             return Err("Choose an app icon size between 24 and 40 DIP.".into());
         }
+        "dock_open_ms" | "dock_close_ms" if !value.as_integer().is_some_and(|ms| (0..=500).contains(&ms)) => {
+            return Err("Choose an animation time between 0 and 500 ms.".into());
+        }
         "theme"
         | "backdrop"
         | "max_results"
@@ -208,6 +224,9 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         | "dock"
         | "dock_autohide"
         | "dock_icon_size"
+        | "dock_open_ms"
+        | "dock_close_ms"
+        | "dock_fade"
         | "hide_taskbar" => {}
         "window_list" if !matches!(value.as_str(), Some("always" | "multiple" | "off")) => {
             return Err("window_list must be always, multiple or off.".into());
@@ -233,7 +252,11 @@ mod tests {
         assert_eq!(config.file_search_exclude.len(), 14);
         assert_eq!(config.position, "bottom");
         assert!(config.dock && config.dock_autohide && config.hide_taskbar);
-        assert_eq!(config.dock_icon_size, 32);
+        assert_eq!(config.dock_icon_size, 24);
+        assert_eq!(
+            (config.dock_open_ms, config.dock_close_ms, config.dock_fade),
+            (180, 140, true)
+        );
         // A config from Wisp 0.3 has no dock keys and keeps the taskbar, as in the launcher.
         let old = Config::from_document(&"hotkey = 'Alt+Space'".parse().unwrap()).unwrap();
         assert!(!old.dock && !old.hide_taskbar);

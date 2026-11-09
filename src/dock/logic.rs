@@ -3,7 +3,7 @@
 use crate::config::WindowListMode;
 use crate::indexer::AppEntry;
 
-pub const DEFAULT_APP_ICON_SIZE: f32 = 32.0;
+pub const DEFAULT_APP_ICON_SIZE: f32 = 24.0;
 pub const MIN_APP_ICON_SIZE: f32 = 24.0;
 pub const MAX_APP_ICON_SIZE: f32 = 40.0;
 pub const TILE_TOP: f32 = 5.0;
@@ -29,7 +29,7 @@ pub const PAD: f32 = 8.0;
 pub const SEPARATOR: f32 = 9.0;
 
 pub fn layout_scale(app_icon_size: f32) -> f32 {
-    app_icon_size / DEFAULT_APP_ICON_SIZE
+    app_icon_size / 32.0
 }
 
 pub fn height(scale: f32) -> f32 {
@@ -103,8 +103,8 @@ pub fn show_window_list(mode: WindowListMode, windows: usize) -> bool {
 }
 /// Notification-area icons shown in the dock; the rest are behind the chevron.
 pub const MAX_INLINE: usize = 5;
-/// Tray icons share the dock's enlarged visual rhythm.
-pub const TRAY_ICON: f32 = 18.0;
+/// Standard small notification-area icon size at 100% scaling.
+pub const TRAY_ICON: f32 = 16.0;
 
 /// The status parts after the apps, in order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -333,13 +333,13 @@ mod tests {
     #[test]
     fn app_icon_pixel_size_scales_with_dpi() {
         assert_eq!(icon_pixels(96, 24.0), 24);
-        assert_eq!(icon_pixels(144, DEFAULT_APP_ICON_SIZE), 48);
+        assert_eq!(icon_pixels(144, DEFAULT_APP_ICON_SIZE), 36);
         assert_eq!(icon_pixels(192, MAX_APP_ICON_SIZE), 80);
     }
     #[test]
     fn dock_geometry_scales_with_app_icon_size() {
         let small = layout_scale(MIN_APP_ICON_SIZE);
-        let normal = layout_scale(DEFAULT_APP_ICON_SIZE);
+        let normal = layout_scale(32.0);
         let large = layout_scale(MAX_APP_ICON_SIZE);
         assert_eq!((small, normal, large), (0.75, 1.0, 1.25));
         assert_eq!(height(small), 42.0);

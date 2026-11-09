@@ -56,6 +56,9 @@ pub struct Config {
     pub dock: bool,
     pub dock_autohide: bool,
     pub dock_icon_size: usize,
+    pub dock_open_ms: u32,
+    pub dock_close_ms: u32,
+    pub dock_fade: bool,
     pub hotkey: String,
     pub max_results: usize,
     pub theme: Theme,
@@ -99,6 +102,8 @@ impl Config {
             Ok(mut config) => {
                 config.max_results = config.max_results.clamp(1, 20);
                 config.dock_icon_size = config.dock_icon_size.clamp(24, 40);
+                config.dock_open_ms = config.dock_open_ms.min(500);
+                config.dock_close_ms = config.dock_close_ms.min(500);
                 (config, None)
             }
             Err(e) => (Config::default(), Some(format!("config.toml: {}", e.message()))),
@@ -148,7 +153,7 @@ mod tests {
         // A new config has them all.
         let default = Config::default();
         assert!(default.dock && default.hide_taskbar);
-        assert_eq!(default.dock_icon_size, 32);
+        assert_eq!(default.dock_icon_size, 24);
         assert_eq!(default.position, Position::Bottom);
         assert!(Config::parse("dock = \"yes\"").is_err());
     }

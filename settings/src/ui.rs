@@ -79,6 +79,8 @@ pub struct Settings {
     window_list: Entity<Choices>,
     results: Entity<SliderState>,
     app_icon_size: Entity<SliderState>,
+    dock_open: Entity<SliderState>,
+    dock_close: Entity<SliderState>,
     autostart: bool,
     powertoys: Result<bool, String>,
     recording: bool,
@@ -155,6 +157,15 @@ impl Settings {
                 .step(1.)
                 .default_value(config.dock_icon_size as f32)
         });
+        let duration_slider = |value: i64| {
+            SliderState::new()
+                .min(0.)
+                .max(500.)
+                .step(10.)
+                .default_value(value as f32)
+        };
+        let dock_open = cx.new(|_| duration_slider(config.dock_open_ms));
+        let dock_close = cx.new(|_| duration_slider(config.dock_close_ms));
         let focus = cx.focus_handle();
 
         cx.subscribe_in(&shortcut, window, |this, input, event, window, cx| {
@@ -215,6 +226,22 @@ impl Settings {
             }
         })
         .detach();
+        for (slider, key) in [(&dock_open, "dock_open_ms"), (&dock_close, "dock_close_ms")] {
+            cx.subscribe_in(slider, window, move |this, _, event, window, cx| {
+                if let SliderEvent::Change(value) = event {
+                    let value = (value.start().round() as i64).clamp(0, 500);
+                    let current = if key == "dock_open_ms" {
+                        this.config.dock_open_ms
+                    } else {
+                        this.config.dock_close_ms
+                    };
+                    if value != current {
+                        this.save(key, value.into(), window, cx);
+                    }
+                }
+            })
+            .detach();
+        }
         cx.observe_window_appearance(window, |this, window, cx| this.apply_theme(window, cx))
             .detach();
         cx.on_blur(&focus, window, |this, _, cx| {
@@ -241,6 +268,8 @@ impl Settings {
             window_list,
             results,
             app_icon_size,
+            dock_open,
+            dock_close,
             autostart: system::autostart_enabled(),
             powertoys: system::powertoys_run_enabled(),
             recording: false,
@@ -326,6 +355,12 @@ impl Settings {
                 let app_icon_size = self.config.dock_icon_size as f32;
                 self.app_icon_size
                     .update(cx, |state, cx| state.set_value(app_icon_size, window, cx));
+                for (slider, ms) in [
+                    (&self.dock_open, self.config.dock_open_ms),
+                    (&self.dock_close, self.config.dock_close_ms),
+                ] {
+                    slider.update(cx, |state, cx| state.set_value(ms as f32, window, cx));
+                }
                 self.apply_theme(window, cx);
             }
             Err(error) => self.error = Some(error),
@@ -527,6 +562,24 @@ impl Settings {
                         )
                         .child(Slider::new(&self.app_icon_size).accessibility_label("App icon size")),
                     )
+                    .child(divider(p))
+                    .child(row(
+                        "Fade dock content",
+                        "Fade icons and status while the dock slides in or out.",
+                        Switch::new("dock-fade")
+                            .checked(self.config.dock_fade)
+                            .accessibility_label("Fade dock content")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("dock_fade", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(item("Dock opening time", format!("{} ms. Set to 0 for instant.", self.config.dock_open_ms), p)
+                        .child(Slider::new(&self.dock_open).accessibility_label("Dock opening time")))
+                    .child(divider(p))
+                    .child(item("Dock closing time", format!("{} ms. Set to 0 for instant.", self.config.dock_close_ms), p)
+                        .child(Slider::new(&self.dock_close).accessibility_label("Dock closing time")))
                     .child(divider(p))
                     .child(row(
                         "App window list",

@@ -54,6 +54,8 @@ pub enum Part {
     Bluetooth,
     /// The default output device's volume.
     Volume,
+    /// The default output device’s mute control.
+    Mute,
     /// Output devices to switch between.
     Outputs,
     /// One volume per app that plays sound.
@@ -426,6 +428,18 @@ fn widgets(part: &Part, state: &State) -> Vec<Widget> {
                     target: Target::Master,
                 },
             )],
+        },
+        Part::Mute => match &state.audio {
+            Some(Some(audio)) => vec![Widget::new(
+                "Mute",
+                if audio.muted { "Sound muted" } else { "Sound on" },
+                glyph::MUTED,
+                Input::Toggle {
+                    on: audio.muted,
+                    command: Command::Mute(!audio.muted),
+                },
+            )],
+            _ => Vec::new(),
         },
         Part::Outputs => {
             if state.outputs.len() < 2 {

@@ -613,6 +613,11 @@ impl Launcher {
             dock.set_apps(&self.apps, &self.icons);
             dock.set_window_list_mode(self.config.window_list);
             dock.set_app_icon_size(self.config.dock_icon_size as u32);
+            dock.set_animation(
+                self.config.dock_open_ms,
+                self.config.dock_close_ms,
+                self.config.dock_fade,
+            );
             // Notification icons need a home while the taskbar is hidden.
             dock.set_tray(self.taskbar.as_ref().is_some_and(TaskbarHider::is_active));
             dock.set_autohide(self.config.dock_autohide);
@@ -2535,6 +2540,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         }
         dock::WM_SHOW_LAUNCHER => {
             with_launcher(Launcher::show);
+        }
+        dock::WM_SHOW_SOUND => {
+            with_launcher(|l| {
+                l.show();
+                if let Some(index) = l
+                    .surfaces
+                    .specs
+                    .iter()
+                    .position(|spec| spec.title.eq_ignore_ascii_case("Sound"))
+                {
+                    l.open_surface(index);
+                }
+            });
         }
         dock::WM_DOCK_SHOW_TASKBAR => {
             with_launcher(Launcher::peek_taskbar);

@@ -15,6 +15,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetForegroundWindow};
 use windows::core::{PCWSTR, Result, w};
+use windows_numerics::Matrix3x2;
 
 /// Vertical layout, in DIPs, shared by the app slots and the status parts.
 /// Icons sit a little above center to leave room for the running indicator.
@@ -59,6 +60,7 @@ pub struct Renderer {
 }
 
 pub struct Frame<'a> {
+    pub opacity: f32,
     pub dpi: u32,
     pub palette: &'a Palette,
     pub items: &'a [Item],
@@ -184,7 +186,7 @@ impl Renderer {
         self.update_formats(frame.layout_scale)?;
         self.paint(hwnd, frame.dpi, frame.palette, |target, formats| {
             background(target, frame.palette, frame.layout_scale);
-            unsafe { draw(target, formats, frame) }.and_then(|()| draw_status(target, formats, frame))
+            draw_content(target, formats, frame)
         })
     }
 
@@ -200,7 +202,7 @@ impl Renderer {
             });
         }
         let target = self.shared_target.as_mut().unwrap();
-        unsafe { draw(target, &self.formats, frame) }.and_then(|()| draw_status(target, &self.formats, frame))
+        draw_content(target, &self.formats, frame)
     }
 
     fn update_formats(&mut self, scale: f32) -> Result<()> {
@@ -562,6 +564,31 @@ fn separator(target: &Target, frame: &Frame, x: f32) {
             ),
             &target.brush,
         );
+    }
+}
+
+fn draw_content(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<()> {
+    if frame.opacity <= 0.0 {
+        return Ok(());
+    }
+    unsafe {
+        if frame.opacity < 1.0 {
+            let size = target.rt.GetSize();
+            target.rt.PushLayer(
+                &D2D1_LAYER_PARAMETERS {
+                    contentBounds: rect(0.0, 0.0, size.width, size.height),
+                    opacity: frame.opacity,
+                    maskTransform: Matrix3x2::identity(),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        let result = draw(target, formats, frame).and_then(|()| draw_status(target, formats, frame));
+        if frame.opacity < 1.0 {
+            target.rt.PopLayer();
+        }
+        result
     }
 }
 
