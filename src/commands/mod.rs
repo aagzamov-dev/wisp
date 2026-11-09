@@ -8,6 +8,7 @@
 pub mod audio;
 pub mod battery;
 pub mod bluetooth;
+pub mod control;
 pub mod media;
 pub mod open_windows;
 pub mod power;
@@ -117,6 +118,7 @@ pub struct State {
 }
 
 pub enum Event {
+    Control(control::Hardware),
     /// New state, icons for new programs, and how many commands the worker
     /// had run when it read the state.
     State(Box<State>, Vec<(String, Arc<IconPixels>)>, u64),
@@ -127,12 +129,19 @@ pub enum Event {
 
 enum Request {
     Refresh,
+    RefreshSound,
     List(Drill),
     Run(Command),
 }
 
 pub struct Commands {
     requests: Sender<Request>,
+    refresh_pending: Arc<std::sync::atomic::AtomicBool>,
+    sound_pending: Arc<std::sync::atomic::AtomicBool>,
+    control: std::sync::OnceLock<std::sync::mpsc::SyncSender<control::Request>>,
+    control_events: Sender<Event>,
+    notify_window: isize,
+    notify_message: u32,
 }
 
 impl Commands {
@@ -140,20 +149,74 @@ impl Commands {
         let (requests, rx) = channel();
         let (events, events_rx) = channel();
         let hwnd = hwnd.0 as isize;
+        let refresh_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending = refresh_pending.clone();
+        let sound_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_sound = sound_pending.clone();
+        let control_events = events.clone();
         std::thread::Builder::new()
             .name("commands".into())
             .spawn(move || {
-                worker(rx, events, icon_size, move || unsafe {
+                worker(rx, events, icon_size, pending, pending_sound, move || unsafe {
                     let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
                 })
             })
             .expect("could not start commands thread");
-        (Commands { requests }, events_rx)
+        (
+            Commands {
+                requests,
+                refresh_pending,
+                sound_pending,
+                control: std::sync::OnceLock::new(),
+                control_events,
+                notify_window: hwnd,
+                notify_message: notify_msg,
+            },
+            events_rx,
+        )
     }
 
     /// Reads the state again. The launcher calls this each time it opens.
     pub fn refresh(&self) {
-        let _ = self.requests.send(Request::Refresh);
+        if !self.refresh_pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let _ = self.requests.send(Request::Refresh);
+        }
+    }
+
+    pub fn refresh_sound(&self) {
+        if !self.sound_pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let _ = self.requests.send(Request::RefreshSound);
+        }
+    }
+
+    pub fn control(&self, request: control::Request) -> bool {
+        let sender = self.control.get_or_init(|| {
+            let (sender, requests) = std::sync::mpsc::sync_channel(4);
+            let events = self.control_events.clone();
+            let window = self.notify_window;
+            let message = self.notify_message;
+            std::thread::spawn(move || {
+                unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
+                let mut hardware = control::Hardware::default();
+                while let Ok(request) = requests.recv() {
+                    if let Err(error) = control::run(request, &mut hardware)
+                        && events.send(Event::Failed(error)).is_err()
+                    {
+                        break;
+                    }
+                    if events.send(Event::Control(hardware.clone())).is_err() {
+                        break;
+                    }
+                    unsafe {
+                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
+                    }
+                }
+            });
+            sender
+        });
+        sender.try_send(request).is_ok()
     }
 
     pub fn list(&self, drill: Drill) {
@@ -167,7 +230,14 @@ impl Commands {
     }
 }
 
-fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, notify: impl Fn()) {
+fn worker(
+    requests: Receiver<Request>,
+    events: Sender<Event>,
+    icon_size: i32,
+    refresh_pending: Arc<std::sync::atomic::AtomicBool>,
+    sound_pending: Arc<std::sync::atomic::AtomicBool>,
+    notify: impl Fn(),
+) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
@@ -178,8 +248,16 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, no
     };
     let mut icons_sent = HashSet::new();
     let mut ran = 0;
-    let mut refresh = |ran: u64| {
-        let state = read_state();
+    let mut state = State::default();
+    let mut refresh = |ran: u64, full: bool| {
+        if full {
+            state = read_state();
+        } else {
+            state.audio = Some(audio::state());
+            state.media = Some(media::state());
+            state.sessions = audio::sessions();
+            state.outputs = audio::outputs().unwrap_or_default();
+        }
         let windows = state.windows.iter().map(|w| (w.icon_key(), &w.exe));
         let sessions = state.sessions.iter().map(|s| (s.icon_key(), &s.exe));
         let icons = windows
@@ -188,19 +266,30 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, no
             .filter(|(key, _)| icons_sent.insert(key.clone()))
             .filter_map(|(key, exe)| Some((key, Arc::new(exe_icon(&exe, icon_size)?))))
             .collect();
-        send(Event::State(Box::new(state), icons, ran));
+        send(Event::State(Box::new(state.clone()), icons, ran));
     };
     while let Ok(first) = requests.recv() {
         // Handle the queued requests, then read the state once. Holding a
         // slider key queues many volume changes.
         let started = Instant::now();
         let mut stale = false;
+        let mut full = false;
+        let mut sound = false;
         let mut handled = 0;
         let mut next = Some(first);
         while let Some(request) = next.take() {
             handled += 1;
             match request {
-                Request::Refresh => stale = true,
+                Request::Refresh | Request::RefreshSound => {
+                    if matches!(request, Request::Refresh) {
+                        full = true;
+                        refresh_pending.store(false, std::sync::atomic::Ordering::Release);
+                    } else {
+                        sound = true;
+                        sound_pending.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                    stale = true;
+                }
                 Request::List(drill) => send(Event::List(drill, list_items(drill))),
                 Request::Run(command) => {
                     let result = match &command {
@@ -211,7 +300,7 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, no
                         Command::Mute(muted) => audio::set_mute(*muted),
                         Command::AppVolume { pid, percent } => audio::set_app_volume(*pid, *percent),
                         Command::Output(id) => audio::set_output(id),
-                        Command::Media(control) => media::control(*control),
+                        Command::Media(control) => media::control(control),
                         Command::FocusWindow(hwnd) => open_windows::focus(*hwnd),
                         Command::CloseWindow(hwnd) => open_windows::close(*hwnd),
                         Command::Power(power) => power::run(*power),
@@ -221,9 +310,17 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, no
                         send(Event::Failed(error));
                     }
                     // Apps update their media state and close windows a moment later.
-                    if matches!(command, Command::Media(_) | Command::CloseWindow(_)) {
+                    if matches!(command, Command::CloseWindow(_)) {
                         std::thread::sleep(Duration::from_millis(300));
                     }
+                    full |= !matches!(
+                        command,
+                        Command::Volume(_)
+                            | Command::Mute(_)
+                            | Command::AppVolume { .. }
+                            | Command::Output(_)
+                            | Command::Media(_)
+                    );
                     ran += 1;
                     stale = true;
                 }
@@ -233,7 +330,11 @@ fn worker(requests: Receiver<Request>, events: Sender<Event>, icon_size: i32, no
             }
         }
         if stale {
-            refresh(ran);
+            if full && sound {
+                // Make the audio snapshot available before device discovery.
+                refresh(ran, false);
+            }
+            refresh(ran, full);
         }
     }
 }
@@ -852,6 +953,8 @@ mod tests {
                 artist: "Band".into(),
                 app: "Spotify".into(),
                 playing: true,
+                timeline: None,
+                source: "Spotify.exe".into(),
             })),
             windows: vec![open_windows::Window {
                 hwnd: 1,

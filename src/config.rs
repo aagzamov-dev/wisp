@@ -41,10 +41,20 @@ pub enum Position {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum WindowListMode {
-    #[default]
     Multiple,
+    #[default]
     Always,
     Off,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockAnimation {
+    #[default]
+    Slide,
+    Fade,
+    RiseFade,
+    ScaleFade,
 }
 
 /// Keys missing from the user's file take their value from `config-0.3.toml`,
@@ -58,7 +68,7 @@ pub struct Config {
     pub dock_icon_size: usize,
     pub dock_open_ms: u32,
     pub dock_close_ms: u32,
-    pub dock_fade: bool,
+    pub dock_animation: DockAnimation,
     pub hotkey: String,
     pub max_results: usize,
     pub theme: Theme,
@@ -128,11 +138,11 @@ mod tests {
     fn legacy_pins_are_ignored() {
         let config = Config::parse("dock = true\ndock_apps = ['old.app']").unwrap();
         assert!(config.dock);
-        assert_eq!(config.window_list, super::WindowListMode::Multiple);
+        assert_eq!(config.window_list, super::WindowListMode::Always);
     }
 
     #[test]
-    fn window_list_modes_deserialize_and_older_config_defaults_to_multiple() {
+    fn window_list_modes_deserialize() {
         for (value, expected) in [
             ("multiple", super::WindowListMode::Multiple),
             ("always", super::WindowListMode::Always),

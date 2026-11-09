@@ -38,10 +38,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::{IPropertyStore, SHGetPropertyStoreForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{Error, GUID, Result, w};
+use windows::core::{BOOL, Error, GUID, Result, w};
 
 use crate::commands::open_windows::{self, Window};
-use crate::config::{Backdrop, WindowListMode};
+use crate::config::{Backdrop, DockAnimation, WindowListMode};
 use crate::indexer::{AppEntry, IconPixels};
 use crate::theme::Palette;
 use crate::tray_host::{self, Action, TrayHost};
@@ -54,7 +54,8 @@ const WM_TRAY_CHANGED: u32 = WM_APP + 22;
 /// dock lacks.
 pub const WM_DOCK_SHOW_TASKBAR: u32 = WM_APP + 23;
 const WM_CLOSE_FLYOUT: u32 = WM_APP + 24;
-pub const WM_SHOW_SOUND: u32 = WM_APP + 25;
+#[path = "dock/sound.rs"]
+pub mod sound;
 /// Shows a notification icon's tooltip after a short hover.
 const TIP_TIMER: usize = 104;
 const TIP_MS: u32 = 450;
@@ -64,6 +65,62 @@ const TIP_MAX: f32 = 320.0;
 /// has left both the list and the dock.
 const WINDOWS_TIMER: usize = 107;
 const WINDOWS_HIDE_TIMER: usize = 108;
+const POPUP_FADE_TIMER: usize = 2;
+const POPUP_FADE_MS: f32 = 105.;
+const POPUP_START_ALPHA: u8 = 115;
+
+fn client_animations_enabled() -> bool {
+    let mut enabled = BOOL(1);
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some((&raw mut enabled).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    enabled.as_bool()
+}
+
+fn start_popup_fade(hwnd: HWND) -> Option<Instant> {
+    if !client_animations_enabled() {
+        return None;
+    }
+    unsafe {
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+        if SetLayeredWindowAttributes(hwnd, COLORREF(0), POPUP_START_ALPHA, LWA_ALPHA).is_err()
+            || SetTimer(Some(hwnd), POPUP_FADE_TIMER, 15, None) == 0
+        {
+            finish_popup_fade(hwnd);
+            return None;
+        }
+    }
+    Some(Instant::now())
+}
+
+fn tick_popup_fade(hwnd: HWND, fade: &mut Option<Instant>) {
+    let Some(start) = *fade else { return };
+    let t = start.elapsed().as_secs_f32() * 1000. / POPUP_FADE_MS;
+    if t >= 1. {
+        fade.take();
+        finish_popup_fade(hwnd);
+    } else {
+        let alpha = POPUP_START_ALPHA as f32 + (255 - POPUP_START_ALPHA) as f32 * (1. - (1. - t).powi(3));
+        unsafe {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha.round() as u8, LWA_ALPHA);
+        }
+    }
+}
+
+fn finish_popup_fade(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), POPUP_FADE_TIMER);
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
 const WINDOWS_HIDE_MS: u32 = 220;
 const REFRESH_TIMER: usize = 101;
 /// Watches the pointer for the bottom edge while the dock is hidden, and
@@ -71,7 +128,7 @@ const REFRESH_TIMER: usize = 101;
 const POLL_TIMER: usize = 102;
 const POLL_MS: u32 = 100;
 /// Polls the pointer may spend away from the dock before it hides.
-const HIDE_AFTER: u8 = 5;
+const HIDE_AFTER: u8 = 3;
 /// Steps the slide-in animation.
 const SLIDE_TIMER: usize = 103;
 const HOVER_TIMER: usize = 105;
@@ -107,6 +164,7 @@ struct State {
     scroll: usize,
     capacity: usize,
     status: status::Status,
+    status_read_at: Instant,
     hover_part: Option<logic::Part>,
     /// The pointer touched the bottom edge, so the dock slid in.
     revealed: bool,
@@ -128,7 +186,14 @@ struct State {
     slide_ms: u32,
     open_ms: u32,
     close_ms: u32,
-    fade: bool,
+    animation: DockAnimation,
+    layered: bool,
+    tray_interaction: Option<(u32, Instant)>,
+    sound: HWND,
+    sound_state: crate::commands::State,
+    sound_hardware: crate::commands::control::Hardware,
+    preview: Option<(isize, isize)>,
+    preview_height: f32,
     hover_levels: Vec<f32>,
     hover_tick: Option<Instant>,
     /// Wheel delta over the volume not yet spent on a whole percent.
@@ -150,6 +215,7 @@ struct State {
     /// Lists every notification icon above the chevron.
     flyout: HWND,
     flyout_open: bool,
+    flyout_fade: Option<Instant>,
     flyout_hover: Option<usize>,
     flyout_renderer: render::Renderer,
     tip: HWND,
@@ -211,6 +277,7 @@ impl Dock {
             scroll: 0,
             capacity: usize::MAX,
             status: status::read(),
+            status_read_at: Instant::now(),
             hover_part: None,
             revealed: false,
             away: 0,
@@ -226,7 +293,14 @@ impl Dock {
             slide_ms: 0,
             open_ms: 180,
             close_ms: 140,
-            fade: true,
+            animation: DockAnimation::Slide,
+            layered: false,
+            tray_interaction: None,
+            sound: HWND::default(),
+            sound_state: crate::commands::State::default(),
+            sound_hardware: crate::commands::control::Hardware::default(),
+            preview: None,
+            preview_height: 0.0,
             hover_levels: Vec::new(),
             hover_tick: None,
             wheel: 0,
@@ -241,6 +315,7 @@ impl Dock {
             inline: Vec::new(),
             flyout: HWND::default(),
             flyout_open: false,
+            flyout_fade: None,
             flyout_hover: None,
             flyout_renderer: render::Renderer::new()?,
             tip: HWND::default(),
@@ -436,6 +511,7 @@ impl Dock {
     pub fn suspend(&mut self) -> RECT {
         let mut s = self.state.borrow_mut();
         s.close_flyout();
+        s.close_sound();
         s.hide_tip();
         s.hide_windows();
         let mut rect = RECT::default();
@@ -513,11 +589,33 @@ impl Dock {
         }
     }
 
-    pub fn set_animation(&mut self, open_ms: u32, close_ms: u32, fade: bool) {
+    pub fn set_animation(&mut self, open_ms: u32, close_ms: u32, animation: DockAnimation) {
         let mut s = self.state.borrow_mut();
         s.open_ms = open_ms;
         s.close_ms = close_ms;
-        s.fade = fade;
+        s.animation = animation;
+    }
+
+    pub fn sound_window(&self) -> Option<HWND> {
+        let s = self.state.borrow();
+        s.sound_open().then_some(s.sound)
+    }
+
+    pub fn update_control_hardware(&self, hardware: crate::commands::control::Hardware) {
+        let mut s = self.state.borrow_mut();
+        if s.sound_open() {
+            sound::update_hardware(s.sound, hardware.clone());
+        }
+        s.sound_hardware = hardware;
+    }
+
+    pub fn update_sound(&self, state: &crate::commands::State) {
+        let mut s = self.state.borrow_mut();
+        if s.sound_open() {
+            sound::update(s.sound, state);
+            sound::update_hardware(s.sound, s.sound_hardware.clone());
+        }
+        s.sound_state.clone_from(state);
     }
 
     pub fn refresh(&mut self) {
@@ -638,6 +736,7 @@ impl Dock {
     pub fn hide(&mut self) {
         let mut s = self.state.borrow_mut();
         s.close_flyout();
+        s.close_sound();
         s.hide_tip();
         s.hide_windows();
         s.visible = false;
@@ -666,7 +765,9 @@ impl Drop for Dock {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
             // Remove the pointer before synchronous destruction can reenter the wndproc.
-            let s = self.state.borrow();
+            let mut s = self.state.borrow_mut();
+            s.close_sound();
+            s.clear_preview();
             for hwnd in [s.flyout, s.tip, s.windows, self.hwnd] {
                 if !hwnd.is_invalid() {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -689,7 +790,7 @@ impl State {
     fn paint(&mut self, rt: Option<&windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget>) -> Result<()> {
         let hwnd = self.hwnd;
         let parts = self.parts();
-        let opacity = if self.fade { 1.0 - self.slide_value() } else { 1.0 };
+        let animation_scale = self.animation_scale();
         let State {
             renderer,
             items,
@@ -709,7 +810,7 @@ impl State {
             ..
         } = self;
         let frame = &render::Frame {
-            opacity,
+            animation_scale,
             dpi: *dpi,
             palette,
             items,
@@ -819,6 +920,7 @@ impl State {
         if self.fullscreen {
             self.hide_windows();
             self.stop_slide();
+            self.close_sound();
             self.revealed = false;
         }
         unsafe {
@@ -840,15 +942,32 @@ impl State {
 
     /// Slides the dock in when the pointer reaches a bottom edge, and out once
     /// it has been away for a moment.
+    fn tray_menu_active(&self) -> bool {
+        self.tray_interaction.is_some_and(|(thread, started)| {
+            let mut info = GUITHREADINFO {
+                cbSize: size_of::<GUITHREADINFO>() as u32,
+                ..Default::default()
+            };
+            started.elapsed() < Duration::from_millis(500)
+                || unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+                    && (info.flags.0 & (GUI_INMENUMODE.0 | GUI_POPUPMENUMODE.0) != 0 || !info.hwndCapture.is_invalid())
+        })
+    }
+
     fn poll(&mut self) {
         let _span = crate::util::perf::Span::new("dock_poll");
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&mut cursor) }.is_err() {
             return;
         }
+        let tray_busy = self.tray_menu_active();
+        if !tray_busy && self.tray_interaction.take().is_some() {
+            self.restore_tray_order();
+        }
         let hidden = !self.revealed && self.slide.is_none();
-        if !hidden && fullscreen_foreground(self.hwnd) {
+        if !hidden && !tray_busy && fullscreen_foreground(self.hwnd) {
             self.stop_slide();
+            self.close_sound();
             self.revealed = false;
             self.close_flyout();
             self.hide_tip();
@@ -876,7 +995,7 @@ impl State {
         }
         let mut rect = RECT::default();
         let _ = unsafe { GetWindowRect(self.hwnd, &mut rect) };
-        if self.flyout_open && !self.held {
+        if self.flyout_open && !self.held && !tray_busy {
             // Activation closes the flyout on a click elsewhere; this covers
             // clicks while it could not take the foreground.
             let pressed =
@@ -901,6 +1020,8 @@ impl State {
             && cursor.y >= windows_rect.top
             && cursor.y < windows_rect.bottom;
         let near = !self.autohide
+            || tray_busy
+            || self.sound_open()
             || self.held
             || self.flyout_open
             || over_windows
@@ -918,7 +1039,9 @@ impl State {
             }
         }
         // Polling also catches volume changes from keys and other apps.
-        self.update_status();
+        if self.status_read_at.elapsed() >= Duration::from_millis(750) {
+            self.update_status();
+        }
     }
 
     /// Shows the dock, or reverses an outgoing slide at its current position.
@@ -950,7 +1073,7 @@ impl State {
         self.slide_from = self.slide_value();
         self.slide_to = to;
         self.slide_ms = if to > 0.5 { self.close_ms } else { self.open_ms };
-        self.slide = (self.slide_ms > 0).then(Instant::now);
+        self.slide = (self.slide_ms > 0 && client_animations_enabled()).then(Instant::now);
         if self.slide.is_none() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
@@ -958,8 +1081,10 @@ impl State {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
                 }
             }
+            self.set_slide_alpha(255);
             return;
         }
+        self.apply_slide();
         if !self.frame_paced {
             unsafe {
                 SetTimer(Some(self.hwnd), SLIDE_TIMER, 10, None);
@@ -971,15 +1096,86 @@ impl State {
         self.slide = None;
         self.slide_from = 0.0;
         self.slide_to = 0.0;
+        self.set_slide_alpha(255);
         unsafe {
             let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
         }
     }
 
     fn slide_offset(&self, height: i32) -> i32 {
-        let layout_scale = logic::layout_scale(self.app_icon_size);
-        ((height + (logic::margin(layout_scale) * self.dpi as f32 / 96.0).round() as i32) as f32 * self.slide_value())
-            .round() as i32
+        let distance = match self.animation {
+            DockAnimation::Slide => {
+                height
+                    + (logic::margin(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32
+            }
+            DockAnimation::RiseFade => (12.0 * self.dpi as f32 / 96.0).round() as i32,
+            DockAnimation::Fade | DockAnimation::ScaleFade => 0,
+        };
+        (distance as f32 * self.slide_value()).round() as i32
+    }
+
+    fn animation_scale(&self) -> f32 {
+        if self.animation == DockAnimation::ScaleFade && self.slide.is_some() {
+            1.0 - 0.08 * self.slide_value()
+        } else {
+            1.0
+        }
+    }
+
+    fn set_slide_alpha(&mut self, alpha: u8) {
+        let layered = alpha < 255;
+        unsafe {
+            if self.layered != layered {
+                let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+                let flag = WS_EX_LAYERED.0 as isize;
+                SetWindowLongPtrW(
+                    self.hwnd,
+                    GWL_EXSTYLE,
+                    if layered { style | flag } else { style & !flag },
+                );
+                self.layered = layered;
+                if !layered {
+                    let _ = InvalidateRect(Some(self.hwnd), None, false);
+                }
+            }
+            if self.layered {
+                let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA);
+            }
+        }
+    }
+
+    fn apply_slide(&mut self) {
+        let height = (logic::height(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32;
+        let factor = self.animation_scale();
+        let width = (self.width as f32 * factor).round() as i32;
+        let scaled_height = (height as f32 * factor).round() as i32;
+        let x = self.left + (self.width - width) / 2;
+        let y = self.top + self.slide_offset(height) + height - scaled_height;
+        unsafe {
+            let mut rect = RECT::default();
+            if width > 0
+                && height > 0
+                && GetWindowRect(self.hwnd, &mut rect).is_ok()
+                && (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top) != (x, y, width, scaled_height)
+            {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    x,
+                    y,
+                    width,
+                    scaled_height,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                self.publish_rects();
+            }
+        }
+        let alpha = if self.animation == DockAnimation::Slide {
+            255
+        } else {
+            ((1.0 - self.slide_value()) * 255.0).round() as u8
+        };
+        self.set_slide_alpha(alpha);
     }
 
     fn step_slide(&mut self) {
@@ -987,30 +1183,17 @@ impl State {
         crate::util::perf::event("slide_frame");
         let tick = Instant::now();
         let elapsed = self.slide.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
-        let mut rect = RECT::default();
-        unsafe {
-            let _ = GetWindowRect(self.hwnd, &mut rect);
-            let offset = self.slide_offset(rect.bottom - rect.top);
-            if rect.top != self.top + offset {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    rect.left,
-                    self.top + offset,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                self.publish_rects();
-            }
-            if self.fade {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
-            if elapsed / f64::from(crate::util::perf::slowdown()) >= f64::from(self.slide_ms) {
-                self.slide = None;
+        let finished = elapsed / f64::from(crate::util::perf::slowdown()) >= f64::from(self.slide_ms);
+        if finished {
+            self.slide = None;
+        }
+        self.apply_slide();
+        if finished {
+            unsafe {
                 let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
                 if !self.revealed {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    self.set_slide_alpha(255);
                 }
             }
         }
@@ -1072,6 +1255,12 @@ impl State {
             if !GetMonitorInfoW(monitor, &mut info).as_bool() {
                 return;
             }
+            // A tray callback may open a menu while the dock is relaid out.
+            let order = if self.tray_interaction.is_some() {
+                SWP_NOZORDER
+            } else {
+                SET_WINDOW_POS_FLAGS(0)
+            };
             // Move first, then query the window's new monitor DPI. Skipped on the
             // same monitor, where the jump would show.
             if MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) != monitor {
@@ -1082,7 +1271,7 @@ impl State {
                     info.rcMonitor.bottom - 60,
                     0,
                     0,
-                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW,
+                    SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOREDRAW | order,
                 );
             }
             self.dpi = self.held_dpi.unwrap_or_else(|| GetDpiForWindow(self.hwnd)).max(96);
@@ -1129,9 +1318,20 @@ impl State {
             self.top = info.rcMonitor.bottom - height - (logic::margin(layout_scale) * scale).round() as i32;
             self.left = x;
             self.width = width;
-            let y = self.top + self.slide_offset(height);
+            let factor = self.animation_scale();
+            let scaled_width = (width as f32 * factor).round() as i32;
+            let scaled_height = (height as f32 * factor).round() as i32;
+            let y = self.top + self.slide_offset(height) + height - scaled_height;
             crate::theme::shape(self.hwnd, width, height, 8.0 * layout_scale, self.dpi);
-            let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                x + (width - scaled_width) / 2,
+                y,
+                scaled_width,
+                scaled_height,
+                SWP_NOACTIVATE | order,
+            );
         }
         if previous != (self.dpi, self.left, self.top, self.width, self.scroll, self.capacity) {
             self.hide_windows();
@@ -1305,6 +1505,9 @@ impl State {
         self.flyout_open = true;
         self.flyout_hover = None;
         self.layout_flyout();
+        if !self.held {
+            self.flyout_fade = start_popup_fade(self.flyout);
+        }
         unsafe {
             let _ = ShowWindow(self.flyout, SW_SHOWNA);
             // The click on the chevron lets Wisp take the foreground, which
@@ -1339,7 +1542,7 @@ impl State {
             .max(monitor.left + margin);
         let y = self.top - margin - height;
         unsafe {
-            let _ = SetWindowPos(self.flyout, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
+            let _ = SetWindowPos(self.flyout, None, x, y, width, height, SWP_NOACTIVATE | SWP_NOZORDER);
             let _ = InvalidateRect(Some(self.flyout), None, false);
         }
     }
@@ -1356,6 +1559,9 @@ impl State {
         unsafe {
             let _ = ShowWindow(self.flyout, SW_HIDE);
             let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        if self.flyout_fade.take().is_some() {
+            finish_popup_fade(self.flyout);
         }
         self.publish_rects();
     }
@@ -1382,8 +1588,53 @@ impl State {
             other => other,
         };
         self.hide_tip();
-        if let Err(error) = tray_host::invoke(&self.tray[index].icon, action, center.x, center.y) {
-            eprintln!("Dock notification icon: {error}");
+        let menu = matches!(action, Action::Menu);
+        if menu && self.flyout_fade.take().is_some() {
+            finish_popup_fade(self.flyout);
+        }
+        // Keep the overflow visible. Lower the dock and its owned flyout
+        // while the app has its menu open so the menu can overlap them.
+        // The icon owner needs permission to activate its native menu.
+        unsafe {
+            let foreground = if self.flyout_open { self.flyout } else { self.hwnd };
+            let _ = SetForegroundWindow(foreground);
+            if menu {
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_NOTOPMOST),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                );
+            }
+        }
+        match tray_host::invoke(&self.tray[index].icon, action, center.x, center.y) {
+            Ok(thread) => {
+                self.tray_interaction = Some((thread, Instant::now()));
+                self.away = 0;
+            }
+            Err(error) => {
+                if menu {
+                    self.restore_tray_order();
+                }
+                eprintln!("Dock notification icon: {error}");
+            }
+        }
+    }
+
+    fn restore_tray_order(&self) {
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
         }
     }
 
@@ -1448,7 +1699,71 @@ impl State {
     }
 
     /// Hides the window list and forgets its windows.
+    fn clear_preview(&mut self) {
+        if let Some((_, thumbnail)) = self.preview.take() {
+            let _ = unsafe { windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail) };
+        }
+    }
+
+    fn update_preview(&mut self) {
+        use windows::Win32::Graphics::Dwm::*;
+        let source = self.windows_targets.get(self.windows_hover.unwrap_or(0)).copied();
+        if self.preview_height == 0.0 || source.is_none() {
+            self.clear_preview();
+            return;
+        }
+        let source = source.unwrap();
+        if self.preview.is_some_and(|(current, _)| current == source) {
+            return;
+        }
+        self.clear_preview();
+        let result = unsafe { DwmRegisterThumbnail(self.windows, HWND(source as _)) };
+        let Ok(thumbnail) = result else {
+            if let Err(error) = result {
+                eprintln!("Window preview registration: {error}");
+            }
+            return;
+        };
+        let updated = unsafe {
+            DwmQueryThumbnailSourceSize(thumbnail).and_then(|size| {
+                if size.cx <= 0 || size.cy <= 0 {
+                    return Err(Error::new(E_FAIL, "Windows returned an empty preview"));
+                }
+                let mut client = RECT::default();
+                GetClientRect(self.windows, &mut client)?;
+                let padding = (6.0 * self.dpi as f32 / 96.0).round() as i32;
+                let available = (self.preview_height * self.dpi as f32 / 96.0).round() as i32 - padding * 2;
+                let factor = ((client.right - padding * 2) as f32 / size.cx.max(1) as f32)
+                    .min(available as f32 / size.cy.max(1) as f32);
+                let width = (size.cx as f32 * factor).round().max(1.0) as i32;
+                let height = (size.cy as f32 * factor).round().max(1.0) as i32;
+                let left = (client.right - width) / 2;
+                let top = padding + (available - height) / 2;
+                DwmUpdateThumbnailProperties(
+                    thumbnail,
+                    &DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
+                        rcDestination: RECT {
+                            left,
+                            top,
+                            right: left + width,
+                            bottom: top + height,
+                        },
+                        fVisible: BOOL(1),
+                        ..Default::default()
+                    },
+                )
+            })
+        };
+        if updated.is_ok() {
+            self.preview = Some((source, thumbnail));
+        } else {
+            let _ = unsafe { DwmUnregisterThumbnail(thumbnail) };
+        }
+    }
+
     fn hide_windows(&mut self) {
+        self.clear_preview();
         self.windows_slot = None;
         self.windows_hover = None;
         self.windows_rows.clear();
@@ -1548,7 +1863,12 @@ impl State {
         let anchor = self.item_rect(slot);
         let gap = (6.0 * scale).round() as i32;
         let available = anchor.top - gap - (info.rcWork.top + gap);
-        let capacity = logic::window_list_rows(available, scale, logic::LIST_PAD.1);
+        let preview_height = if available as f32 / scale >= 170.0 { 120.0 } else { 0.0 };
+        let capacity = logic::window_list_rows(
+            available - (preview_height * scale).ceil() as i32,
+            scale,
+            logic::LIST_PAD.1,
+        );
         if capacity == 0 {
             self.hide_windows();
             return;
@@ -1566,12 +1886,18 @@ impl State {
             self.hide_windows();
             return;
         };
-        let (width, height) = ((width * scale).ceil() as i32, (height * scale).ceil() as i32);
+        let width = if preview_height > 0.0 { width.max(215.0) } else { width };
+        let (width, height) = (
+            (width * scale).ceil() as i32,
+            ((height + preview_height) * scale).ceil() as i32,
+        );
         let x = ((anchor.left + anchor.right - width) / 2)
             .min(info.rcWork.right - gap - width)
             .max(info.rcWork.left + gap);
         self.hide_tip();
         self.windows_hover = self.windows_hover.filter(|&row| row < targets.len());
+        self.clear_preview();
+        self.preview_height = preview_height;
         self.windows_rows = rows;
         self.windows_targets = targets;
         unsafe {
@@ -1586,13 +1912,19 @@ impl State {
             );
             let _ = InvalidateRect(Some(self.windows), None, false);
         }
+        self.update_preview();
     }
 
     /// The row of the window list under a popup pointer position.
     fn windows_hit(&self, lp: LPARAM) -> Option<usize> {
         let scale = self.dpi as f32 / 96.0;
         let y = ((lp.0 >> 16) as i16) as f32 / scale;
-        let row = (y - logic::LIST_PAD.1) / logic::LIST_ROW;
+        if (0.0..self.preview_height).contains(&y) {
+            return self
+                .windows_hover
+                .or_else(|| (!self.windows_targets.is_empty()).then_some(0));
+        }
+        let row = (y - self.preview_height - logic::LIST_PAD.1) / logic::LIST_ROW;
         (row >= 0.0)
             .then_some(row as usize)
             .filter(|&row| row < self.windows_targets.len())
@@ -1704,7 +2036,7 @@ impl State {
     }
 
     fn hit(&self, lp: LPARAM) -> Option<usize> {
-        let scale = self.dpi as f32 / 96.0;
+        let scale = self.dpi as f32 / 96.0 * self.animation_scale();
         let running = self.count();
         logic::hit_scaled(
             (lp.0 as i16) as f32 / scale,
@@ -1715,7 +2047,7 @@ impl State {
     }
 
     fn hit_part(&self, lp: LPARAM) -> Option<logic::Part> {
-        let scale = self.dpi as f32 / 96.0;
+        let scale = self.dpi as f32 / 96.0 * self.animation_scale();
         let running = self.count();
         logic::part_hit_scaled(
             (lp.0 as i16) as f32 / scale,
@@ -1724,6 +2056,45 @@ impl State {
             &self.parts(),
             logic::layout_scale(self.app_icon_size),
         )
+    }
+
+    fn sound_open(&self) -> bool {
+        unsafe { IsWindowVisible(self.sound) }.as_bool()
+    }
+
+    fn close_sound(&mut self) {
+        if self.sound_open() {
+            let _ = unsafe { DestroyWindow(self.sound) };
+        }
+        self.sound = HWND::default();
+    }
+
+    fn open_sound(&mut self) {
+        if self.sound_open() {
+            self.close_sound();
+            return;
+        }
+        let Some(anchor) = self.part_rect(logic::Part::Volume) else {
+            return;
+        };
+        self.close_flyout();
+        self.hide_tip();
+        self.hide_windows();
+        match sound::open(
+            self.hwnd,
+            self.owner,
+            anchor,
+            self.dpi,
+            self.sound_state.clone(),
+            self.sound_hardware.clone(),
+            self.flyout_renderer.for_window(),
+        ) {
+            Ok(hwnd) => {
+                self.sound = hwnd;
+                self.away = 0;
+            }
+            Err(error) => eprintln!("Dock Sound: {error}"),
+        }
     }
 
     /// The speaker opens Sound; the clock opens the calendar and notifications;
@@ -1740,9 +2111,7 @@ impl State {
                 return;
             }
             logic::Part::Volume => {
-                unsafe {
-                    let _ = PostMessageW(Some(self.owner), WM_SHOW_SOUND, WPARAM(0), LPARAM(0));
-                }
+                self.open_sound();
                 return;
             }
             logic::Part::Clock => "ms-actioncenter:",
@@ -1827,6 +2196,7 @@ impl State {
     /// Rereads the status, redrawing if it changed.
     fn update_status(&mut self) {
         let _span = crate::util::perf::Span::new("status");
+        self.status_read_at = Instant::now();
         let status = status::read();
         if status != self.status {
             self.status = status;
@@ -2160,11 +2530,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         s.menu(index);
                     } else {
                         match s.hit_part(lp) {
-                            Some(logic::Part::Volume) => {
-                                if let Err(error) = crate::launch::open("ms-settings:sound") {
-                                    eprintln!("Dock sound settings: {error}");
-                                }
-                            }
+                            Some(logic::Part::Volume) => s.open_sound(),
                             Some(logic::Part::Chevron) => s.chevron_menu(),
                             Some(logic::Part::Tray(position)) => s.click_inline(position, Action::Menu),
                             _ => {}
@@ -2273,6 +2639,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let hover = s.windows_hit(lp);
                     if s.windows_hover != hover {
                         s.windows_hover = hover;
+                        s.update_preview();
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
@@ -2321,10 +2688,18 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         dpi,
                         windows_rows,
                         windows_hover,
+                        preview_height,
+                        preview,
                         ..
                     } = &mut *s;
-                    if let Err(error) = windows_renderer.draw_windows(hwnd, *dpi, palette, windows_rows, *windows_hover)
-                    {
+                    if let Err(error) = windows_renderer.draw_windows(
+                        hwnd,
+                        *dpi,
+                        palette,
+                        windows_rows,
+                        *windows_hover,
+                        (*preview_height, preview.is_some()),
+                    ) {
                         eprintln!("Dock window list: {error}");
                     }
                     let _ = EndPaint(hwnd, &paint);
@@ -2387,6 +2762,10 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 return LRESULT(0);
             }
             _ if tip => {}
+            WM_TIMER if wp.0 == POPUP_FADE_TIMER => {
+                tick_popup_fade(hwnd, &mut s.flyout_fade);
+                return LRESULT(0);
+            }
             WM_MOUSEMOVE => {
                 let hover = cell_at(&s, lp);
                 if s.flyout_hover != hover {
@@ -2408,7 +2787,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
             }
-            // Like the taskbar's overflow, the flyout closes once an icon is used.
+            // Leave the overflow visible until the app takes focus or the user dismisses it.
             WM_LBUTTONUP | WM_RBUTTONUP => {
                 if let Some(index) = cell_at(&s, lp) {
                     let rect = s.cell_rect(index);
@@ -2416,7 +2795,6 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         x: (rect.left + rect.right) / 2,
                         y: (rect.top + rect.bottom) / 2,
                     };
-                    s.close_flyout();
                     let action = if msg == WM_LBUTTONUP {
                         Action::Click
                     } else {
@@ -2436,7 +2814,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             WM_CLOSE_FLYOUT => {
                 // A held demo flyout stays for its screenshot.
-                if !s.held && GetForegroundWindow() != hwnd {
+                if !s.held && !s.tray_menu_active() && GetForegroundWindow() != hwnd {
                     s.close_flyout();
                 }
                 return LRESULT(0);

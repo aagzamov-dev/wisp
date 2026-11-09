@@ -69,7 +69,7 @@ pub fn read() -> Status {
 impl Status {
     /// `tray` is the number of inline notification icons, if the dock hosts them.
     pub fn parts(&self, tray: Option<usize>) -> Vec<super::logic::Part> {
-        super::logic::parts(tray, self.volume.is_some(), self.battery.is_some())
+        super::logic::parts(tray, true, self.battery.is_some())
     }
 }
 

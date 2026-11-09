@@ -48,17 +48,19 @@ The dock appears when the pointer touches the bottom edge of a screen, and hides
 | Click the app in front | Minimize it |
 | Middle-click an app | Open a new window of it |
 | Right-click an app | Close its windows |
-| Hover an app with several windows | See its windows. Click one to switch to it, middle-click to close it. |
+| Hover an app with open windows | See its window titles and a live preview when Windows provides one. Click one to switch to it, middle-click to close it. |
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |
 | Right-click **⌄** | Show the taskbar, or open taskbar settings |
-| Click the volume | Open Sound with a volume slider and mute control |
-| Scroll over the volume | Change the volume |
-| Right-click the volume | Open sound settings |
+| Click the controls icon | Open Control Center for Wi-Fi, Bluetooth, display and sound |
+| Scroll over the controls icon | Change the volume |
+| Right-click the controls icon | Toggle Control Center |
 | Click the clock | Open notifications and the calendar |
 | Click the battery | Open battery settings |
 | Scroll anywhere else | Switch virtual desktops |
 | <kbd>Shift</kbd>+scroll | Scroll through the apps |
+
+The monitor icon in Control Center opens Display settings and brightness controls for monitors that expose DDC/CI. The Sound row shows the connected Bluetooth output’s battery percentage when Windows reports a level for the matching device. Do Not Disturb opens Windows notification settings.
 
 The dock hides over full-screen apps. Tray icons you pin in Windows show in the dock; the rest are behind **⌄**.
 
@@ -87,7 +89,6 @@ Type to search, then press <kbd>Enter</kbd>.
 | `dark mode` · `display` · … | Open that Settings page |
 | `now` · `sound` | Open live panels for status and audio |
 | `quit` | Quit Wisp |
-| Anything else | Search the web |
 
 Apps you opened recently rank higher. With the box empty, the launcher shows your recent apps.
 
@@ -121,11 +122,11 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `hotkey` | `"Alt+Space"` | Shows or hides the launcher |
 | `dock` | `true` | Shows the dock |
 | `dock_autohide` | `true` | Hides the dock until the pointer touches the bottom edge. `false` keeps it visible. |
-| `window_list` | `"multiple"` | `"multiple"` lists an app's windows when it has more than one; `"always"` or `"off"` |
+| `window_list` | `"always"` | `"multiple"` lists an app's windows when it has more than one; `"always"` or `"off"` |
 | `dock_icon_size` | `24` | App icon size in the dock, 24–40 DIP. The dock's height, spacing and status area scale with it. |
 | `dock_open_ms` | `180` | Dock opening animation time, 0–500 ms. |
 | `dock_close_ms` | `140` | Dock closing animation time, 0–500 ms. |
-| `dock_fade` | `true` | Fade icons and status during dock motion. |
+| `dock_animation` | `"slide"` | Dock motion in Appearance. Choose Slide, Fade, Rise + Fade, or Scale + Fade. |
 | `hide_taskbar` | `true` | Hides the Windows taskbar while Wisp runs |
 | `position` | `"bottom"` | `"bottom"` grows the launcher from the dock; `"center"` opens it in the middle |
 | `theme` | `"system"` | `"system"`, `"dark"` or `"light"` |

@@ -43,7 +43,7 @@ dock = true
 dock_autohide = true
 # App window list shown when hovering a running app icon:
 # "multiple" (only when the app has multiple windows), "always", or "off".
-window_list = "multiple"
+window_list = "always"
 
 # App icons in the dock, in DIPs (24 to 40). The default is 24.
 dock_icon_size = 24
@@ -51,5 +51,5 @@ dock_icon_size = 24
 # Auto-hide animation duration in milliseconds. Use 0 for instant.
 dock_open_ms = 180
 dock_close_ms = 140
-# Fade the dock content while it slides.
-dock_fade = true
+# slide, fade, rise-fade, or scale-fade.
+dock_animation = "slide"

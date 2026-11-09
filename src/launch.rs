@@ -35,6 +35,35 @@ pub fn open(target: &str) -> Result<()> {
     execute(target, None, false)
 }
 
+pub fn project() -> Result<()> {
+    execute(&system_tool(r"System32\DisplaySwitch.exe"), None, false)
+}
+
+pub fn quick_settings() -> Result<()> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    let key = |vk, flags| INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: vk,
+                dwFlags: flags,
+                ..Default::default()
+            },
+        },
+    };
+    let inputs = [
+        key(VK_LWIN, KEYEVENTF_EXTENDEDKEY),
+        key(VK_A, KEYBD_EVENT_FLAGS(0)),
+        key(VK_A, KEYEVENTF_KEYUP),
+        key(VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+    ];
+    if unsafe { SendInput(&inputs, size_of::<INPUT>() as i32) } == inputs.len() as u32 {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_thread())
+    }
+}
+
 pub fn shell(command: &str, admin: bool) -> Result<()> {
     execute(&system_tool(r"System32\cmd.exe"), Some(&format!("/k {command}")), admin)
 }

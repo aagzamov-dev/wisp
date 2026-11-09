@@ -135,7 +135,17 @@ impl<I> Model<I> {
                     uid: n.uid,
                     guid: n.guid,
                     callback: 0,
-                    version: 0,
+                    // For an existing Explorer icon the original SETVERSION
+                    // may predate Wisp. Some clients also fill this field on
+                    // registration updates (unless it holds a balloon timeout).
+                    version: if (n.op == wire::NIM_MODIFY || !accepted)
+                        && n.flags & (wire::NIF_MESSAGE | wire::NIF_INFO) == wire::NIF_MESSAGE
+                        && matches!(n.version, 3 | 4)
+                    {
+                        n.version
+                    } else {
+                        0
+                    },
                     state: 0,
                     tip: String::new(),
                     image: None,
@@ -205,18 +215,18 @@ pub enum Action {
 }
 
 /// The events Explorer sends for a gesture: the mouse messages every app
-/// understands, then for version 3 and 4 the selection or menu event.
+/// understands, or the context-menu event for icons using the modern protocol.
 pub fn events(action: Action, version: u32) -> Vec<u32> {
     let mut events = match action {
         Action::Click => vec![WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP],
         Action::DoubleClick => vec![WM_LBUTTONDBLCLK, WM_LBUTTONUP],
+        Action::Menu if version == 4 => vec![WM_CONTEXTMENU],
         Action::Menu => vec![WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP],
     };
     if version >= 3 {
         match action {
             Action::Click => events.push(NIN_SELECT),
-            Action::Menu => events.push(WM_CONTEXTMENU),
-            Action::DoubleClick => {}
+            Action::Menu | Action::DoubleClick => {}
         }
     }
     events
@@ -411,10 +421,21 @@ mod tests {
     }
 
     #[test]
+    fn existing_icons_can_recover_the_callback_version() {
+        let mut model = Model::<()>::default();
+        for (uid, accepted, extra, version) in [(1, false, 0, 4), (2, true, 0, 0), (3, false, NIF_INFO, 0)] {
+            let add = parse(NIM_ADD, NIF_MESSAGE | extra, uid, "");
+            assert!(model.apply(&add, accepted, None, owner()));
+            assert_eq!(model.icons.last().unwrap().version, version);
+        }
+    }
+
+    #[test]
     fn events_add_selection_for_new_versions() {
         assert_eq!(events(Action::Click, 0), [WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP]);
         assert_eq!(events(Action::Click, 4).last(), Some(&NIN_SELECT));
-        assert_eq!(events(Action::Menu, 3).last(), Some(&WM_CONTEXTMENU));
+        assert_eq!(events(Action::Menu, 3), [WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP]);
+        assert_eq!(events(Action::Menu, 4), [WM_CONTEXTMENU]);
         assert_eq!(events(Action::Menu, 0).last(), Some(&WM_RBUTTONUP));
         assert_eq!(events(Action::DoubleClick, 4), [WM_LBUTTONDBLCLK, WM_LBUTTONUP]);
     }

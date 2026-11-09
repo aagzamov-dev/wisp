@@ -25,6 +25,12 @@ const ICON_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
 /// Config values and the labels the dropdowns show for them.
 const THEMES: [(&str, &str); 3] = [("system", "System"), ("dark", "Dark"), ("light", "Light")];
 const BACKDROPS: [(&str, &str); 3] = [("acrylic", "Acrylic"), ("mica", "Mica"), ("solid", "Solid")];
+const DOCK_ANIMATIONS: [(&str, &str); 4] = [
+    ("slide", "Slide"),
+    ("fade", "Fade"),
+    ("rise-fade", "Rise + Fade"),
+    ("scale-fade", "Scale + Fade"),
+];
 const WINDOW_LISTS: [(&str, &str); 3] = [
     ("multiple", "Only for multiple windows"),
     ("always", "Always"),
@@ -76,6 +82,7 @@ pub struct Settings {
     folder: Entity<InputState>,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
+    dock_animation: Entity<Choices>,
     window_list: Entity<Choices>,
     results: Entity<SliderState>,
     app_icon_size: Entity<SliderState>,
@@ -135,6 +142,14 @@ impl Settings {
                 cx,
             )
         });
+        let dock_animation = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(labels(&DOCK_ANIMATIONS)),
+                index_of(&DOCK_ANIMATIONS, &config.dock_animation),
+                window,
+                cx,
+            )
+        });
         let window_list = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(labels(&WINDOW_LISTS)),
@@ -189,6 +204,14 @@ impl Settings {
                 && let Some(value) = value_of(&THEMES, label)
             {
                 this.save("theme", value.into(), window, cx);
+            }
+        })
+        .detach();
+        cx.subscribe_in(&dock_animation, window, |this, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(label)) = event
+                && let Some(value) = value_of(&DOCK_ANIMATIONS, label)
+            {
+                this.save("dock_animation", value.into(), window, cx);
             }
         })
         .detach();
@@ -265,6 +288,7 @@ impl Settings {
             folder,
             theme,
             backdrop,
+            dock_animation,
             window_list,
             results,
             app_icon_size,
@@ -343,6 +367,9 @@ impl Settings {
                 let theme = index_of(&THEMES, &self.config.theme);
                 self.theme
                     .update(cx, |state, cx| state.set_selected_index(theme, window, cx));
+                let animation = index_of(&DOCK_ANIMATIONS, &self.config.dock_animation);
+                self.dock_animation
+                    .update(cx, |state, cx| state.set_selected_index(animation, window, cx));
                 let backdrop = index_of(&BACKDROPS, &self.config.backdrop);
                 self.backdrop
                     .update(cx, |state, cx| state.set_selected_index(backdrop, window, cx));
@@ -564,24 +591,6 @@ impl Settings {
                     )
                     .child(divider(p))
                     .child(row(
-                        "Fade dock content",
-                        "Fade icons and status while the dock slides in or out.",
-                        Switch::new("dock-fade")
-                            .checked(self.config.dock_fade)
-                            .accessibility_label("Fade dock content")
-                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
-                                this.save("dock_fade", (*enabled).into(), window, cx);
-                            })),
-                        p,
-                    ))
-                    .child(divider(p))
-                    .child(item("Dock opening time", format!("{} ms. Set to 0 for instant.", self.config.dock_open_ms), p)
-                        .child(Slider::new(&self.dock_open).accessibility_label("Dock opening time")))
-                    .child(divider(p))
-                    .child(item("Dock closing time", format!("{} ms. Set to 0 for instant.", self.config.dock_close_ms), p)
-                        .child(Slider::new(&self.dock_close).accessibility_label("Dock closing time")))
-                    .child(divider(p))
-                    .child(row(
                         "App window list",
                         "Show a compact window list when hovering a running app icon.",
                         Select::new(&self.window_list)
@@ -645,6 +654,37 @@ impl Settings {
                         Select::new(&self.backdrop).accessibility_label("Backdrop").w(px(160.)),
                         p,
                     )),
+            )
+            .child(div().h_3())
+            .child(label("Dock animation", p))
+            .child(
+                group(p)
+                    .child(row(
+                        "Style",
+                        "How the dock appears and hides.",
+                        Select::new(&self.dock_animation)
+                            .accessibility_label("Dock animation style")
+                            .w(px(160.)),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(
+                        item(
+                            "Dock opening time",
+                            format!("{} ms. Set to 0 for instant.", self.config.dock_open_ms),
+                            p,
+                        )
+                        .child(Slider::new(&self.dock_open).accessibility_label("Dock opening time")),
+                    )
+                    .child(divider(p))
+                    .child(
+                        item(
+                            "Dock closing time",
+                            format!("{} ms. Set to 0 for instant.", self.config.dock_close_ms),
+                            p,
+                        )
+                        .child(Slider::new(&self.dock_close).accessibility_label("Dock closing time")),
+                    ),
             )
             .child(div().h_3())
             .child(label("Results", p))

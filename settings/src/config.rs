@@ -25,7 +25,7 @@ pub struct Config {
     pub dock_icon_size: i64,
     pub dock_open_ms: i64,
     pub dock_close_ms: i64,
-    pub dock_fade: bool,
+    pub dock_animation: String,
     pub hide_taskbar: bool,
     pub window_list: String,
 }
@@ -54,6 +54,11 @@ impl Config {
         };
         let theme = string("theme")?;
         choice(&theme, &["system", "dark", "light"], "theme")?;
+        choice(
+            &string("dock_animation")?,
+            &["slide", "fade", "rise-fade", "scale-fade"],
+            "dock_animation",
+        )?;
         let backdrop = string("backdrop")?;
         choice(&backdrop, &["acrylic", "mica", "solid"], "backdrop")?;
         let position = string("position")?;
@@ -102,7 +107,7 @@ impl Config {
             dock_icon_size,
             dock_open_ms: duration("dock_open_ms")?,
             dock_close_ms: duration("dock_close_ms")?,
-            dock_fade: boolean("dock_fade")?,
+            dock_animation: string("dock_animation")?,
             hide_taskbar: boolean("hide_taskbar")?,
             window_list,
         })
@@ -226,7 +231,7 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         | "dock_icon_size"
         | "dock_open_ms"
         | "dock_close_ms"
-        | "dock_fade"
+        | "dock_animation"
         | "hide_taskbar" => {}
         "window_list" if !matches!(value.as_str(), Some("always" | "multiple" | "off")) => {
             return Err("window_list must be always, multiple or off.".into());
@@ -254,15 +259,19 @@ mod tests {
         assert!(config.dock && config.dock_autohide && config.hide_taskbar);
         assert_eq!(config.dock_icon_size, 24);
         assert_eq!(
-            (config.dock_open_ms, config.dock_close_ms, config.dock_fade),
-            (180, 140, true)
+            (
+                config.dock_open_ms,
+                config.dock_close_ms,
+                config.dock_animation.as_str()
+            ),
+            (180, 140, "slide")
         );
         // A config from Wisp 0.3 has no dock keys and keeps the taskbar, as in the launcher.
         let old = Config::from_document(&"hotkey = 'Alt+Space'".parse().unwrap()).unwrap();
         assert!(!old.dock && !old.hide_taskbar);
         assert_eq!(old.position, "center");
         assert_eq!(old.max_results, config.max_results);
-        assert_eq!(config.window_list, "multiple");
+        assert_eq!(config.window_list, "always");
         assert_eq!(Config::from_document(&DEFAULT_CONFIG.parse().unwrap()).unwrap(), config);
     }
 

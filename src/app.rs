@@ -616,7 +616,7 @@ impl Launcher {
             dock.set_animation(
                 self.config.dock_open_ms,
                 self.config.dock_close_ms,
-                self.config.dock_fade,
+                self.config.dock_animation,
             );
             // Notification icons need a home while the taskbar is hidden.
             dock.set_tray(self.taskbar.as_ref().is_some_and(TaskbarHider::is_active));
@@ -1436,6 +1436,13 @@ impl Launcher {
         let stays_open = command.stays_open();
         self.commands.run(command);
         self.commands_sent += 1;
+        // Dock audio commands must not resize the shared launcher window.
+        if !self.visible {
+            if let Some(dock) = &self.dock {
+                dock.update_sound(&self.command_state);
+            }
+            return;
+        }
         if !stays_open {
             self.hide();
             return;
@@ -1529,8 +1536,16 @@ impl Launcher {
                         changed = true;
                     }
                 }
+                commands::Event::Control(hardware) => {
+                    if let Some(dock) = &self.dock {
+                        dock.update_control_hardware(hardware);
+                    }
+                }
                 commands::Event::Failed(error) => tray::notify(self.hwnd, "Wisp", &error, true),
             }
+        }
+        if changed && let Some(dock) = &self.dock {
+            dock.update_sound(&self.command_state);
         }
         if changed && self.visible {
             let selected = self.selected;
@@ -2541,16 +2556,57 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         dock::WM_SHOW_LAUNCHER => {
             with_launcher(Launcher::show);
         }
-        dock::WM_SHOW_SOUND => {
+        dock::sound::WM_SOUND_REFRESH => {
             with_launcher(|l| {
-                l.show();
-                if let Some(index) = l
-                    .surfaces
-                    .specs
-                    .iter()
-                    .position(|spec| spec.title.eq_ignore_ascii_case("Sound"))
+                if let Some(dock) = &l.dock
+                    && dock.sound_window().is_some_and(|hwnd| hwnd.0 as usize == wparam.0)
                 {
-                    l.open_surface(index);
+                    dock.update_sound(&l.command_state);
+                    l.commands.refresh_sound();
+                    if lparam.0 == 1 {
+                        l.commands.refresh();
+                        let _ = l.commands.control(commands::control::Request::Batteries);
+                    }
+                }
+            });
+        }
+        dock::sound::WM_SOUND_ACTION => {
+            with_launcher(|l| {
+                use dock::sound::Action;
+                let Some(window) = l
+                    .dock
+                    .as_ref()
+                    .and_then(Dock::sound_window)
+                    .filter(|hwnd| hwnd.0 as usize == wparam.0)
+                else {
+                    return;
+                };
+                let Some(action) = dock::sound::take_action(window) else {
+                    return;
+                };
+                let result = match action {
+                    Action::Run(command) => {
+                        l.run_command(command);
+                        return;
+                    }
+                    Action::Hardware(request) => {
+                        if !l.commands.control(request) {
+                            tray::notify(
+                                l.hwnd,
+                                "Control Center",
+                                "Device controls are busy. Try again in a moment.",
+                                true,
+                            );
+                        }
+                        return;
+                    }
+                    Action::Settings(uri) => launch::open(uri),
+                    Action::Project => launch::project(),
+                    Action::QuickSettings => launch::quick_settings(),
+                    Action::WispSettings => launch::settings(false),
+                };
+                if let Err(error) = result {
+                    tray::notify(l.hwnd, "Control Center", &error.message(), true);
                 }
             });
         }

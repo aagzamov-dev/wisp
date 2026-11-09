@@ -33,12 +33,17 @@ winresource = "0.1"
 version = "0.62"
 features = [
     "Devices_Bluetooth",
+    "Devices_Bluetooth_GenericAttributeProfile",
+    "Storage_Streams",
     "Devices_Enumeration",
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
     "Media_Control",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Display",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Graphics_Direct2D",

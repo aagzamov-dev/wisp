@@ -26,6 +26,7 @@ pub const NIF_MESSAGE: u32 = 0x01;
 pub const NIF_ICON: u32 = 0x02;
 pub const NIF_TIP: u32 = 0x04;
 pub const NIF_STATE: u32 = 0x08;
+pub const NIF_INFO: u32 = 0x10;
 pub const NIF_GUID: u32 = 0x20;
 
 pub const NIS_HIDDEN: u32 = 0x01;
@@ -59,7 +60,7 @@ pub struct Notify {
     pub tip: Option<String>,
     pub state: u32,
     pub state_mask: u32,
-    /// The timeout/version union; a version only for NIM_SETVERSION.
+    /// The timeout/version union; NIF_INFO uses it for the notification timeout.
     pub version: u32,
     /// Only with NIF_GUID and a nonzero GUID.
     pub guid: Option<GUID>,

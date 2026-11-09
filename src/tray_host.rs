@@ -151,14 +151,15 @@ impl Drop for TrayHost {
 
 /// Sends an app its callback for a gesture on its icon, as Explorer would.
 /// `x` and `y` are the icon's center in physical screen pixels.
-pub fn invoke(icon: &Icon, action: Action, x: i32, y: i32) -> std::result::Result<(), String> {
+pub fn invoke(icon: &Icon, action: Action, x: i32, y: i32) -> std::result::Result<u32, String> {
     let hwnd = HWND(wire::handle(icon.hwnd) as _);
     unsafe {
         if icon.callback == 0 {
             return Err("The icon has no callback message".into());
         }
         let mut pid = 0;
-        if !IsWindow(Some(hwnd)).as_bool() || GetWindowThreadProcessId(hwnd, Some(&mut pid)) == 0 {
+        let thread = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if !IsWindow(Some(hwnd)).as_bool() || thread == 0 {
             return Err("The icon's window is gone".into());
         }
         if icon.pid != 0 && pid != icon.pid {
@@ -174,6 +175,6 @@ pub fn invoke(icon: &Icon, action: Action, x: i32, y: i32) -> std::result::Resul
             let (wp, lp) = model::callback_words(icon.version, icon.uid, event, x, y);
             PostMessageW(Some(hwnd), icon.callback, WPARAM(wp), LPARAM(lp)).map_err(|e| e.message())?;
         }
+        Ok(thread)
     }
-    Ok(())
 }
