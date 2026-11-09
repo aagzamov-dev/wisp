@@ -38,8 +38,7 @@ struct Formats {
     letter: IDWriteTextFormat,
     time: IDWriteTextFormat,
     small: IDWriteTextFormat,
-    /// Segoe Fluent Icons, for the search button and the status glyphs.
-    search: IDWriteTextFormat,
+    /// Segoe Fluent Icons for the status glyphs.
     glyph: IDWriteTextFormat,
     chevron: IDWriteTextFormat,
     /// Tooltips: left-aligned and wrapping.
@@ -147,7 +146,6 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             letter: format(display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0)?,
             time: format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
             small: format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.5)?,
-            search: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 21.0)?,
             glyph: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 17.0)?,
             chevron: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 12.0)?,
             tip,
@@ -256,6 +254,7 @@ impl Renderer {
         max_scroll: f32,
         focus: Option<usize>,
         dragging: Option<(usize, u32)>,
+        page_opacity: f32,
     ) -> Result<()> {
         use super::sound::Style;
         self.paint(hwnd, dpi, palette, |target, formats| {
@@ -269,7 +268,36 @@ impl Renderer {
                 let rt = &target.rt;
                 let brush = &target.brush;
                 let size = rt.GetSize();
-                rt.Clear(Some(&color(0x27272b)));
+                crate::theme::paint_background(rt, brush, palette, 30.);
+                if page_opacity < 1. {
+                    rt.PushLayer(
+                        &D2D1_LAYER_PARAMETERS {
+                            contentBounds: rect(0., 0., size.width, size.height),
+                            opacity: page_opacity,
+                            maskTransform: Matrix3x2::identity(),
+                            ..Default::default()
+                        },
+                        None,
+                    );
+                }
+                let rgb = |color: &D2D1_COLOR_F| {
+                    ((color.r * 255.) as u32) << 16 | ((color.g * 255.) as u32) << 8 | (color.b * 255.) as u32
+                };
+                let surface = |strength: f32| {
+                    let base = &palette.background_solid;
+                    let ink = &palette.text;
+                    rgb(&D2D1_COLOR_F {
+                        r: base.r + (ink.r - base.r) * strength,
+                        g: base.g + (ink.g - base.g) * strength,
+                        b: base.b + (ink.b - base.b) * strength,
+                        a: 1.,
+                    })
+                };
+                let card = surface(0.13);
+                let row = surface(0.17);
+                let hover = surface(0.24);
+                let muted = surface(0.68);
+                let main = rgb(&palette.text);
                 let fill = |r, radius, hex| {
                     brush.SetColor(&color(hex));
                     rt.FillRoundedRectangle(&rounded(r, radius), brush);
@@ -296,11 +324,9 @@ impl Renderer {
                     }
                     let selected = focus == Some(i);
                     let bounds = rect(x, y, x + w, y + h);
-                    let main = 0xf3f3f3;
-                    let muted = 0xb4b4b8;
                     match item.style {
                         Style::Card => {
-                            fill(bounds, 18., 0x3a3a3e);
+                            fill(bounds, 18., card);
                             text(
                                 &item.title,
                                 &formats.control_title,
@@ -309,7 +335,7 @@ impl Renderer {
                             );
                         }
                         Style::Tile(active) => {
-                            fill(bounds, 18., if selected { 0x49494e } else { 0x3a3a3e });
+                            fill(bounds, 18., if selected { hover } else { card });
                             let cy = y + h / 2.;
                             fill(
                                 rect(x + 15., cy - 20., x + 55., cy + 20.),
@@ -336,7 +362,7 @@ impl Renderer {
                             );
                         }
                         Style::Row(active) => {
-                            fill(bounds, 12., if selected || active { 0x4c4c51 } else { 0x404045 });
+                            fill(bounds, 12., if selected || active { hover } else { row });
                             let start = if item.icon.is_empty() { x + 12. } else { x + 39. };
                             text(item.icon, &formats.glyph, rect(x + 7., y, x + 36., y + h), main);
                             if item.detail.is_empty() || item.detail == "✓" || item.detail.ends_with('›') {
@@ -377,7 +403,7 @@ impl Renderer {
                                 .filter(|(index, _)| *index == i)
                                 .map_or(value, |(_, value)| value);
                             let thumb = x + 26. + (w - 39.) * value as f32 / 100.;
-                            fill(bounds, 16., 0x58585e);
+                            fill(bounds, 16., surface(0.26));
                             fill(rect(x, y, (thumb + 14.).min(x + w), y + h), 16., 0xefeff0);
                             fill(rect(thumb - 12., y + 3., thumb + 12., y + h - 3.), 13., 0xffffff);
                             text(item.icon, &formats.glyph, rect(x + 3., y, x + 35., y + h), 0x616167);
@@ -393,7 +419,7 @@ impl Renderer {
                         }
                         Style::MediaButton(primary) => {
                             if selected || primary {
-                                fill(bounds, h / 2., if selected { 0x616168 } else { 0x505056 });
+                                fill(bounds, h / 2., if selected { hover } else { row });
                             }
                             text(item.icon, &formats.glyph, bounds, main);
                         }
@@ -435,7 +461,7 @@ impl Renderer {
                         }
                         Style::Text => {
                             if selected {
-                                fill(bounds, 12., 0x49494e);
+                                fill(bounds, 12., hover);
                             }
                             let split = if item.detail.is_empty() { w } else { w * 0.68 };
                             text(
@@ -461,7 +487,10 @@ impl Renderer {
                     let track = (size.height - 32.).max(0.);
                     let thumb = (track * size.height / (size.height + max_scroll)).clamp(18_f32.min(track), track);
                     let top = 16. + (track - thumb) * (scroll / max_scroll).clamp(0., 1.);
-                    fill(rect(size.width - 7., top, size.width - 4., top + thumb), 1.5, 0x75757b);
+                    fill(rect(size.width - 7., top, size.width - 4., top + thumb), 1.5, muted);
+                }
+                if page_opacity < 1. {
+                    rt.PopLayer();
                 }
             }
             Ok(())
@@ -509,75 +538,86 @@ impl Renderer {
         dpi: u32,
         palette: &Palette,
         rows: &[String],
-        hover: Option<usize>,
-        preview: (f32, bool),
+        hover: Option<(usize, bool)>,
+        (card_width, preview_height): (f32, f32),
+        previews: &[Option<isize>],
+        (page, page_count): (usize, usize),
     ) -> Result<()> {
         self.paint(hwnd, dpi, palette, |target, formats| {
             background(target, palette, 1.0);
-            let size = unsafe { target.rt.GetSize() };
-            if preview.0 > 0.0 && !preview.1 {
-                let text: Vec<u16> = "Preview unavailable".encode_utf16().collect();
-                unsafe {
-                    target.brush.SetColor(&palette.text);
-                    target.rt.DrawText(
-                        &text,
+            let pad = logic::PREVIEW_PAD;
+            let header = logic::PREVIEW_HEADER;
+            let bottom = pad + header + preview_height;
+            let rt = &target.rt;
+            let brush = &target.brush;
+            unsafe {
+                for (index, title) in rows.iter().enumerate() {
+                    let left = pad + card_width * index as f32;
+                    let right = left + card_width;
+                    let hovered = hover.is_some_and(|(row, _)| row == index);
+                    brush.SetColor(if hovered { &palette.row_selected } else { &palette.tile });
+                    rt.FillRoundedRectangle(&rounded(rect(left + 2., pad, right - 2., bottom), 7.), brush);
+                    brush.SetColor(&palette.text);
+                    text(
+                        rt,
+                        brush,
                         &formats.row,
-                        &rect(12.0, 12.0, size.width - 12.0, preview.0),
-                        &target.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        DWRITE_MEASURING_MODE_NATURAL,
+                        title,
+                        rect(left + 9., pad, right - 31., pad + header),
                     );
-                }
-            }
-            for (index, row) in rows.iter().enumerate() {
-                let top = preview.0 + logic::LIST_PAD.1 + index as f32 * logic::LIST_ROW;
-                let line = rect(
-                    logic::LIST_PAD.0,
-                    top,
-                    size.width - logic::LIST_PAD.0,
-                    top + logic::LIST_ROW,
-                );
-                if hover == Some(index) {
-                    unsafe {
-                        target.brush.SetColor(&palette.row_selected);
-                        target.rt.FillRoundedRectangle(&rounded(line, 4.0), &target.brush);
+                    let close = rect(right - 25., pad + 3., right - 5., pad + header - 3.);
+                    if hover == Some((index, true)) {
+                        brush.SetColor(&RED);
+                        rt.FillRoundedRectangle(&rounded(close, 4.), brush);
+                        brush.SetColor(&D2D1_COLOR_F {
+                            r: 1.,
+                            g: 1.,
+                            b: 1.,
+                            a: 1.,
+                        });
+                    }
+                    text(rt, brush, &formats.glyph, "\u{E711}", close);
+                    if preview_height >= 24. && previews.get(index).is_none_or(Option::is_none) {
+                        brush.SetColor(&palette.subtext);
+                        text(
+                            rt,
+                            brush,
+                            &formats.small,
+                            "Preview unavailable",
+                            rect(left + 5., pad + header, right - 5., bottom),
+                        );
                     }
                 }
-                unsafe { target.brush.SetColor(&palette.text) };
-                let wide: Vec<u16> = row.encode_utf16().collect();
-                unsafe {
-                    target.rt.DrawText(
-                        &wide,
-                        &formats.row,
-                        &line,
-                        &target.brush,
-                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                        DWRITE_MEASURING_MODE_NATURAL,
+                if page_count > 1 {
+                    let width = rt.GetSize().width;
+                    let top = bottom + 3.;
+                    let bottom = top + logic::PREVIEW_FOOTER;
+                    brush.SetColor(if page > 0 { &palette.text } else { &palette.subtext });
+                    text(rt, brush, &formats.small, "‹", rect(pad, top, pad + 32., bottom));
+                    brush.SetColor(&palette.subtext);
+                    text(
+                        rt,
+                        brush,
+                        &formats.small,
+                        &format!("{} / {page_count}", page + 1),
+                        rect(width / 2. - 38., top, width / 2. + 38., bottom),
+                    );
+                    brush.SetColor(if page + 1 < page_count {
+                        &palette.text
+                    } else {
+                        &palette.subtext
+                    });
+                    text(
+                        rt,
+                        brush,
+                        &formats.small,
+                        "›",
+                        rect(width - pad - 32., top, width - pad, bottom),
                     );
                 }
             }
             Ok(())
         })
-    }
-
-    /// The window list's window size in DIPs.
-    pub fn measure_windows(&self, rows: &[String]) -> Result<(f32, f32)> {
-        let mut width = 0.0f32;
-        for row in rows {
-            let wide: Vec<u16> = row.encode_utf16().collect();
-            unsafe {
-                let layout = self
-                    .dw
-                    .CreateTextLayout(&wide, &self.formats.row, logic::LIST_TEXT_MAX, 1000.0)?;
-                let mut metrics = DWRITE_TEXT_METRICS::default();
-                layout.GetMetrics(&mut metrics)?;
-                width = width.max(metrics.widthIncludingTrailingWhitespace);
-            }
-        }
-        Ok((
-            width.ceil().min(logic::LIST_TEXT_MAX) + 2.0 * logic::LIST_PAD.0,
-            rows.len() as f32 * logic::LIST_ROW + 2.0 * logic::LIST_PAD.1,
-        ))
     }
 
     /// Draws the desktop pill: a dot per desktop, the current one long, then its name.
@@ -902,9 +942,21 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 icon_top + icon_size,
             );
             let Some(item) = item else {
-                // A quiet search affordance leaves the accent to the running indicator.
-                target.brush.SetColor(&p.subtext);
-                text(&target.rt, &target.brush, &formats.search, "\u{E721}", icon_rect);
+                // Draw the four panes directly so Start does not depend on an icon font.
+                target.brush.SetColor(&p.text);
+                let start_size = icon_size * 0.85;
+                let gap = 2. * frame.layout_scale;
+                let pane = (start_size - gap) / 2.;
+                let step = pane + gap;
+                let half = start_size / 2.;
+                let left = (icon_rect.left + icon_rect.right) / 2. - half;
+                let top = (icon_rect.top + icon_rect.bottom) / 2. - half;
+                for y in [top, top + step] {
+                    for x in [left, left + step] {
+                        let bounds = frame.snap_rect(x, y, x + pane, y + pane);
+                        target.rt.FillRectangle(&bounds, &target.brush);
+                    }
+                }
                 continue;
             };
             let fallback = item

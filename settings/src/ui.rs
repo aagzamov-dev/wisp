@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use gpui_kit::component::{
     button::{Button, ButtonVariants},
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     input::{Input, InputEvent, InputState},
     select::{SearchableVec, Select, SelectEvent, SelectState},
     slider::{Slider, SliderEvent, SliderState},
@@ -24,7 +25,15 @@ const ICON_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
 
 /// Config values and the labels the dropdowns show for them.
 const THEMES: [(&str, &str); 3] = [("system", "System"), ("dark", "Dark"), ("light", "Light")];
-const BACKDROPS: [(&str, &str); 3] = [("acrylic", "Acrylic"), ("mica", "Mica"), ("solid", "Solid")];
+const BACKDROPS: [(&str, &str); 7] = [
+    ("acrylic", "Acrylic"),
+    ("mica", "Mica"),
+    ("solid", "Solid"),
+    ("transparent", "Transparent"),
+    ("glass", "Glass"),
+    ("liquid-glass", "Liquid Glass"),
+    ("color", "Custom color"),
+];
 const DOCK_ANIMATIONS: [(&str, &str); 4] = [
     ("slide", "Slide"),
     ("fade", "Fade"),
@@ -80,6 +89,7 @@ pub struct Settings {
     onboarding: Option<usize>,
     shortcut: Entity<InputState>,
     folder: Entity<InputState>,
+    backdrop_color: Entity<ColorPickerState>,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
     dock_animation: Entity<Choices>,
@@ -126,6 +136,8 @@ impl Settings {
         };
         let shortcut = cx.new(|cx| InputState::new(window, cx).default_value(config.hotkey.clone()));
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
+        let backdrop_color =
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(backdrop_swatch(&config.backdrop_color)));
         let theme = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(labels(&THEMES)),
@@ -190,6 +202,17 @@ impl Settings {
                 cx.notify();
             } else if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                 this.commit_shortcut(window, cx);
+            }
+        })
+        .detach();
+        cx.subscribe_in(&backdrop_color, window, |this, _, event, window, cx| {
+            if let ColorPickerEvent::Change(Some(color)) = event {
+                let rgb = color.to_rgb();
+                let channel = |value: f32| (value.clamp(0., 1.) * 255.).round() as u8;
+                let value = format!("#{:02X}{:02X}{:02X}", channel(rgb.r), channel(rgb.g), channel(rgb.b));
+                if !value.eq_ignore_ascii_case(&this.config.backdrop_color) {
+                    this.save("backdrop_color", value.into(), window, cx);
+                }
             }
         })
         .detach();
@@ -286,6 +309,7 @@ impl Settings {
             onboarding: welcome.then_some(0),
             shortcut,
             folder,
+            backdrop_color,
             theme,
             backdrop,
             dock_animation,
@@ -370,6 +394,9 @@ impl Settings {
                 let animation = index_of(&DOCK_ANIMATIONS, &self.config.dock_animation);
                 self.dock_animation
                     .update(cx, |state, cx| state.set_selected_index(animation, window, cx));
+                let color = backdrop_swatch(&self.config.backdrop_color);
+                self.backdrop_color
+                    .update(cx, |input, cx| input.set_value(color, window, cx));
                 let backdrop = index_of(&BACKDROPS, &self.config.backdrop);
                 self.backdrop
                     .update(cx, |state, cx| state.set_selected_index(backdrop, window, cx));
@@ -566,6 +593,17 @@ impl Settings {
                     ))
                     .child(divider(p))
                     .child(row(
+                        "Open Start with the Windows key",
+                        "Tap either Windows key to open Wisp Start. Windows shortcuts still go to Windows.",
+                        Switch::new("win-start").checked(self.config.win_start)
+                            .accessibility_label("Open Start with the Windows key")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("win_start", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(row(
                         "Keep the dock visible",
                         "Show the dock all the time on the main screen instead of when the pointer touches the bottom edge. While the taskbar is hidden, windows stop above the dock.",
                         Switch::new("dock-visible")
@@ -650,10 +688,18 @@ impl Settings {
                     .child(divider(p))
                     .child(row(
                         "Backdrop",
-                        "Acrylic and mica blur what is behind the launcher and fade in. Solid appears at once.",
+                        "Shared by Start, the Wisp dock, and Control Center.",
                         Select::new(&self.backdrop).accessibility_label("Backdrop").w(px(160.)),
                         p,
-                    )),
+                    ))
+                    .when(self.config.backdrop == "color", |group| {
+                        group.child(divider(p)).child(row(
+                            "Custom color",
+                            "Choose any color or enter its RGB hex value.",
+                            ColorPicker::new(&self.backdrop_color).accessibility_label("Custom backdrop color"),
+                            p,
+                        ))
+                    }),
             )
             .child(div().h_3())
             .child(label("Dock animation", p))
@@ -1120,4 +1166,12 @@ fn hint(text: impl Into<SharedString>, p: Palette) -> Div {
 
 fn error_text(text: &str, p: Palette) -> Div {
     div().text_xs().text_color(p.danger).child(text.to_owned())
+}
+
+fn backdrop_swatch(value: &str) -> Hsla {
+    let value = value
+        .strip_prefix('#')
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .unwrap_or(0x252833);
+    rgb(value).into()
 }

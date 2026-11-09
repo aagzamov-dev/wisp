@@ -20,7 +20,7 @@
   <img src="assets/dock-to-launcher.webp" width="700" alt="The dock slides up, then grows into the launcher">
 </p>
 
-Wisp hides the taskbar and puts a dock in its place. Press <kbd>Alt</kbd>+<kbd>Space</kbd> and the dock grows into a launcher.
+Wisp can hide the Windows taskbar and show a dock in its place. Tap the Windows key or click the dock search icon to open Wisp Start above the dock. <kbd>Alt</kbd>+<kbd>Space</kbd> opens the compact launcher.
 
 It is written in Rust with Win32 and Direct2D. It needs no .NET, web view or PowerToys.
 
@@ -44,11 +44,11 @@ The dock appears when the pointer touches the bottom edge of a screen, and hides
 
 | Do this | To |
 | --- | --- |
-| Click an app | Switch to it |
+| Click an app | Switch to its window, or choose from thumbnails when it has multiple windows |
 | Click the app in front | Minimize it |
 | Middle-click an app | Open a new window of it |
 | Right-click an app | Close its windows |
-| Hover an app with open windows | See its window titles and a live preview when Windows provides one. Click one to switch to it, middle-click to close it. |
+| Hover an app with open windows | See a thumbnail card for each window. Click to switch, or use the close button to close that window. Use the arrows or wheel when the cards span multiple pages. |
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |
 | Right-click **⌄** | Show the taskbar, or open taskbar settings |
@@ -66,7 +66,10 @@ The dock hides over full-screen apps. Tray icons you pin in Windows show in the 
 
 If Wisp quits or crashes, the taskbar comes back with every tray icon.
 
-## Launcher
+## Start and launcher
+
+Wisp Start shows up to 12 pinned apps. Search with the same app, file and command search as the launcher. Right-click an app result to pin it, or right-click a pinned app to remove it. The footer opens profile actions, Settings and Power, including Quit Wisp. Restart, shut down and sign out require a separate confirmation.
+
 
 <p align="center">
   <img src="assets/screenshot-launcher.png" width="700" alt="The launcher searching for apps">
@@ -130,7 +133,9 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `hide_taskbar` | `true` | Hides the Windows taskbar while Wisp runs |
 | `position` | `"bottom"` | `"bottom"` grows the launcher from the dock; `"center"` opens it in the middle |
 | `theme` | `"system"` | `"system"`, `"dark"` or `"light"` |
-| `backdrop` | `"acrylic"` | `"acrylic"`, `"mica"` or `"solid"` |
+| `backdrop` | `"acrylic"` | Shared by Start, the dock and Control Center. Choose Acrylic, Mica, Solid, Transparent, Glass, Liquid Glass or Custom color. |
+| `backdrop_color` | `"#252833"` | RGB hex color used for Custom color. |
+| `win_start` | `true` | A bare Windows key tap opens Wisp Start. Turn this off to restore the Windows Start shortcut. |
 | `max_results` | `8` | Results visible at once |
 | `show_recent` | `true` | Shows recent apps when the box is empty |
 | `file_search` | `true` | Searches files in the Windows Search index |
@@ -151,12 +156,12 @@ Wisp 0.2.0 against PowerToys Run 0.94 on the same PC, median of 30 runs:
 | Memory | **20 MB** | 302 MB |
 | Size on disk | **1.5 MB** (0.4.0) | 794 MB |
 
-The dock grows into the launcher in 155 ms. A hidden dock uses almost no CPU. [`bench/`](bench) has the method and full results.
+A hidden dock uses almost no CPU. [`bench/`](bench) has the method and full results.
 
 ## How it works
 
 - **Tray icons:** Wisp creates its own hidden `Shell_TrayWnd`, which apps find first. Wisp copies each icon and passes the message on to Explorer.
-- **One window:** the dock and the launcher are the same window, so the dock can grow into the launcher.
+- **Start:** the dock has its own window and stays visible while Start is open. Start shares the launcher’s renderer, index and search.
 - **Blur:** Windows turns off blur for inactive windows. The dock is never active, so it uses an older blur API that stays on.
 - **Drawing:** Direct2D draws in software. At this size it is fast and saves about 30 MB.
 - **Apps:** Wisp reads `shell:AppsFolder`, the same list Start uses.

@@ -12,7 +12,9 @@ fn rgba(hex: u32, a: f32) -> D2D1_COLOR_F {
     }
 }
 
+#[derive(Clone)]
 pub struct Palette {
+    pub glass_rim: bool,
     pub background: D2D1_COLOR_F,
     pub text: D2D1_COLOR_F,
     pub subtext: D2D1_COLOR_F,
@@ -32,6 +34,7 @@ impl Palette {
     pub fn new(dark: bool, translucent: bool) -> Self {
         if dark {
             Self {
+                glass_rim: false,
                 background: if translucent {
                     rgba(0x1C1C1C, 0.3)
                 } else {
@@ -50,6 +53,7 @@ impl Palette {
             }
         } else {
             Self {
+                glass_rim: false,
                 background: if translucent {
                     rgba(0xF3F3F3, 0.4)
                 } else {
@@ -93,7 +97,13 @@ pub fn transparency_available() -> bool {
 }
 
 /// Nonactivating surfaces need the composition acrylic policy as well as DWM's backdrop.
-fn composition_acrylic(hwnd: windows::Win32::Foundation::HWND, enabled: bool, palette: &Palette) -> bool {
+fn composition_material(
+    hwnd: windows::Win32::Foundation::HWND,
+    state: u32,
+    alpha: u32,
+    flags: u32,
+    palette: &Palette,
+) -> bool {
     use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     use windows::core::{BOOL, s, w};
     #[repr(C)]
@@ -119,9 +129,9 @@ fn composition_acrylic(hwnd: windows::Win32::Foundation::HWND, enabled: bool, pa
         let set: unsafe extern "system" fn(windows::Win32::Foundation::HWND, *mut Attribute) -> BOOL =
             std::mem::transmute(proc);
         let mut accent = Accent {
-            state: if enabled { 4 } else { 0 },
-            flags: 2,
-            tint: 0x70000000
+            state,
+            flags,
+            tint: (alpha << 24)
                 | ((palette.background_solid.b * 255.0) as u32) << 16
                 | ((palette.background_solid.g * 255.0) as u32) << 8
                 | (palette.background_solid.r * 255.0) as u32,
@@ -144,25 +154,60 @@ pub fn apply_backdrop(
     dark: bool,
     backdrop: crate::config::Backdrop,
     persistent: bool,
+    color: &str,
 ) -> Palette {
     use crate::config::Backdrop;
     use windows::Win32::Graphics::Dwm::*;
     use windows::Win32::UI::Controls::MARGINS;
-    let translucent = backdrop != Backdrop::Solid && transparency_available();
+    let translucent = !matches!(backdrop, Backdrop::Solid | Backdrop::Color) && transparency_available();
+    let glass = matches!(backdrop, Backdrop::Glass | Backdrop::LiquidGlass);
     let mut palette = Palette::new(dark, translucent);
+    if backdrop == Backdrop::Color
+        && let Some(rgb) = color
+            .strip_prefix('#')
+            .filter(|color| color.len() == 6)
+            .and_then(|color| u32::from_str_radix(color, 16).ok())
+    {
+        let fill = rgba(rgb, 1.);
+        let luminance = 0.2126 * fill.r + 0.7152 * fill.g + 0.0722 * fill.b;
+        palette = Palette::new(luminance < 0.49, false);
+        palette.background = fill;
+        palette.background_solid = fill;
+    }
+    if translucent {
+        match backdrop {
+            Backdrop::Transparent => palette.background.a = 0.15,
+            Backdrop::Glass => palette.background.a = 0.12,
+            Backdrop::LiquidGlass => {
+                palette.background.a = 0.09;
+                palette.glass_rim = true;
+            }
+            _ => {}
+        }
+    }
     unsafe {
         let set = |attr, value: i32| DwmSetWindowAttribute(hwnd, attr, (&value as *const i32).cast(), 4);
         let _ = set(DWMWA_USE_IMMERSIVE_DARK_MODE, i32::from(dark));
         let _ = set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND.0);
         let _ = set(DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE as i32);
-        let accent = persistent && backdrop == Backdrop::Acrylic && translucent;
-        let material = if !translucent || accent {
+        let (accent, tint) = if translucent {
+            match backdrop {
+                Backdrop::Acrylic if persistent => (4, 0x70),
+                Backdrop::Transparent => (2, 0x38),
+                Backdrop::Glass => (4, 0x24),
+                Backdrop::LiquidGlass => (4, 0x16),
+                _ => (0, 0),
+            }
+        } else {
+            (0, 0)
+        };
+        let material = if !translucent || accent != 0 {
             DWMSBT_NONE
         } else {
             match backdrop {
                 Backdrop::Acrylic => DWMSBT_TRANSIENTWINDOW,
                 Backdrop::Mica => DWMSBT_MAINWINDOW,
-                Backdrop::Solid => DWMSBT_NONE,
+                _ => DWMSBT_NONE,
             }
         };
         {
@@ -171,10 +216,10 @@ pub fn apply_backdrop(
             SetWindowLongPtrW(
                 hwnd,
                 GWL_STYLE,
-                if persistent {
-                    style & !(WS_CAPTION.0 as isize)
-                } else {
+                if !persistent {
                     style | WS_CAPTION.0 as isize
+                } else {
+                    style & !(WS_CAPTION.0 as isize)
                 },
             );
             let _ = SetWindowPos(
@@ -188,20 +233,33 @@ pub fn apply_backdrop(
             );
         }
         let system = set(DWMWA_SYSTEMBACKDROP_TYPE, material.0).is_ok();
-        let _ = DwmExtendFrameIntoClientArea(
+        let margin = if !persistent { -1 } else { 0 };
+        let extended = DwmExtendFrameIntoClientArea(
             hwnd,
             &MARGINS {
-                cxLeftWidth: if persistent { 0 } else { -1 },
-                cxRightWidth: if persistent { 0 } else { -1 },
-                cyTopHeight: if persistent { 0 } else { -1 },
-                cyBottomHeight: if persistent { 0 } else { -1 },
+                cxLeftWidth: margin,
+                cxRightWidth: margin,
+                cyTopHeight: margin,
+                cyBottomHeight: margin,
             },
-        );
+        )
+        .is_ok();
         if !persistent {
             let _ = windows::Win32::Graphics::Gdi::SetWindowRgn(hwnd, None, false);
         }
-        let composition = composition_acrylic(hwnd, accent, &palette);
-        if !system || accent && !composition {
+        // Match the transparent accent path, using acrylic blur with a
+        // low nonzero tint and without the modern acrylic recipe.
+        let flags = if glass && accent == 4 { 0 } else { 2 };
+        let composition = composition_material(hwnd, accent, tint, flags, &palette);
+        let shown = if accent == 0 {
+            system && extended
+        } else if !composition && glass {
+            palette.background.a = 0.15;
+            composition_material(hwnd, 2, 0x38, 2, &palette)
+        } else {
+            composition
+        };
+        if translucent && !shown {
             palette = Palette::new(dark, false);
         }
     }
@@ -225,7 +283,13 @@ pub fn paint_background(
         rt.GetDpi(&mut dpi, &mut dpi_y);
         let pixel = 96.0 / dpi;
         brush.SetColor(&D2D1_COLOR_F {
-            a: if palette.text.r > 0.5 { 0.14 } else { 0.12 },
+            a: if palette.glass_rim {
+                0.35
+            } else if palette.text.r > 0.5 {
+                0.14
+            } else {
+                0.12
+            },
             ..palette.text
         });
         rt.DrawRoundedRectangle(

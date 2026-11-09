@@ -22,6 +22,7 @@ use crate::theme::Palette;
 pub const WM_SOUND_ACTION: u32 = WM_APP + 26;
 pub const WM_SOUND_REFRESH: u32 = WM_APP + 27;
 const REFRESH: usize = 1;
+const PAGE_FADE: usize = 3;
 const WIDTH: f32 = 424.0;
 
 #[derive(Clone)]
@@ -115,7 +116,8 @@ struct Panel {
     scroll: f32,
     focus: Option<usize>,
     dragging: Option<(usize, u32)>,
-    fade: Option<Instant>,
+    page_fade_ms: u32,
+    page_fade: Option<Instant>,
 }
 
 fn preferences() -> std::path::PathBuf {
@@ -753,6 +755,10 @@ impl Panel {
         let action = match click {
             Click::Page(page) => {
                 self.page = page;
+                if super::client_animations_enabled() && unsafe { SetTimer(Some(hwnd), PAGE_FADE, 15, None) } != 0 {
+                    self.page_fade_ms = 105;
+                    self.page_fade = Some(Instant::now());
+                }
                 self.scroll = 0.;
                 self.focus = None;
                 self.rebuild();
@@ -829,6 +835,8 @@ pub fn open(
     state: State,
     hardware: control::Hardware,
     renderer: Renderer,
+    material: (bool, crate::config::Backdrop, &str),
+    open_ms: u32,
 ) -> Result<HWND> {
     unsafe {
         let instance = GetModuleHandleW(None)?.into();
@@ -884,7 +892,8 @@ pub fn open(
             scroll: 0.,
             focus: None,
             dragging: None,
-            fade: None,
+            page_fade_ms: open_ms,
+            page_fade: None,
         };
         contents.rebuild();
         contents.height = contents.content_height().min(contents.max_height);
@@ -909,16 +918,31 @@ pub fn open(
             GWLP_USERDATA,
             Box::into_raw(Box::new(RefCell::new(contents))) as isize,
         );
+        apply_theme(hwnd, material.0, material.1, material.2);
         crate::theme::shape(hwnd, width, height, 30., dpi);
-        if let Some(cell) = panel(hwnd).as_ref() {
-            let fade = super::start_popup_fade(hwnd);
-            cell.borrow_mut().fade = fade;
+        if open_ms != 0
+            && super::client_animations_enabled()
+            && SetTimer(Some(hwnd), PAGE_FADE, 15, None) != 0
+            && let Some(cell) = panel(hwnd).as_ref()
+        {
+            cell.borrow_mut().page_fade = Some(Instant::now());
         }
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = SetForegroundWindow(hwnd);
         let _ = SetTimer(Some(hwnd), REFRESH, 1000, None);
         let _ = PostMessageW(Some(launcher), WM_SOUND_REFRESH, WPARAM(hwnd.0 as usize), LPARAM(1));
         Ok(hwnd)
+    }
+}
+
+pub fn apply_theme(hwnd: HWND, dark: bool, backdrop: crate::config::Backdrop, color: &str) {
+    if let Some(cell) = unsafe { panel(hwnd).as_ref() }
+        && let Ok(mut p) = cell.try_borrow_mut()
+    {
+        p.palette = crate::theme::apply_backdrop(hwnd, dark, backdrop, true, color);
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 }
 
@@ -963,6 +987,12 @@ pub fn take_action(hwnd: HWND) -> Option<Action> {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if msg == WM_NCCALCSIZE && wp.0 != 0 {
+            return LRESULT(0);
+        }
+        if msg == WM_NCACTIVATE {
+            return DefWindowProcW(hwnd, msg, wp, LPARAM(-1));
+        }
         if msg == WM_NCDESTROY {
             let data = panel(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -987,6 +1017,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut paint = PAINTSTRUCT::default();
                 let _ = BeginPaint(hwnd, &mut paint);
                 let max_scroll = p.max_scroll();
+                let page_opacity = p.page_fade.map_or(1., |start| {
+                    let t = (start.elapsed().as_secs_f32() * 1000. / p.page_fade_ms.max(1) as f32).min(1.);
+                    0.55 + 0.45 * (1. - (1. - t).powi(3))
+                });
                 let Panel {
                     renderer,
                     dpi,
@@ -997,18 +1031,34 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     dragging,
                     ..
                 } = &mut *p;
-                let _ = renderer.draw_control(hwnd, *dpi, palette, elements, *scroll, max_scroll, *focus, *dragging);
+                let _ = renderer.draw_control(
+                    hwnd,
+                    *dpi,
+                    palette,
+                    elements,
+                    *scroll,
+                    max_scroll,
+                    *focus,
+                    *dragging,
+                    page_opacity,
+                );
                 let _ = EndPaint(hwnd, &paint);
                 return LRESULT(0);
+            }
+            WM_TIMER if wp.0 == PAGE_FADE => {
+                if p.page_fade
+                    .is_some_and(|start| start.elapsed().as_millis() >= u128::from(p.page_fade_ms))
+                {
+                    p.page_fade = None;
+                    let _ = KillTimer(Some(hwnd), PAGE_FADE);
+                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             WM_TIMER if wp.0 == REFRESH => {
                 if p.page == Page::Home && p.elements.iter().any(|e| matches!(e.style, Style::Timeline(_, true))) {
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 let _ = PostMessageW(Some(p.launcher), WM_SOUND_REFRESH, WPARAM(hwnd.0 as usize), LPARAM(0));
-            }
-            WM_TIMER if wp.0 == super::POPUP_FADE_TIMER => {
-                super::tick_popup_fade(hwnd, &mut p.fade);
             }
             WM_ACTIVATE if wp.0 & 0xffff == WA_INACTIVE as usize => {
                 let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));

@@ -26,6 +26,11 @@ pub enum Backdrop {
     Acrylic,
     Mica,
     Solid,
+    Transparent,
+    Glass,
+    #[serde(rename = "liquid-glass")]
+    LiquidGlass,
+    Color,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -63,6 +68,8 @@ pub enum DockAnimation {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub hide_taskbar: bool,
+    pub win_start: bool,
+    pub backdrop_color: String,
     pub dock: bool,
     pub dock_autohide: bool,
     pub dock_icon_size: usize,

@@ -65,11 +65,15 @@ const TIP_MAX: f32 = 320.0;
 /// has left both the list and the dock.
 const WINDOWS_TIMER: usize = 107;
 const WINDOWS_HIDE_TIMER: usize = 108;
-const POPUP_FADE_TIMER: usize = 2;
-const POPUP_FADE_MS: f32 = 105.;
+pub(crate) const POPUP_FADE_TIMER: usize = 110;
+#[derive(Clone, Copy)]
+pub(crate) struct PopupFade {
+    started: Instant,
+    ms: u32,
+}
 const POPUP_START_ALPHA: u8 = 115;
 
-fn client_animations_enabled() -> bool {
+pub(crate) fn client_animations_enabled() -> bool {
     let mut enabled = BOOL(1);
     unsafe {
         let _ = SystemParametersInfoW(
@@ -82,8 +86,8 @@ fn client_animations_enabled() -> bool {
     enabled.as_bool()
 }
 
-fn start_popup_fade(hwnd: HWND) -> Option<Instant> {
-    if !client_animations_enabled() {
+pub(crate) fn start_popup_fade(hwnd: HWND, ms: u32) -> Option<PopupFade> {
+    if ms == 0 || !client_animations_enabled() {
         return None;
     }
     unsafe {
@@ -96,12 +100,15 @@ fn start_popup_fade(hwnd: HWND) -> Option<Instant> {
             return None;
         }
     }
-    Some(Instant::now())
+    Some(PopupFade {
+        started: Instant::now(),
+        ms,
+    })
 }
 
-fn tick_popup_fade(hwnd: HWND, fade: &mut Option<Instant>) {
-    let Some(start) = *fade else { return };
-    let t = start.elapsed().as_secs_f32() * 1000. / POPUP_FADE_MS;
+pub(crate) fn tick_popup_fade(hwnd: HWND, fade: &mut Option<PopupFade>) {
+    let Some(animation) = *fade else { return };
+    let t = animation.started.elapsed().as_secs_f32() * 1000. / animation.ms as f32;
     if t >= 1. {
         fade.take();
         finish_popup_fade(hwnd);
@@ -113,7 +120,7 @@ fn tick_popup_fade(hwnd: HWND, fade: &mut Option<Instant>) {
     }
 }
 
-fn finish_popup_fade(hwnd: HWND) {
+pub(crate) fn finish_popup_fade(hwnd: HWND) {
     unsafe {
         let _ = KillTimer(Some(hwnd), POPUP_FADE_TIMER);
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -153,6 +160,8 @@ struct State {
     items: Vec<Item>,
     palette: Palette,
     backdrop: Backdrop,
+    backdrop_color: String,
+    dark: bool,
     window_list_mode: WindowListMode,
     app_icon_size: f32,
     renderer: render::Renderer,
@@ -192,8 +201,12 @@ struct State {
     sound: HWND,
     sound_state: crate::commands::State,
     sound_hardware: crate::commands::control::Hardware,
-    preview: Option<(isize, isize)>,
+    previews: Vec<Option<isize>>,
     preview_height: f32,
+    preview_width: f32,
+    preview_page: usize,
+    preview_count: usize,
+    windows_clicked: bool,
     hover_levels: Vec<f32>,
     hover_tick: Option<Instant>,
     /// Wheel delta over the volume not yet spent on a whole percent.
@@ -215,7 +228,8 @@ struct State {
     /// Lists every notification icon above the chevron.
     flyout: HWND,
     flyout_open: bool,
-    flyout_fade: Option<Instant>,
+    start_open: bool,
+    flyout_fade: Option<PopupFade>,
     flyout_hover: Option<usize>,
     flyout_renderer: render::Renderer,
     tip: HWND,
@@ -230,7 +244,7 @@ struct State {
     windows_slot: Option<usize>,
     windows_rows: Vec<String>,
     windows_targets: Vec<isize>,
-    windows_hover: Option<usize>,
+    windows_hover: Option<(usize, bool)>,
     /// The last click on a notification icon, to tell double clicks.
     tray_click: Option<(tray_host::Key, Instant)>,
     /// The demo's flyout and its hovered icon, applied as icons arrive.
@@ -266,6 +280,8 @@ impl Dock {
             items: Vec::new(),
             palette: Palette::new(true, true),
             backdrop: Backdrop::Acrylic,
+            backdrop_color: String::new(),
+            dark: true,
             window_list_mode: WindowListMode::default(),
             app_icon_size: logic::DEFAULT_APP_ICON_SIZE,
             renderer: render::Renderer::new()?,
@@ -299,8 +315,12 @@ impl Dock {
             sound: HWND::default(),
             sound_state: crate::commands::State::default(),
             sound_hardware: crate::commands::control::Hardware::default(),
-            preview: None,
-            preview_height: 0.0,
+            previews: Vec::new(),
+            preview_height: 0.,
+            preview_width: 0.,
+            preview_page: 0,
+            preview_count: 0,
+            windows_clicked: false,
             hover_levels: Vec::new(),
             hover_tick: None,
             wheel: 0,
@@ -315,6 +335,7 @@ impl Dock {
             inline: Vec::new(),
             flyout: HWND::default(),
             flyout_open: false,
+            start_open: false,
             flyout_fade: None,
             flyout_hover: None,
             flyout_renderer: render::Renderer::new()?,
@@ -448,7 +469,7 @@ impl Dock {
             }
             dock.hooks.push(hook);
         }
-        dock.apply_theme(Palette::new(true, true), Backdrop::Acrylic);
+        dock.apply_theme(true, Backdrop::Acrylic, "");
         dock.refresh();
         Ok(dock)
     }
@@ -622,8 +643,8 @@ impl Dock {
         self.state.borrow_mut().refresh();
     }
 
-    pub fn apply_theme(&mut self, palette: Palette, backdrop: Backdrop) {
-        self.state.borrow_mut().apply_material(palette.text.r > 0.5, backdrop);
+    pub fn apply_theme(&mut self, dark: bool, backdrop: Backdrop, color: &str) {
+        self.state.borrow_mut().apply_material(dark, backdrop, color);
     }
 
     /// Hosts the notification area in the dock while `enabled`, which
@@ -658,6 +679,37 @@ impl Dock {
 
     /// Lets the dock auto-hide: it appears when the pointer reaches the
     /// bottom edge of a screen.
+    pub fn set_start_open(&mut self, open: bool) {
+        let mut s = self.state.borrow_mut();
+        s.start_open = open;
+        s.away = 0;
+        if open {
+            s.close_flyout();
+            s.close_sound();
+            s.hide_tip();
+            s.hide_windows();
+            if !s.visible {
+                s.visible = true;
+                unsafe {
+                    let _ = SetTimer(Some(s.hwnd), POLL_TIMER, POLL_MS, None);
+                }
+            }
+            if !s.revealed {
+                s.reveal();
+            }
+        } else if s.autohide && s.revealed && !s.held && !s.flyout_open && !s.sound_open() && !s.tray_menu_active() {
+            let slack = (12 * s.dpi / 96) as i32;
+            let mut cursor = POINT::default();
+            if unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                && (cursor.x < s.left - slack || cursor.x >= s.left + s.width + slack || cursor.y < s.top - slack)
+            {
+                s.hide_tip();
+                s.revealed = false;
+                s.start_slide(1.);
+            }
+        }
+    }
+
     pub fn show(&mut self) {
         self.state.borrow_mut().suspended = false;
         let mut s = self.state.borrow_mut();
@@ -834,11 +886,16 @@ impl State {
         }
     }
 
-    fn apply_material(&mut self, dark: bool, backdrop: Backdrop) {
+    fn apply_material(&mut self, dark: bool, backdrop: Backdrop, color: &str) {
         self.backdrop = backdrop;
-        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true);
+        self.backdrop_color = color.to_owned();
+        self.dark = dark;
+        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true, color);
+        if self.sound_open() {
+            sound::apply_theme(self.sound, dark, backdrop, color);
+        }
         for hwnd in [self.flyout, self.tip, self.windows] {
-            crate::theme::apply_backdrop(hwnd, dark, backdrop, true);
+            crate::theme::apply_backdrop(hwnd, dark, backdrop, true, color);
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -889,24 +946,26 @@ impl State {
         let previous = self
             .windows_slot
             .and_then(|slot| self.item_at(slot))
-            .map(|item| (item.app.id.clone(), item.app.name.clone(), item.windows.clone()));
+            .map(|item| (item.app.id.clone(), item.windows.clone()));
         self.items = logic::stable_order(std::mem::take(&mut self.items), items, |old, new| {
             old.app.id.eq_ignore_ascii_case(&new.app.id)
         });
-        if let Some(slot) = self.windows_slot
-            && self.item_at(slot).is_none_or(|item| {
-                !logic::show_window_list(self.window_list_mode, item.windows.len())
-                    || previous.as_ref().is_none_or(|(id, name, windows)| {
-                        !id.eq_ignore_ascii_case(&item.app.id)
-                            || *name != item.app.name
-                            || windows.len() != item.windows.len()
-                            || windows
-                                .iter()
-                                .any(|old| !item.windows.iter().any(|new| old.hwnd == new.hwnd))
-                    })
-            })
-        {
-            self.hide_windows();
+        let mut previews_changed = false;
+        if let Some(slot) = self.windows_slot {
+            let same_app = self.item_at(slot).zip(previous.as_ref()).filter(|(item, (id, _))| {
+                id.eq_ignore_ascii_case(&item.app.id)
+                    && !item.windows.is_empty()
+                    && (self.windows_clicked || logic::show_window_list(self.window_list_mode, item.windows.len()))
+            });
+            if let Some((item, (_, windows))) = same_app {
+                previews_changed = !self.windows_rows.is_empty()
+                    && (windows.len() != item.windows.len()
+                        || windows
+                            .iter()
+                            .any(|old| !item.windows.iter().any(|new| old.hwnd == new.hwnd)));
+            } else {
+                self.hide_windows();
+            }
         }
         self.status = status::read();
         self.place();
@@ -915,7 +974,11 @@ impl State {
         }
         self.fullscreen = fullscreen_foreground(self.hwnd);
         if !self.fullscreen {
-            self.refresh_window_titles();
+            if previews_changed && self.windows_slot.is_some() {
+                self.show_windows();
+            } else {
+                self.refresh_window_titles();
+            }
         }
         if self.fullscreen {
             self.hide_windows();
@@ -965,7 +1028,7 @@ impl State {
             self.restore_tray_order();
         }
         let hidden = !self.revealed && self.slide.is_none();
-        if !hidden && !tray_busy && fullscreen_foreground(self.hwnd) {
+        if !hidden && !tray_busy && !self.start_open && fullscreen_foreground(self.hwnd) {
             self.stop_slide();
             self.close_sound();
             self.revealed = false;
@@ -1020,6 +1083,7 @@ impl State {
             && cursor.y >= windows_rect.top
             && cursor.y < windows_rect.bottom;
         let near = !self.autohide
+            || self.start_open
             || tray_busy
             || self.sound_open()
             || self.held
@@ -1506,7 +1570,7 @@ impl State {
         self.flyout_hover = None;
         self.layout_flyout();
         if !self.held {
-            self.flyout_fade = start_popup_fade(self.flyout);
+            self.flyout_fade = start_popup_fade(self.flyout, self.open_ms);
         }
         unsafe {
             let _ = ShowWindow(self.flyout, SW_SHOWNA);
@@ -1673,6 +1737,9 @@ impl State {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
         }
+        if self.windows_clicked && slot == self.windows_slot {
+            return;
+        }
         let slot = slot.filter(|&slot| {
             self.window_list_mode != WindowListMode::Off
                 && self
@@ -1700,71 +1767,69 @@ impl State {
 
     /// Hides the window list and forgets its windows.
     fn clear_preview(&mut self) {
-        if let Some((_, thumbnail)) = self.preview.take() {
+        for thumbnail in self.previews.drain(..).flatten() {
             let _ = unsafe { windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail) };
         }
     }
 
-    fn update_preview(&mut self) {
+    fn update_previews(&mut self) {
         use windows::Win32::Graphics::Dwm::*;
-        let source = self.windows_targets.get(self.windows_hover.unwrap_or(0)).copied();
-        if self.preview_height == 0.0 || source.is_none() {
-            self.clear_preview();
-            return;
-        }
-        let source = source.unwrap();
-        if self.preview.is_some_and(|(current, _)| current == source) {
-            return;
-        }
-        self.clear_preview();
-        let result = unsafe { DwmRegisterThumbnail(self.windows, HWND(source as _)) };
-        let Ok(thumbnail) = result else {
-            if let Err(error) = result {
-                eprintln!("Window preview registration: {error}");
-            }
-            return;
-        };
-        let updated = unsafe {
-            DwmQueryThumbnailSourceSize(thumbnail).and_then(|size| {
-                if size.cx <= 0 || size.cy <= 0 {
-                    return Err(Error::new(E_FAIL, "Windows returned an empty preview"));
+        let scale = self.dpi as f32 / 96.;
+        let px = |dip: f32| (dip * scale).round() as i32;
+        self.previews = self
+            .windows_targets
+            .iter()
+            .enumerate()
+            .map(|(index, &source)| {
+                if self.preview_height < 24. {
+                    return None;
                 }
-                let mut client = RECT::default();
-                GetClientRect(self.windows, &mut client)?;
-                let padding = (6.0 * self.dpi as f32 / 96.0).round() as i32;
-                let available = (self.preview_height * self.dpi as f32 / 96.0).round() as i32 - padding * 2;
-                let factor = ((client.right - padding * 2) as f32 / size.cx.max(1) as f32)
-                    .min(available as f32 / size.cy.max(1) as f32);
-                let width = (size.cx as f32 * factor).round().max(1.0) as i32;
-                let height = (size.cy as f32 * factor).round().max(1.0) as i32;
-                let left = (client.right - width) / 2;
-                let top = padding + (available - height) / 2;
-                DwmUpdateThumbnailProperties(
-                    thumbnail,
-                    &DWM_THUMBNAIL_PROPERTIES {
-                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
-                        rcDestination: RECT {
-                            left,
-                            top,
-                            right: left + width,
-                            bottom: top + height,
-                        },
-                        fVisible: BOOL(1),
-                        ..Default::default()
-                    },
-                )
+                let thumbnail = unsafe { DwmRegisterThumbnail(self.windows, HWND(source as _)) }.ok()?;
+                let updated = unsafe {
+                    DwmQueryThumbnailSourceSize(thumbnail).is_ok_and(|size| {
+                        if size.cx <= 0 || size.cy <= 0 {
+                            return false;
+                        }
+                        let box_width = self.preview_width - 12.;
+                        let factor = (box_width / size.cx as f32).min(self.preview_height / size.cy as f32);
+                        let width = size.cx as f32 * factor;
+                        let height = size.cy as f32 * factor;
+                        let left =
+                            logic::PREVIEW_PAD + index as f32 * self.preview_width + (self.preview_width - width) / 2.;
+                        let top = logic::PREVIEW_PAD + logic::PREVIEW_HEADER + (self.preview_height - height) / 2.;
+                        DwmUpdateThumbnailProperties(
+                            thumbnail,
+                            &DWM_THUMBNAIL_PROPERTIES {
+                                dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
+                                rcDestination: RECT {
+                                    left: px(left),
+                                    top: px(top),
+                                    right: px(left + width),
+                                    bottom: px(top + height),
+                                },
+                                opacity: 255,
+                                fVisible: BOOL(1),
+                                ..Default::default()
+                            },
+                        )
+                        .is_ok()
+                    })
+                };
+                if updated {
+                    Some(thumbnail)
+                } else {
+                    let _ = unsafe { DwmUnregisterThumbnail(thumbnail) };
+                    None
+                }
             })
-        };
-        if updated.is_ok() {
-            self.preview = Some((source, thumbnail));
-        } else {
-            let _ = unsafe { DwmUnregisterThumbnail(thumbnail) };
-        }
+            .collect();
     }
 
     fn hide_windows(&mut self) {
         self.clear_preview();
         self.windows_slot = None;
+        self.windows_clicked = false;
+        self.preview_page = 0;
         self.windows_hover = None;
         self.windows_rows.clear();
         self.windows_targets.clear();
@@ -1805,7 +1870,7 @@ impl State {
             self.hide_windows();
             return;
         };
-        if !logic::show_window_list(self.window_list_mode, item.windows.len()) {
+        if !self.windows_clicked && !logic::show_window_list(self.window_list_mode, item.windows.len()) {
             self.hide_windows();
             return;
         }
@@ -1845,13 +1910,16 @@ impl State {
             };
         }
         if rows != self.windows_rows {
-            self.layout_windows(slot, rows, self.windows_targets.clone());
+            self.windows_rows = rows;
+            unsafe {
+                let _ = InvalidateRect(Some(self.windows), None, false);
+            }
         }
     }
 
-    /// Measures and places the list after its row text changes.
-    fn layout_windows(&mut self, slot: usize, mut rows: Vec<String>, mut targets: Vec<isize>) {
-        let scale = self.dpi as f32 / 96.0;
+    /// Shows one page of thumbnails, keeping each card tied to its window handle.
+    fn layout_windows(&mut self, slot: usize, rows: Vec<String>, targets: Vec<isize>) {
+        let scale = self.dpi as f32 / 96.;
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -1861,46 +1929,41 @@ impl State {
             return;
         }
         let anchor = self.item_rect(slot);
-        let gap = (6.0 * scale).round() as i32;
-        let available = anchor.top - gap - (info.rcWork.top + gap);
-        let preview_height = if available as f32 / scale >= 170.0 { 120.0 } else { 0.0 };
-        let capacity = logic::window_list_rows(
-            available - (preview_height * scale).ceil() as i32,
-            scale,
-            logic::LIST_PAD.1,
-        );
-        if capacity == 0 {
+        let gap = (6. * scale).round() as i32;
+        let work = info.rcWork;
+        let available_width = (work.right - work.left - 2 * gap) as f32 / scale - 2. * logic::PREVIEW_PAD;
+        if available_width < 70. {
             self.hide_windows();
             return;
         }
-        if rows.len() > capacity {
-            // Keep the first (most recently used) windows. The final row only
-            // reports the remainder and has no target or hover highlight.
-            let visible = capacity - 1;
-            let total = self.item_at(slot).map_or(targets.len(), |item| item.windows.len());
-            rows.truncate(visible);
-            targets.truncate(visible);
-            rows.push(format!("+{} more", total - visible));
-        }
-        let Ok((width, height)) = self.windows_renderer.measure_windows(&rows) else {
+        let card = logic::PREVIEW_WIDTH.min(available_width);
+        let count = rows.len();
+        let capacity = ((available_width / card).floor() as usize).clamp(1, 6);
+        let paged = count > capacity;
+        let footer = if paged { logic::PREVIEW_FOOTER } else { 0. };
+        let available_height = (anchor.top - work.top - 2 * gap) as f32 / scale;
+        let chrome = 2. * logic::PREVIEW_PAD + logic::PREVIEW_HEADER + footer;
+        if available_height < chrome {
             self.hide_windows();
             return;
-        };
-        let width = if preview_height > 0.0 { width.max(215.0) } else { width };
-        let (width, height) = (
-            (width * scale).ceil() as i32,
-            ((height + preview_height) * scale).ceil() as i32,
-        );
-        let x = ((anchor.left + anchor.right - width) / 2)
-            .min(info.rcWork.right - gap - width)
-            .max(info.rcWork.left + gap);
-        self.hide_tip();
-        self.windows_hover = self.windows_hover.filter(|&row| row < targets.len());
+        }
+        self.preview_height = (available_height - chrome).min(logic::PREVIEW_HEIGHT);
+        self.preview_width = card;
+        self.preview_count = count.div_ceil(capacity);
+        self.preview_page = self.preview_page.min(self.preview_count.saturating_sub(1));
+        let offset = self.preview_page * capacity;
         self.clear_preview();
-        self.preview_height = preview_height;
-        self.windows_rows = rows;
-        self.windows_targets = targets;
+        self.windows_rows = rows.into_iter().skip(offset).take(capacity).collect();
+        self.windows_targets = targets.into_iter().skip(offset).take(capacity).collect();
+        let width = ((card * count.min(capacity) as f32 + 2. * logic::PREVIEW_PAD) * scale).ceil() as i32;
+        let height = ((chrome + self.preview_height) * scale).ceil() as i32;
+        let x = ((anchor.left + anchor.right - width) / 2)
+            .min(work.right - gap - width)
+            .max(work.left + gap);
+        self.hide_tip();
+        self.windows_hover = None;
         unsafe {
+            crate::theme::shape(self.windows, width, height, 8., self.dpi);
             let _ = SetWindowPos(
                 self.windows,
                 Some(HWND_TOPMOST),
@@ -1912,22 +1975,34 @@ impl State {
             );
             let _ = InvalidateRect(Some(self.windows), None, false);
         }
-        self.update_preview();
+        self.update_previews();
     }
 
-    /// The row of the window list under a popup pointer position.
-    fn windows_hit(&self, lp: LPARAM) -> Option<usize> {
-        let scale = self.dpi as f32 / 96.0;
-        let y = ((lp.0 >> 16) as i16) as f32 / scale;
-        if (0.0..self.preview_height).contains(&y) {
-            return self
-                .windows_hover
-                .or_else(|| (!self.windows_targets.is_empty()).then_some(0));
+    fn change_preview_page(&mut self, forward: bool) {
+        let next = if forward {
+            (self.preview_page + 1).min(self.preview_count.saturating_sub(1))
+        } else {
+            self.preview_page.saturating_sub(1)
+        };
+        if next != self.preview_page {
+            self.preview_page = next;
+            self.show_windows();
         }
-        let row = (y - self.preview_height - logic::LIST_PAD.1) / logic::LIST_ROW;
-        (row >= 0.0)
-            .then_some(row as usize)
-            .filter(|&row| row < self.windows_targets.len())
+    }
+
+    /// Returns the card and whether its close button was hit.
+    fn windows_hit(&self, lp: LPARAM) -> Option<(usize, bool)> {
+        let scale = self.dpi as f32 / 96.;
+        let x = (lp.0 as i16) as f32 / scale - logic::PREVIEW_PAD;
+        let y = ((lp.0 >> 16) as i16) as f32 / scale - logic::PREVIEW_PAD;
+        if x < 0. || !(0. ..logic::PREVIEW_HEADER + self.preview_height).contains(&y) || self.preview_width <= 0. {
+            return None;
+        }
+        let index = (x / self.preview_width) as usize;
+        (index < self.windows_targets.len()).then_some((
+            index,
+            y < logic::PREVIEW_HEADER && x % self.preview_width >= self.preview_width - 27.,
+        ))
     }
 
     fn hide_tip(&mut self) {
@@ -2088,6 +2163,8 @@ impl State {
             self.sound_state.clone(),
             self.sound_hardware.clone(),
             self.flyout_renderer.for_window(),
+            (self.dark, self.backdrop, &self.backdrop_color),
+            self.open_ms,
         ) {
             Ok(hwnd) => {
                 self.sound = hwnd;
@@ -2210,6 +2287,19 @@ impl State {
         if index == 0 {
             unsafe {
                 let _ = PostMessageW(Some(self.owner), WM_SHOW_LAUNCHER, WPARAM(0), LPARAM(0));
+            }
+        } else if !new_instance && self.item_at(index).is_some_and(|item| item.windows.len() > 1) {
+            if self.windows_slot == Some(index) && self.windows_clicked {
+                self.hide_windows();
+            } else {
+                if self.windows_slot != Some(index) {
+                    self.hide_windows();
+                }
+                self.windows_slot = Some(index);
+                self.windows_clicked = true;
+                if self.windows_targets.is_empty() {
+                    self.show_windows();
+                }
             }
         } else if let Some(item) = self.items.get(index - 1 + self.scroll) {
             if !new_instance && let Some(window) = item.windows.first() {
@@ -2412,7 +2502,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 WM_SETTINGCHANGE | WM_POWERBROADCAST | WM_THEMECHANGED => {
                     let dark = s.palette.text.r > 0.5;
                     let backdrop = s.backdrop;
-                    s.apply_material(dark, backdrop);
+                    let color = s.backdrop_color.clone();
+                    s.apply_material(dark, backdrop, &color);
                 }
                 WM_REFRESH => {
                     if !s.scheduled {
@@ -2513,13 +2604,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     if s.hit_part(lp) != Some(logic::Part::Chevron) {
                         s.close_flyout();
                     }
-                    s.hide_windows();
                     if let Some(index) = s.hit(lp) {
+                        if msg == WM_MBUTTONUP || !s.item_at(index).is_some_and(|item| item.windows.len() > 1) {
+                            s.hide_windows();
+                        }
                         s.click(index, msg == WM_MBUTTONUP);
                     } else if let Some(part) = s.hit_part(lp)
                         && msg == WM_LBUTTONUP
                     {
+                        s.hide_windows();
                         s.click_part(part);
+                    } else {
+                        s.hide_windows();
                     }
                     return LRESULT(0);
                 }
@@ -2639,7 +2735,6 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let hover = s.windows_hit(lp);
                     if s.windows_hover != hover {
                         s.windows_hover = hover;
-                        s.update_preview();
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
@@ -2657,17 +2752,39 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     s.leave_windows();
                     return LRESULT(0);
                 }
+                WM_MOUSEWHEEL => {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.change_preview_page(((wp.0 >> 16) as i16) < 0);
+                    }
+                    return LRESULT(0);
+                }
                 WM_LBUTTONUP | WM_MBUTTONUP => {
                     let Ok(mut s) = cell.try_borrow_mut() else {
                         return DefWindowProcW(hwnd, msg, wp, lp);
                     };
-                    if let Some(row) = s.windows_hit(lp)
+                    let scale = s.dpi as f32 / 96.;
+                    let y = ((lp.0 >> 16) as i16) as f32 / scale;
+                    if msg == WM_LBUTTONUP
+                        && s.preview_count > 1
+                        && y >= logic::PREVIEW_PAD + logic::PREVIEW_HEADER + s.preview_height
+                    {
+                        let x = (lp.0 as i16) as f32 / scale;
+                        let mut client = RECT::default();
+                        if GetClientRect(hwnd, &mut client).is_ok() {
+                            let width = client.right as f32 / scale;
+                            if x < logic::PREVIEW_PAD + 36. || x > width - logic::PREVIEW_PAD - 36. {
+                                s.change_preview_page(x > width / 2.);
+                            }
+                        }
+                        return LRESULT(0);
+                    }
+                    if let Some((row, close)) = s.windows_hit(lp)
                         && let Some(&target) = s.windows_targets.get(row)
                     {
-                        s.hide_windows();
-                        let result = if msg == WM_MBUTTONUP {
+                        let result = if msg == WM_MBUTTONUP || close {
                             open_windows::close(target)
                         } else {
+                            s.hide_windows();
                             open_windows::focus(target)
                         };
                         if let Err(error) = result {
@@ -2689,7 +2806,10 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         windows_rows,
                         windows_hover,
                         preview_height,
-                        preview,
+                        preview_width,
+                        previews,
+                        preview_page,
+                        preview_count,
                         ..
                     } = &mut *s;
                     if let Err(error) = windows_renderer.draw_windows(
@@ -2698,7 +2818,9 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         palette,
                         windows_rows,
                         *windows_hover,
-                        (*preview_height, preview.is_some()),
+                        (*preview_width, *preview_height),
+                        previews,
+                        (*preview_page, *preview_count),
                     ) {
                         eprintln!("Dock window list: {error}");
                     }

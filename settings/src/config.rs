@@ -16,6 +16,8 @@ pub struct Config {
     pub max_results: i64,
     pub theme: String,
     pub backdrop: String,
+    pub backdrop_color: String,
+    pub win_start: bool,
     pub show_recent: bool,
     pub file_search: bool,
     pub file_search_exclude: Vec<String>,
@@ -60,7 +62,23 @@ impl Config {
             "dock_animation",
         )?;
         let backdrop = string("backdrop")?;
-        choice(&backdrop, &["acrylic", "mica", "solid"], "backdrop")?;
+        choice(
+            &backdrop,
+            &[
+                "acrylic",
+                "mica",
+                "solid",
+                "transparent",
+                "glass",
+                "liquid-glass",
+                "color",
+            ],
+            "backdrop",
+        )?;
+        let backdrop_color = string("backdrop_color")?;
+        if !valid_color(&backdrop_color) {
+            return Err("Enter a color as #RRGGBB.".into());
+        }
         let position = string("position")?;
         choice(&position, &["center", "bottom"], "position")?;
         let window_list = string("window_list")?;
@@ -98,6 +116,8 @@ impl Config {
             max_results,
             theme,
             backdrop,
+            backdrop_color,
+            win_start: boolean("win_start")?,
             show_recent: boolean("show_recent")?,
             file_search: boolean("file_search")?,
             file_search_exclude,
@@ -112,6 +132,12 @@ impl Config {
             window_list,
         })
     }
+}
+
+fn valid_color(color: &str) -> bool {
+    color
+        .strip_prefix('#')
+        .is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
 fn choice(value: &str, choices: &[&str], key: &str) -> Result<(), String> {
@@ -219,7 +245,12 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         "dock_open_ms" | "dock_close_ms" if !value.as_integer().is_some_and(|ms| (0..=500).contains(&ms)) => {
             return Err("Choose an animation time between 0 and 500 ms.".into());
         }
+        "backdrop_color" if !value.as_str().is_some_and(valid_color) => {
+            return Err("Enter a color as #RRGGBB.".into());
+        }
         "theme"
+        | "backdrop_color"
+        | "win_start"
         | "backdrop"
         | "max_results"
         | "show_recent"

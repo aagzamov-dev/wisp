@@ -1,5 +1,8 @@
 //! Launcher lifecycle, input and message loop.
 
+#[path = "start.rs"]
+pub(crate) mod start;
+
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,6 +60,7 @@ const PEEK_TIMER: usize = 3;
 /// Tries again to hide the taskbar after a failure. At sign-in Explorer may
 /// not have finished creating it.
 const TASKBAR_TIMER: usize = 4;
+const START_ACTIVATE_TIMER: usize = 5;
 const TASKBAR_RETRY_MS: u32 = 2000;
 const TASKBAR_ATTEMPTS: u32 = 5;
 /// File results shown after apps, and for a query that starts with `?`.
@@ -121,7 +125,7 @@ fn run_deferred() {
                     l.drain_command_events();
                 }
                 if work & DEFER_HIDE != 0 {
-                    l.hide();
+                    l.hide_after_deactivation();
                 }
             }
             true
@@ -246,6 +250,18 @@ pub fn run() -> Result<()> {
             position: (0, 0),
             rows_that_fit: usize::MAX,
             visible: false,
+            start_open: false,
+            start_activating: false,
+            start_focus: None,
+            footer_menu: None,
+            start_hover: None,
+            footer_hover: None,
+            start_height: start::HEIGHT,
+            start_width: start::WIDTH,
+            start_fade: None,
+            start_previous_editor: None,
+            pins: start::Pins::load(),
+            win_key: None,
             editor: crate::editor::Editor::default(),
             searcher: Searcher::new(),
             results: Vec::new(),
@@ -402,6 +418,18 @@ struct Launcher {
     /// Number of results that fit in the current monitor's work area.
     rows_that_fit: usize,
     visible: bool,
+    start_open: bool,
+    start_activating: bool,
+    start_focus: Option<usize>,
+    footer_menu: Option<(start::FooterMenu, usize)>,
+    start_hover: Option<usize>,
+    footer_hover: Option<usize>,
+    start_height: f32,
+    start_width: f32,
+    start_fade: Option<Instant>,
+    start_previous_editor: Option<crate::editor::Editor>,
+    pins: start::Pins,
+    win_key: Option<start::WinKey>,
 
     editor: crate::editor::Editor,
     searcher: Searcher,
@@ -508,8 +536,20 @@ impl Launcher {
         if !crate::util::perf::hook_on("WISP_CAPTURE") {
             self.register_hotkey(true);
         }
+        self.sync_win_key();
         self.indexer.rescan();
         self.last_scan = Instant::now();
+    }
+
+    fn sync_win_key(&mut self) {
+        if !self.config.win_start || crate::util::perf::hook_on("WISP_CAPTURE") {
+            self.win_key = None;
+        } else if self.win_key.is_none() {
+            match start::WinKey::install(self.hwnd) {
+                Ok(hook) => self.win_key = Some(hook),
+                Err(error) => tray::notify(self.hwnd, "Windows key", &error.message(), true),
+            }
+        }
     }
 
     fn tooltip(&self) -> String {
@@ -581,13 +621,15 @@ impl Launcher {
         self.sync_shell();
         self.apply_theme();
         self.register_hotkey(true);
+        self.sync_win_key();
     }
 
     /// Hides or restores the Windows taskbar and creates or removes the dock
     /// to match the config.
     fn sync_shell(&mut self) {
         self.sync_taskbar();
-        if self.dock.as_ref().is_some_and(|d| d.shared() != self.bottom()) {
+        let shared = self.bottom() && crate::util::perf::hook_on("WISP_CAPTURE");
+        if self.dock.as_ref().is_some_and(|d| d.shared() != shared) {
             self.dock = None;
         }
         if !self.config.dock {
@@ -596,7 +638,7 @@ impl Launcher {
             return;
         }
         if self.dock.is_none() {
-            match if self.bottom() {
+            match if shared {
                 Dock::on_surface(self.hwnd)
             } else {
                 Dock::new(self.hwnd)
@@ -621,7 +663,13 @@ impl Launcher {
             // Notification icons need a home while the taskbar is hidden.
             dock.set_tray(self.taskbar.as_ref().is_some_and(TaskbarHider::is_active));
             dock.set_autohide(self.config.dock_autohide);
-            if self.visible { dock.hide() } else { dock.show() }
+            if self.start_open {
+                dock.set_start_open(true);
+            } else if self.visible {
+                dock.hide();
+            } else {
+                dock.show();
+            }
         }
         self.sync_reserve();
     }
@@ -755,21 +803,53 @@ impl Launcher {
         }
     }
 
-    fn apply_theme(&mut self) {
-        let dark = match self.config.theme {
+    fn dark_theme(&self) -> bool {
+        match self.config.theme {
             Theme::Dark => true,
             Theme::Light => false,
             Theme::System => !system::system_uses_light_theme(),
-        };
-        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, self.config.backdrop, self.unified());
+        }
+    }
+
+    fn apply_launcher_theme(&mut self, dark: bool) {
+        self.palette = crate::theme::apply_backdrop(
+            self.hwnd,
+            dark,
+            self.config.backdrop,
+            self.start_open || self.unified(),
+            &self.config.backdrop_color,
+        );
+    }
+
+    fn apply_theme(&mut self) {
+        let dark = self.dark_theme();
+        self.apply_launcher_theme(dark);
         if let Some(dock) = &mut self.dock {
-            dock.apply_theme(Palette::new(dark, true), self.config.backdrop);
+            dock.apply_theme(dark, self.config.backdrop, &self.config.backdrop_color);
         }
         self.invalidate();
     }
 
     fn toggle(&mut self) {
         if self.visible { self.hide() } else { self.show() }
+    }
+
+    fn toggle_start(&mut self) {
+        if self.visible {
+            let was_start = self.start_open;
+            self.hide();
+            if was_start {
+                return;
+            }
+        }
+        self.start_open = true;
+        self.start_focus = None;
+        self.start_previous_editor = Some(std::mem::take(&mut self.editor));
+        self.show();
+    }
+
+    fn start_home(&self) -> bool {
+        self.start_open && self.editor.text().trim().is_empty() && self.scope.is_none() && self.surface.is_none()
     }
 
     fn show(&mut self) {
@@ -783,7 +863,9 @@ impl Launcher {
         self.armed = None;
         self.leave_scope();
         self.leave_surface();
-        self.load_surfaces();
+        if !self.start_open {
+            self.load_surfaces();
+        }
         if self.last_scan.elapsed() > RESCAN_AFTER {
             self.indexer.rescan();
             self.last_scan = Instant::now();
@@ -818,20 +900,38 @@ impl Launcher {
             self.previous_foreground = unsafe { GetForegroundWindow() };
         }
         self.editor.select_all();
+        if self.start_open {
+            self.apply_launcher_theme(self.dark_theme());
+            if let Some(dock) = &mut self.dock {
+                dock.set_start_open(true);
+            }
+            self.place_on_active_monitor();
+        }
         self.update_results();
-        self.place_on_active_monitor();
+        if !self.start_open {
+            self.place_on_active_monitor();
+        }
         if let Some(from) = from {
             self.begin_morph(from, self.launcher_rect(), true, opacity);
         }
         self.last_mouse = cursor_pos();
         self.visible = true;
-        // The launcher takes the dock's place while it is open.
-        if let Some(dock) = &mut self.dock
+        if !self.start_open
+            && let Some(dock) = &mut self.dock
             && !dock.shared()
         {
             dock.hide();
         }
         self.set_collapsed_style(false);
+        if self.start_open {
+            self.start_activating = unsafe { SetTimer(Some(self.hwnd), START_ACTIVATE_TIMER, 70, None) } != 0;
+        }
+        if self.start_open && self.config.dock_open_ms != 0 && dock::client_animations_enabled() {
+            // Keep the composited material visible while the content fades in.
+            if unsafe { SetTimer(Some(self.hwnd), dock::POPUP_FADE_TIMER, 15, None) } != 0 {
+                self.start_fade = Some(Instant::now());
+            }
+        }
         unsafe {
             let _ = ShowWindow(
                 self.hwnd,
@@ -854,6 +954,27 @@ impl Launcher {
         self.paint();
     }
 
+    fn hide_after_deactivation(&mut self) {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground == self.hwnd || self.start_activating && foreground == self.previous_foreground {
+            return;
+        }
+        self.hide();
+    }
+
+    fn finish_start_activation(&mut self) {
+        self.start_activating = false;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), START_ACTIVATE_TIMER);
+            if self.start_open && GetForegroundWindow() == self.previous_foreground {
+                let _ = SetForegroundWindow(self.hwnd);
+                if GetForegroundWindow() == self.hwnd {
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+            }
+        }
+    }
+
     fn hide(&mut self) {
         self.drag_press = None;
         if !self.visible {
@@ -861,6 +982,19 @@ impl Launcher {
         }
         let opacity = self.morph_opacity();
         self.visible = false;
+        self.start_activating = false;
+        self.footer_menu = None;
+        self.footer_hover = None;
+        self.start_hover = None;
+        let was_start = std::mem::take(&mut self.start_open);
+        if was_start {
+            if let Some(editor) = self.start_previous_editor.take() {
+                self.editor = editor;
+            }
+            if let Some(dock) = &mut self.dock {
+                dock.set_start_open(false);
+            }
+        }
         if self.morphed && self.unified() && !self.taskbar.as_ref().is_some_and(TaskbarHider::is_peeking) {
             let to = self.dock.as_ref().unwrap().resting_rect();
             self.begin_morph(self.outline.unwrap_or_else(|| self.current_rect()), to, false, opacity);
@@ -877,16 +1011,28 @@ impl Launcher {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), CARET_TIMER);
             let _ = KillTimer(Some(self.hwnd), SURFACE_TIMER);
+            let _ = KillTimer(Some(self.hwnd), START_ACTIVATE_TIMER);
             let _ = ShowWindow(self.hwnd, SW_HIDE);
+        }
+        if self.start_fade.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), dock::POPUP_FADE_TIMER);
+            }
         }
         self.morph = None;
         self.outline = None;
-        self.apply_theme();
+        if was_start {
+            self.apply_launcher_theme(self.dark_theme());
+        } else {
+            self.apply_theme();
+        }
         self.set_collapsed_style(true);
         if let Some(dock) = &mut self.dock
             && !self.taskbar.as_ref().is_some_and(TaskbarHider::is_peeking)
         {
-            dock.show();
+            if !was_start {
+                dock.show();
+            }
         }
     }
 
@@ -896,6 +1042,15 @@ impl Launcher {
         let work = unsafe {
             let mut cursor = POINT::default();
             let _ = GetCursorPos(&mut cursor);
+            if self.start_open
+                && let Some(dock) = &self.dock
+            {
+                let anchor = dock.resting_rect();
+                cursor = POINT {
+                    x: (anchor.left + anchor.right) / 2,
+                    y: (anchor.top + anchor.bottom) / 2,
+                };
+            }
             let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
             let mut info = MONITORINFO {
                 cbSize: size_of::<MONITORINFO>() as u32,
@@ -914,6 +1069,23 @@ impl Launcher {
         };
 
         let margin = self.px(16.0);
+        if self.start_open {
+            let scale = 96. / self.dpi as f32;
+            self.start_width = start::WIDTH.min(((work.right - work.left - 2 * margin) as f32 * scale).max(320.));
+            let dock_top = self.dock.as_ref().map_or(work.bottom, |dock| dock.resting_rect().top);
+            let bottom = work.bottom.min(dock_top) - self.px(8.);
+            let available = ((bottom - work.top - margin) as f32 * scale).max(180.);
+            self.start_height = start::HEIGHT.min(available);
+            self.rows_that_fit = (((self.start_height - layout::height(0) - start::FOOTER - 12.) / layout::ROW_H)
+                .floor() as usize)
+                .max(1);
+            self.position = (
+                work.left + (work.right - work.left - self.px(self.start_width)) / 2,
+                bottom,
+            );
+            self.apply_size();
+            return;
+        }
         let width = self.px(layout::WIDTH);
         let left = work.left + (work.right - work.left - width) / 2;
         if self.bottom() {
@@ -956,12 +1128,16 @@ impl Launcher {
 
     /// The query box sits at the bottom of the screen and results stack upward.
     fn bottom(&self) -> bool {
-        self.config.position == Position::Bottom
+        !self.start_open && self.config.position == Position::Bottom
     }
 
     /// The launcher's height in DIPs.
     fn window_h(&self) -> f32 {
-        layout::height(self.window_rows())
+        if self.start_open {
+            self.start_height
+        } else {
+            layout::height(self.window_rows())
+        }
     }
 
     fn px(&self, dips: f32) -> i32 {
@@ -980,7 +1156,7 @@ impl Launcher {
     fn window_rows(&self) -> usize {
         if self.surface.is_some() {
             self.list_rows()
-        } else if self.unified() {
+        } else if self.start_open || self.unified() {
             self.visible_rows()
         } else if self.results.is_empty() {
             0
@@ -991,6 +1167,9 @@ impl Launcher {
 
     fn apply_size(&mut self) {
         let target = self.launcher_rect();
+        if self.start_open && self.outline == Some(target) {
+            return;
+        }
         if let Some(morph) = &mut self.morph {
             if morph.opening {
                 morph.to = target;
@@ -1010,9 +1189,13 @@ impl Launcher {
     }
 
     fn launcher_rect(&self) -> RECT {
-        let width = self.px(layout::WIDTH);
+        let width = self.px(if self.start_open {
+            self.start_width
+        } else {
+            layout::WIDTH
+        });
         let height = self.px(self.window_h());
-        let top = if self.bottom() {
+        let top = if self.start_open || self.bottom() {
             self.position.1 - height
         } else {
             self.position.1
@@ -1047,14 +1230,13 @@ impl Launcher {
                 SWP_NOACTIVATE,
             );
         }
-        if self.unified() {
-            crate::theme::shape(
-                self.hwnd,
-                width,
-                height,
-                crate::morph::radius(self.morph_opacity()),
-                self.dpi,
-            );
+        if self.start_open || self.unified() {
+            let radius = if self.start_open {
+                start::RADIUS
+            } else {
+                crate::morph::radius(self.morph_opacity())
+            };
+            crate::theme::shape(self.hwnd, width, height, radius, self.dpi);
         }
         self.renderer.resize(width.max(1) as u32, height.max(1) as u32);
         if self.morph.is_some()
@@ -1122,6 +1304,7 @@ impl Launcher {
             self.palette.text.r > 0.5,
             crate::config::Backdrop::Solid,
             true,
+            &self.config.backdrop_color,
         );
         self.morph.as_mut().unwrap().start = Instant::now();
         self.outline = Some(from);
@@ -1175,6 +1358,17 @@ impl Launcher {
     fn update_results(&mut self) {
         let _span = util::perf::Span::new("search");
         let rows_before = self.window_rows();
+        if self.start_home() {
+            self.base_results.clear();
+            self.file_results.clear();
+            self.file_query = None;
+            self.results.clear();
+            self.selected = 0;
+            self.scroll = 0;
+            self.apply_size();
+            self.invalidate();
+            return;
+        }
         if self.surface.is_some() {
             self.update_surface();
             if self.window_rows() != rows_before {
@@ -1598,8 +1792,24 @@ impl Launcher {
     fn on_key(&mut self, vk: VIRTUAL_KEY) -> bool {
         let down = |key: VIRTUAL_KEY| unsafe { GetKeyState(key.0 as i32) < 0 };
         let (ctrl, shift) = (down(VK_CONTROL), down(VK_SHIFT));
+        if let Some((menu, selected)) = self.footer_menu {
+            self.footer_hover = None;
+            let count = menu.actions().len();
+            match vk {
+                VK_UP => self.footer_menu = Some((menu, (selected + count - 1) % count)),
+                VK_DOWN | VK_TAB => self.footer_menu = Some((menu, (selected + 1) % count)),
+                VK_ESCAPE => self.footer_menu = None,
+                VK_RETURN => self.activate_footer_row(menu, selected),
+                _ => return false,
+            }
+            self.invalidate();
+            return true;
+        }
         if self.surface.is_some() && self.on_surface_key(vk, ctrl, shift) {
             self.restart_caret();
+            return true;
+        }
+        if self.start_home() && self.on_start_key(vk, shift) {
             return true;
         }
         let page = self.list_rows() as isize;
@@ -1686,6 +1896,10 @@ impl Launcher {
             return;
         }
         if self.editor.push_utf16(unit) {
+            self.footer_menu = None;
+            self.footer_hover = None;
+            self.start_hover = None;
+            self.start_focus = None;
             self.armed = None;
             self.update_results();
             self.restart_caret();
@@ -1728,6 +1942,26 @@ impl Launcher {
         if !mouse_moved(&mut self.last_mouse, position) {
             return;
         }
+        if self.start_open {
+            unsafe {
+                let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
+                    cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: self.hwnd,
+                    dwHoverTime: 0,
+                });
+            }
+            let hover = self.start_hit(x, y);
+            let row = self.footer_menu.and_then(|(menu, _)| self.footer_row_at(menu, x, y));
+            if (hover, row) != (self.start_hover, self.footer_hover) {
+                self.start_hover = hover;
+                self.footer_hover = row;
+                self.invalidate();
+            }
+            if self.footer_menu.is_some() {
+                return;
+            }
+        }
         if self.surface.is_some() {
             if let Some(index) = self.widget_at(x, y) {
                 self.focus_widget(index);
@@ -1742,7 +1976,206 @@ impl Launcher {
         }
     }
 
+    fn start_hit(&self, x: i32, y: i32) -> Option<usize> {
+        if !self.start_open {
+            return None;
+        }
+        let scale = 96. / self.dpi as f32;
+        let (x, y) = (x as f32 * scale, y as f32 * scale);
+        let inside = |(l, t, r, b)| x >= l && x < r && y >= t && y < b;
+        if self.start_home() {
+            let count = self.pins.apps(&self.apps).len();
+            if let Some(index) = (0..count).find(|&i| inside(start::tile(i, self.start_width, self.window_h()))) {
+                return Some(index);
+            }
+        }
+        (0..3)
+            .find(|&i| inside(start::footer(i, self.start_width, self.window_h())))
+            .map(|i| start::CAPACITY + i)
+    }
+
+    fn start_action(&mut self, index: usize) {
+        if index < start::CAPACITY {
+            if let Some(app) = self.pins.apps(&self.apps).get(index).map(|app| (*app).clone()) {
+                self.perform(
+                    &Action::Launch {
+                        id: app.id,
+                        path: app.path,
+                        admin: false,
+                    },
+                    &app.name,
+                    Kind::App,
+                    false,
+                );
+            }
+            return;
+        }
+        let footer = index - start::CAPACITY;
+        if footer == 1 {
+            self.hide();
+            self.on_tray_command(tray::CMD_SETTINGS);
+            return;
+        }
+        let menu = if footer == 0 {
+            start::FooterMenu::Profile
+        } else {
+            start::FooterMenu::Power
+        };
+        self.footer_menu = Some((menu, 0));
+        self.footer_hover = None;
+        self.invalidate();
+    }
+
+    fn start_power(&mut self, power: commands::power::Power) {
+        if power.needs_confirmation() {
+            self.leave_scope();
+            self.leave_surface();
+            self.editor = crate::editor::Editor::default();
+            self.editor.insert(power.title());
+            self.armed = None;
+            self.start_focus = None;
+            self.update_results();
+            self.apply_size();
+        }
+        self.run_command(Command::Power(power));
+    }
+
+    fn activate_footer_row(&mut self, menu: start::FooterMenu, index: usize) {
+        self.footer_menu = None;
+        self.footer_hover = None;
+        self.start_hover = None;
+        match menu.actions()[index] {
+            Some(power) => self.start_power(power),
+            None => self.run_command(Command::Quit),
+        }
+    }
+
+    fn footer_row_at(&self, menu: start::FooterMenu, x: i32, y: i32) -> Option<usize> {
+        let scale = 96. / self.dpi as f32;
+        let (x, y) = (x as f32 * scale, y as f32 * scale);
+        (0..menu.actions().len()).find(|&i| {
+            let (left, top, right, bottom) = menu.row(i, self.start_width, self.window_h());
+            x >= left && x < right && y >= top && y < bottom
+        })
+    }
+
+    fn on_start_key(&mut self, vk: VIRTUAL_KEY, shift: bool) -> bool {
+        let pins = self.pins.apps(&self.apps).len();
+        if vk == VK_RETURN {
+            if let Some(index) = self.start_focus {
+                self.start_action(index);
+            }
+            return true;
+        }
+        let current = self.start_focus;
+        self.start_focus = match vk {
+            VK_TAB => {
+                let sequence: Vec<_> = (0..pins).chain(start::CAPACITY..start::CAPACITY + 3).collect();
+                match current.and_then(|i| sequence.iter().position(|&item| item == i)) {
+                    Some(i) if shift => i.checked_sub(1).map(|i| sequence[i]),
+                    Some(i) => sequence.get(i + 1).copied(),
+                    None if shift => sequence.last().copied(),
+                    None => sequence.first().copied(),
+                }
+            }
+            VK_DOWN if current.is_none() => (pins > 0).then_some(0).or(Some(start::CAPACITY)),
+            VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN if current.is_some_and(|i| i < pins) => {
+                let step = match vk {
+                    VK_LEFT => -1,
+                    VK_RIGHT => 1,
+                    VK_UP => -6,
+                    _ => 6,
+                };
+                let next = current.unwrap() as isize + step;
+                if next >= 0 && (next as usize) < pins {
+                    Some(next as usize)
+                } else if vk == VK_DOWN {
+                    Some(start::CAPACITY)
+                } else {
+                    current
+                }
+            }
+            VK_LEFT | VK_RIGHT if current.is_some() => {
+                let index = current.unwrap();
+                Some(if vk == VK_LEFT {
+                    index.saturating_sub(1).max(start::CAPACITY)
+                } else {
+                    (index + 1).min(start::CAPACITY + 2)
+                })
+            }
+            VK_UP if current.is_some() => pins.checked_sub(1),
+            _ => return false,
+        };
+        self.invalidate();
+        true
+    }
+
+    fn on_start_right_click(&mut self, x: i32, y: i32) {
+        if !self.start_open {
+            return;
+        }
+        let pins = self.pins.apps(&self.apps);
+        let id = if self.start_home() {
+            self.start_hit(x, y).and_then(|i| pins.get(i)).map(|app| app.id.clone())
+        } else {
+            self.row_at(y)
+                .and_then(|row| self.results.get(row))
+                .and_then(|result| match &result.action {
+                    Action::Launch { id, .. } if result.kind == Kind::App => Some(id.clone()),
+                    _ => None,
+                })
+        };
+        if let Some(id) = id {
+            let pinned = pins.iter().any(|app| app.id == id);
+            let mut point = POINT { x, y };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut point);
+            }
+            if start::menu(
+                self.hwnd,
+                point,
+                &[if pinned {
+                    "Unpin from Wisp Start"
+                } else {
+                    "Pin to Wisp Start"
+                }],
+            )
+            .is_some()
+            {
+                if let Err(error) = self.pins.toggle(&id, &self.apps) {
+                    tray::notify(self.hwnd, "Wisp Start pins", &error.to_string(), true);
+                }
+                self.start_focus = None;
+                self.invalidate();
+            }
+        }
+    }
+
     fn on_click(&mut self, x: i32, y: i32) {
+        if let Some((menu, _)) = self.footer_menu.take() {
+            self.footer_hover = None;
+            if let Some(row) = self.footer_row_at(menu, x, y) {
+                self.activate_footer_row(menu, row);
+                self.invalidate();
+                return;
+            }
+            self.invalidate();
+            if let Some(index) = self.start_hit(x, y).filter(|&index| index >= start::CAPACITY) {
+                let same_button = match menu {
+                    start::FooterMenu::Profile => start::CAPACITY,
+                    start::FooterMenu::Power => start::CAPACITY + 2,
+                };
+                if index != same_button {
+                    self.start_action(index);
+                }
+            }
+            return;
+        }
+        if let Some(index) = self.start_hit(x, y) {
+            self.start_focus = Some(index);
+            self.start_action(index);
+            return;
+        }
         if self.surface.is_some() {
             self.on_surface_click(x, y);
             return;
@@ -1772,7 +2205,14 @@ impl Launcher {
         let opacity = self.morph_opacity();
         let content_size = self.morph.as_ref().map(|_| (layout::WIDTH, self.window_h()));
         let text = self.editor.text();
+        let pins = self.start_home().then(|| self.pins.apps(&self.apps));
         let frame = Frame {
+            start: self.start_open,
+            pins: pins.as_deref(),
+            start_focus: self.start_focus,
+            footer_menu: self.footer_menu,
+            start_hover: self.start_hover,
+            footer_hover: self.footer_hover,
             palette: &self.palette,
             text,
             caret: util::utf16_offset(text, self.editor.caret()),
@@ -1802,11 +2242,18 @@ impl Launcher {
                 rows: self.list_rows(),
             }),
             bottom: self.bottom(),
-            opacity: crate::morph::fades(opacity).1,
+            opacity: self.start_fade.map_or(crate::morph::fades(opacity).1, |start| {
+                let t = (start.elapsed().as_secs_f32() * 1000. / self.config.dock_open_ms.max(1) as f32).min(1.);
+                0.55 + 0.45 * (1. - (1. - t).powi(3))
+            }),
             dock_opacity: crate::morph::fades(opacity).0,
             content_size,
             shared: self.unified(),
-            radius: crate::morph::radius(opacity),
+            radius: if self.start_open {
+                start::RADIUS
+            } else {
+                crate::morph::radius(opacity)
+            },
         };
         if let Err(e) = self.renderer.draw(self.hwnd, &frame, |rt| {
             if crate::morph::fades(opacity).0 > 0.0
@@ -2157,6 +2604,7 @@ impl Launcher {
     }
 
     fn shutdown(&mut self) {
+        self.win_key = None;
         self.dock = None;
         if let Err(e) = TaskbarHider::configure(&mut self.taskbar, self.hwnd, false) {
             eprintln!("could not restore the taskbar: {e}");
@@ -2235,6 +2683,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             WM_ACTIVATE
                 | WM_HOTKEY
                 | WM_APP_SHOW
+                | start::TOGGLE
+                | dock::WM_SHOW_LAUNCHER
                 | WM_KEYDOWN
                 | WM_SYSKEYDOWN
                 | WM_CHAR
@@ -2411,7 +2861,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_APP_INDEX => with_launcher_or_defer(DEFER_INDEX, Launcher::drain_index_events),
         WM_APP_FILES => with_launcher_or_defer(DEFER_FILES, Launcher::drain_file_results),
         WM_APP_COMMANDS => with_launcher_or_defer(DEFER_COMMANDS, Launcher::drain_command_events),
-        WM_ACTIVATE if loword(wparam.0) == WA_INACTIVE => with_launcher_or_defer(DEFER_HIDE, Launcher::hide),
+        WM_ACTIVATE if loword(wparam.0) == WA_INACTIVE => {
+            with_launcher_or_defer(DEFER_HIDE, Launcher::hide_after_deactivation)
+        }
         WM_DPICHANGED => {
             with_launcher(|l| l.on_dpi_changed(loword(wparam.0)));
             return LRESULT(0);
@@ -2438,7 +2890,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_launcher(|l| {
                 l.drag_consumed = false;
                 l.drag_press = if l.visible && l.surface.is_none() && l.morph.is_none() {
-                    l.row_at(point.1)
+                    (l.footer_menu.is_none())
+                        .then(|| l.row_at(point.1))
+                        .flatten()
                         .and_then(|row| l.results.get(row))
                         .and_then(Payload::from_result)
                         .map(|payload| (point, payload))
@@ -2449,6 +2903,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     unsafe {
                         SetCapture(hwnd);
                     }
+                }
+            });
+        }
+        WM_MOUSELEAVE => {
+            with_launcher(|l| {
+                if l.start_hover.take().is_some() | l.footer_hover.take().is_some() {
+                    l.invalidate();
                 }
             });
         }
@@ -2501,6 +2962,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
         }
+        WM_RBUTTONUP => {
+            let (x, y) = mouse_pos(lparam);
+            with_launcher(|l| l.on_start_right_click(x, y));
+        }
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16;
             with_launcher(|l| {
@@ -2509,6 +2974,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 } else {
                     l.move_on_screen(if delta > 0 { -1 } else { 1 }, false);
                 }
+            });
+        }
+        WM_TIMER if wparam.0 == START_ACTIVATE_TIMER => {
+            with_launcher(Launcher::finish_start_activation);
+        }
+        WM_TIMER if wparam.0 == dock::POPUP_FADE_TIMER => {
+            with_launcher(|l| {
+                if l.start_fade
+                    .is_some_and(|start| start.elapsed().as_millis() >= u128::from(l.config.dock_open_ms))
+                {
+                    l.start_fade = None;
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), dock::POPUP_FADE_TIMER);
+                    }
+                }
+                l.invalidate();
             });
         }
         WM_TIMER if wparam.0 == SURFACE_TIMER => {
@@ -2553,8 +3034,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             });
         }
-        dock::WM_SHOW_LAUNCHER => {
-            with_launcher(Launcher::show);
+        dock::WM_SHOW_LAUNCHER | start::TOGGLE => {
+            with_launcher(Launcher::toggle_start);
         }
         dock::sound::WM_SOUND_REFRESH => {
             with_launcher(|l| {

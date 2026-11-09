@@ -80,23 +80,12 @@ pub const TRAY_W: f32 = 32.0;
 pub const VOLUME_W: f32 = 46.0;
 pub const BATTERY_W: f32 = 50.0;
 pub const CLOCK_W: f32 = 88.0;
-/// The window list above an app icon: its padding, one row per window, and
-/// the widest a row may be before it is clipped, in DIPs.
-pub const LIST_PAD: (f32, f32) = (7.0, 3.0);
-pub const LIST_ROW: f32 = 22.0;
-pub const LIST_TEXT_MAX: f32 = 280.0;
-
-/// Whole rows that fit in a physical-pixel height, including both DIP paddings.
-pub fn window_list_rows(available: i32, scale: f32, padding: f32) -> usize {
-    let available = available.max(0) as f32;
-    let rows = ((available / scale - 2.0 * padding).max(0.0) / LIST_ROW).floor() as usize;
-    // Match the popup's rounding to whole physical pixels at fractional scales.
-    if rows > 0 && ((rows as f32 * LIST_ROW + 2.0 * padding) * scale).ceil() > available {
-        rows - 1
-    } else {
-        rows
-    }
-}
+/// Thumbnail card dimensions in DIPs.
+pub const PREVIEW_PAD: f32 = 8.;
+pub const PREVIEW_WIDTH: f32 = 168.;
+pub const PREVIEW_HEIGHT: f32 = 100.;
+pub const PREVIEW_HEADER: f32 = 28.;
+pub const PREVIEW_FOOTER: f32 = 24.;
 
 pub fn show_window_list(mode: WindowListMode, windows: usize) -> bool {
     windows > 0 && (mode == WindowListMode::Always || mode == WindowListMode::Multiple && windows > 1)
@@ -300,24 +289,6 @@ pub fn stable_order<T>(previous: Vec<T>, current: Vec<T>, same: impl Fn(&T, &T) 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn window_list_fits_whole_rows_with_padding_at_each_scale() {
-        for scale in [1.0, 1.25, 1.5, 1.75, 2.0] {
-            for padding in [0.0, LIST_PAD.1, 8.0] {
-                assert_eq!(window_list_rows(-10, scale, padding), 0);
-                assert_eq!(window_list_rows(0, scale, padding), 0);
-                let padding_height = (2.0 * padding * scale).ceil() as i32;
-                assert_eq!(window_list_rows(padding_height, scale, padding), 0);
-                for rows in [1, 2, 10, 100] {
-                    let height = ((rows as f32 * LIST_ROW + 2.0 * padding) * scale).ceil() as i32;
-                    assert_eq!(window_list_rows(height, scale, padding), rows);
-                    assert_eq!(window_list_rows(height - 1, scale, padding), rows - 1);
-                    assert_eq!(window_list_rows(height + 1, scale, padding), rows);
-                }
-            }
-        }
-    }
 
     #[test]
     fn window_list_modes_follow_the_selected_policy() {

@@ -53,3 +53,8 @@ dock_open_ms = 180
 dock_close_ms = 140
 # slide, fade, rise-fade, or scale-fade.
 dock_animation = "slide"
+
+# Open Wisp Start with a bare Windows key tap.
+win_start = true
+# Used by the Color backdrop (RGB hex).
+backdrop_color = "#252833"

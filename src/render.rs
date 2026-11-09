@@ -106,6 +106,12 @@ const HINT_W: f32 = 96.0;
 const INPUT_TEXT_X: f32 = 52.0;
 
 pub struct Frame<'a> {
+    pub start: bool,
+    pub pins: Option<&'a [&'a crate::indexer::AppEntry]>,
+    pub start_focus: Option<usize>,
+    pub footer_menu: Option<(crate::app::start::FooterMenu, usize)>,
+    pub start_hover: Option<usize>,
+    pub footer_hover: Option<usize>,
     pub palette: &'a Palette,
     pub text: &'a str,
     /// UTF-16 offsets into `text`.
@@ -285,7 +291,7 @@ impl Renderer {
         let result = unsafe {
             rt.BeginDraw();
             self.stops.clear();
-            if frame.shared {
+            if frame.shared || frame.start {
                 crate::theme::paint_background(&rt, &target.brush, frame.palette, frame.radius);
             } else {
                 rt.Clear(Some(&frame.palette.background));
@@ -322,6 +328,17 @@ impl Renderer {
             } else {
                 Ok(())
             };
+            if let Some((menu, selected)) = frame.footer_menu {
+                draw_footer_menu(
+                    target,
+                    &self.formats,
+                    frame.palette,
+                    width,
+                    height,
+                    menu,
+                    frame.footer_hover.unwrap_or(selected),
+                );
+            }
             rt.SetTransform(&Matrix3x2::identity());
             if frame.opacity > 0.0 && frame.opacity < 1.0 {
                 rt.PopLayer();
@@ -532,6 +549,10 @@ unsafe fn draw_frame(
         let input_y = input_top(window_h, f.bottom);
         rt.SetTransform(&Matrix3x2::translation(ox, oy + input_y));
         let mid = INPUT_H / 2.0;
+        if f.start {
+            brush.SetColor(&p.tile);
+            rt.FillRoundedRectangle(&rounded(rect(12., 8., width - 12., INPUT_H - 6.), 10.), brush);
+        }
         brush.SetColor(&p.placeholder);
         draw_text(rt, "\u{E721}", &fm.search_glyph, rect(16.0, 0.0, 44.0, INPUT_H), brush);
 
@@ -756,7 +777,115 @@ unsafe fn draw_frame(
             }
         }
 
+        if f.start {
+            use crate::app::start;
+            if let Some(pins) = f.pins {
+                brush.SetColor(&p.text);
+                draw_text(rt, "Pinned apps", &fm.title, rect(20., 64., 175., 87.), brush);
+                brush.SetColor(&p.subtext);
+                draw_text(
+                    rt,
+                    "Right-click apps to pin or unpin",
+                    &fm.hint,
+                    rect(178., 64., width - 18., 87.),
+                    brush,
+                );
+                if pins.is_empty() {
+                    draw_text(
+                        rt,
+                        "Search for an app to add your first pin.",
+                        &fm.subtitle,
+                        rect(20., 108., width - 20., 137.),
+                        brush,
+                    );
+                }
+                for (i, app) in pins.iter().enumerate() {
+                    let (l, top, r, bottom) = start::tile(i, width, window_h);
+                    if f.start_hover.or(f.start_focus) == Some(i) {
+                        brush.SetColor(&p.row_selected);
+                        rt.FillRoundedRectangle(&rounded(rect(l, top, r, bottom), 9.), brush);
+                    }
+                    let size = (bottom - top - 20.).clamp(16., 34.);
+                    let left = (l + r - size) / 2.;
+                    let icon_rect = rect(left, top + 6., left + size, top + 6. + size);
+                    if let Some(icon) = f
+                        .icons
+                        .get(&app.id)
+                        .and_then(|px| bitmap(&mut t.bitmaps, rt, &app.id, px))
+                    {
+                        rt.DrawBitmap(&icon, Some(&icon_rect), 1., D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                    } else {
+                        brush.SetColor(&p.tile);
+                        rt.FillRoundedRectangle(&rounded(icon_rect, 6.), brush);
+                        brush.SetColor(&p.text);
+                        let initial: String = app.name.chars().take(1).collect();
+                        draw_text(rt, &initial, &fm.letter, icon_rect, brush);
+                    }
+                    if bottom - top > 42. {
+                        brush.SetColor(&p.text);
+                        draw_text(
+                            rt,
+                            &app.name,
+                            &fm.small,
+                            rect(l + 4., top + size + 7., r - 4., bottom),
+                            brush,
+                        );
+                    }
+                }
+            }
+            let top = window_h - start::FOOTER;
+            brush.SetColor(&p.divider);
+            rt.FillRectangle(&rect(12., top, width - 12., top + 1.), brush);
+            for (i, (label, glyph)) in [("Profile", "\u{E77B}"), ("Settings", "\u{E713}"), ("Power", "\u{E7E8}")]
+                .into_iter()
+                .enumerate()
+            {
+                let (l, top, r, bottom) = start::footer(i, width, window_h);
+                if f.start_hover.or(f.start_focus) == Some(start::CAPACITY + i) {
+                    brush.SetColor(&p.row_selected);
+                    rt.FillRoundedRectangle(&rounded(rect(l, top, r, bottom), 8.), brush);
+                }
+                brush.SetColor(&p.text);
+                draw_text(rt, glyph, &fm.glyph, rect(l + 4., top, l + 29., bottom), brush);
+                draw_text(rt, label, &fm.subtitle, rect(l + 33., top, r - 2., bottom), brush);
+            }
+        }
         Ok(())
+    }
+}
+
+unsafe fn draw_footer_menu(
+    t: &Target,
+    fm: &Formats,
+    p: &Palette,
+    width: f32,
+    height: f32,
+    menu: crate::app::start::FooterMenu,
+    selected: usize,
+) {
+    let actions = menu.actions();
+    unsafe {
+        let rt = &t.rt;
+        let brush = &t.brush;
+        rt.SetTransform(&Matrix3x2::identity());
+        let (left, top, right, _) = menu.row(0, width, height);
+        let (_, _, _, bottom) = menu.row(actions.len() - 1, width, height);
+        let panel = rounded(rect(left - 5., top - 5., right + 5., bottom + 5.), 11.);
+        brush.SetColor(&p.background_solid);
+        rt.FillRoundedRectangle(&panel, brush);
+        brush.SetColor(&p.divider);
+        rt.DrawRoundedRectangle(&panel, brush, 1., None);
+        for (i, action) in actions.iter().copied().enumerate() {
+            let (l, top, r, b) = menu.row(i, width, height);
+            if i == selected {
+                brush.SetColor(&p.row_selected);
+                rt.FillRoundedRectangle(&rounded(rect(l, top, r, b), 6.), brush);
+            }
+            let (label, icon) = action.map_or(("Quit Wisp", "\u{E711}"), |power| (power.title(), power.glyph()));
+            brush.SetColor(&p.text);
+            draw_text(rt, icon, &fm.glyph, rect(l + 7., top, l + 29., b), brush);
+            draw_text(rt, label, &fm.title, rect(l + 36., top, r - 7., b), brush);
+        }
     }
 }
 
