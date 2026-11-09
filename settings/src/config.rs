@@ -17,7 +17,6 @@ pub struct Config {
     pub theme: String,
     pub backdrop: String,
     pub show_recent: bool,
-    pub search_url: String,
     pub file_search: bool,
     pub file_search_exclude: Vec<String>,
     pub position: String,
@@ -85,7 +84,6 @@ impl Config {
             theme,
             backdrop,
             show_recent: boolean("show_recent")?,
-            search_url: string("search_url")?,
             file_search: boolean("file_search")?,
             file_search_exclude,
             position,
@@ -103,14 +101,6 @@ fn choice(value: &str, choices: &[&str], key: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("{key} must be {}.", choices.join(", ")))
-    }
-}
-
-pub fn validate_url(value: &str) -> Result<(), String> {
-    if value.contains("{query}") {
-        Ok(())
-    } else {
-        Err("Add {query} where the search text should go.".into())
     }
 }
 
@@ -199,7 +189,6 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         "hotkey" => {
             crate::hotkey::parse(value.as_str().ok_or("Shortcut must be text.")?)?;
         }
-        "search_url" => validate_url(value.as_str().ok_or("Search URL must be text.")?)?,
         "max_results" if !value.as_integer().is_some_and(|value| (1..=20).contains(&value)) => {
             return Err("Choose between 1 and 20 results.".into());
         }
@@ -342,8 +331,6 @@ mod tests {
             assert!(store.set(key, value).is_err(), "{key}");
         }
         assert!(!store.path.exists());
-        assert!(validate_url("https://example.com/?q={query}").is_ok());
-        assert!(validate_url("https://example.com/?q={QUERY}").is_err());
         assert_eq!(store.set("max_results", 20.into()).unwrap().max_results, 20);
         assert_eq!(store.set("dock_icon_size", 40.into()).unwrap().dock_icon_size, 40);
     }

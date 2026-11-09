@@ -405,10 +405,9 @@ struct Launcher {
 
     editor: crate::editor::Editor,
     searcher: Searcher,
-    /// What the launcher shows: `base_results` with `file_results` inserted
-    /// before the web search result.
+    /// What the launcher shows: base results followed by file results.
     results: Vec<ResultItem>,
-    /// Results computed on the UI thread: apps, calculator, URL, command, web search.
+    /// Results computed on the UI thread: apps, calculator, URL, and command.
     base_results: Vec<ResultItem>,
     /// File search results, which arrive later from the file search worker.
     file_results: Vec<ResultItem>,
@@ -1255,13 +1254,9 @@ impl Launcher {
 
     /// Rebuilds `results` from `base_results` and `file_results`.
     fn merge_results(&mut self) {
-        let base = std::mem::take(&mut self.base_results);
-        let web = base.iter().position(|r| r.kind == Kind::Web).unwrap_or(base.len());
-        self.results = Vec::with_capacity(base.len() + self.file_results.len());
-        self.results.extend(base[..web].iter().cloned());
+        self.results.clear();
+        self.results.extend(self.base_results.iter().cloned());
         self.results.extend(self.file_results.iter().cloned());
-        self.results.extend(base[web..].iter().cloned());
-        self.base_results = base;
         if crate::util::perf::hook_on("WISP_CAPTURE")
             && let Some(rows) = crate::util::perf::hook("WISP_CAPTURE_ROWS")
             && let Ok(rows) = rows.parse::<usize>()
@@ -1287,14 +1282,8 @@ impl Launcher {
         };
 
         let rows_before = self.window_rows();
-        // Keep the web search result selected only if the user selected it.
-        // When it is the first result, the top result stays selected instead.
-        let web_selected = self.selected > 0 && self.results.get(self.selected).is_some_and(|r| r.kind == Kind::Web);
         self.file_results = hits.into_iter().map(search::file_result).collect();
         self.merge_results();
-        if web_selected {
-            self.selected = self.results.iter().position(|r| r.kind == Kind::Web).unwrap_or(0);
-        }
         self.selected = self.selected.min(self.results.len().saturating_sub(1));
         self.move_selection(0, false);
         if self.window_rows() != rows_before {
@@ -2408,7 +2397,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             return LRESULT(0);
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            if with_launcher(|l| l.on_key(VIRTUAL_KEY(wparam.0 as u16))) == Some(true) {
+            let key = VIRTUAL_KEY(wparam.0 as u16);
+            // Bit 30 is set when the key was already down. A held Enter must not confirm an action.
+            if key == VK_RETURN && lparam.0 & (1 << 30) != 0 {
+                return LRESULT(0);
+            }
+            if with_launcher(|l| l.on_key(key)) == Some(true) {
                 return LRESULT(0);
             }
         }

@@ -30,7 +30,7 @@ It is written in Rust with Win32 and Direct2D. It needs no .NET, web view or Pow
 2. Extract it to `%LOCALAPPDATA%\Programs\Wisp`.
 3. Run `wisp.exe`. The settings app opens and sets your shortcut and **Start with Windows**.
 
-To update, open the settings app and select **Update** on the **About** page.
+To update this fork, quit Wisp and Settings, then replace both executables with the new fork build.
 
 > [!NOTE]
 > PowerToys Run also uses <kbd>Alt</kbd>+<kbd>Space</kbd>. Turn it off, or change Wisp's shortcut.
@@ -108,7 +108,7 @@ Drag a result out of the launcher and drop it anywhere:
 - **Files and folders** into a chat, an email, an upload box or a folder. The original stays where it is.
 - **Apps** onto the desktop or into a folder, to make a shortcut.
 - **Text**, such as a result, the time or a path, into any text box.
-- **Links and web searches** into a browser or a chat.
+- **Links** into a browser or a chat.
 
 Press <kbd>Esc</kbd> to cancel a drag.
 
@@ -131,7 +131,6 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `show_recent` | `true` | Shows recent apps when the box is empty |
 | `file_search` | `true` | Searches files in the Windows Search index |
 | `file_search_exclude` | `["node_modules", …]` | Folder names file search skips |
-| `search_url` | Google | Web search URL. `{query}` is replaced by your search. |
 
 Configs from Wisp 0.3 keep the taskbar. To switch, set `dock` and `hide_taskbar` to `true` and `position` to `"bottom"`.
 

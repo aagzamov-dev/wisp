@@ -17,7 +17,7 @@ use crate::{
     config::{self, Config, Store},
     hotkey,
     palette::{self, Palette},
-    system, update,
+    system,
 };
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
@@ -63,29 +63,16 @@ impl Page {
     }
 }
 
-/// Where the update check or install is.
-enum Updates {
-    Idle,
-    Checking,
-    Latest,
-    Available(update::Release),
-    Installing,
-    Installed(String),
-    Failed(String),
-}
-
 pub struct Settings {
     store: Option<Store>,
     config: Config,
     error: Option<String>,
     shortcut_error: Option<String>,
-    url_error: Option<String>,
     folder_error: Option<String>,
     page: Page,
     /// `Some(step)` while the one-time onboarding is showing.
     onboarding: Option<usize>,
     shortcut: Entity<InputState>,
-    url: Entity<InputState>,
     folder: Entity<InputState>,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
@@ -97,7 +84,6 @@ pub struct Settings {
     recording: bool,
     focus: FocusHandle,
     icon: Arc<Image>,
-    updates: Updates,
 }
 
 fn labels(choices: &[(&'static str, &'static str)]) -> Vec<&'static str> {
@@ -130,7 +116,6 @@ impl Settings {
             Err(error) => (None, Config::default(), Some(error)),
         };
         let shortcut = cx.new(|cx| InputState::new(window, cx).default_value(config.hotkey.clone()));
-        let url = cx.new(|cx| InputState::new(window, cx).default_value(config.search_url.clone()));
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let theme = cx.new(|cx| {
             SelectState::new(
@@ -179,17 +164,6 @@ impl Settings {
                 cx.notify();
             } else if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
                 this.commit_shortcut(window, cx);
-            }
-        })
-        .detach();
-        cx.subscribe_in(&url, window, |this, input, event, window, cx| {
-            if matches!(event, InputEvent::Change) {
-                let value = input.read(cx).value().to_string();
-                this.url_error = config::validate_url(&value).err();
-                if this.url_error.is_none() && value != this.config.search_url {
-                    this.save("search_url", value.into(), window, cx);
-                }
-                cx.notify();
             }
         })
         .detach();
@@ -249,10 +223,9 @@ impl Settings {
         })
         .detach();
 
-        let mut this = Self {
+        let this = Self {
             store,
             shortcut_error: hotkey::parse(&config.hotkey).err(),
-            url_error: config::validate_url(&config.search_url).err(),
             config,
             error,
             folder_error: None,
@@ -262,7 +235,6 @@ impl Settings {
                 .unwrap_or(Page::General),
             onboarding: welcome.then_some(0),
             shortcut,
-            url,
             folder,
             theme,
             backdrop,
@@ -274,12 +246,8 @@ impl Settings {
             recording: false,
             focus,
             icon: Arc::new(Image::from_bytes(ImageFormat::Svg, ICON_SVG.to_vec())),
-            updates: Updates::Idle,
         };
         this.apply_theme(window, cx);
-        if !welcome {
-            this.check_updates(false, cx);
-        }
         this
     }
 
@@ -340,11 +308,9 @@ impl Settings {
                 self.config = config;
                 self.error = None;
                 self.shortcut_error = hotkey::parse(&self.config.hotkey).err();
-                self.url_error = config::validate_url(&self.config.search_url).err();
-                let (hotkey, url) = (self.config.hotkey.clone(), self.config.search_url.clone());
+                let hotkey = self.config.hotkey.clone();
                 self.shortcut
                     .update(cx, |input, cx| input.set_value(hotkey, window, cx));
-                self.url.update(cx, |input, cx| input.set_value(url, window, cx));
                 let theme = index_of(&THEMES, &self.config.theme);
                 self.theme
                     .update(cx, |state, cx| state.set_selected_index(theme, window, cx));
@@ -438,144 +404,6 @@ impl Settings {
             self.error = Some(error);
             cx.notify();
         }
-    }
-
-    /// Asks GitHub for the latest release. A check the user did not ask for
-    /// stays quiet when it fails.
-    fn check_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
-        self.updates = Updates::Checking;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx.background_executor().spawn(async { update::check() }).await;
-            let _ = this.update(cx, |this, cx| {
-                this.updates = match result {
-                    Ok(Some(release)) => Updates::Available(release),
-                    Ok(None) => Updates::Latest,
-                    Err(error) if manual => Updates::Failed(error),
-                    Err(_) => Updates::Idle,
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn install_update(&mut self, cx: &mut Context<Self>) {
-        let Updates::Available(release) = &self.updates else {
-            return;
-        };
-        let release = release.clone();
-        self.updates = Updates::Installing;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let version = release.version().to_owned();
-            let result = cx
-                .background_executor()
-                .spawn(async move { update::install(&release) })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.updates = match result {
-                    Ok(()) => Updates::Installed(version),
-                    Err(error) => Updates::Failed(error),
-                };
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn updates_row(&self, p: Palette, cx: &mut Context<Self>) -> Div {
-        let current = env!("CARGO_PKG_VERSION");
-        let check = |label: &'static str, cx: &mut Context<Self>| {
-            Button::new("check-updates")
-                .label(label)
-                .on_click(cx.listener(|this, _, _, cx| this.check_updates(true, cx)))
-                .into_any_element()
-        };
-        let busy = |label: &'static str| Button::new("busy").label(label).disabled(true).into_any_element();
-        let (description, control): (SharedString, AnyElement) = match &self.updates {
-            Updates::Idle => (
-                format!("You have version {current}.").into(),
-                check("Check for updates", cx),
-            ),
-            Updates::Checking => ("Checking GitHub for a newer version…".into(), busy("Checking…")),
-            Updates::Latest => (
-                format!("Version {current} is the latest version.").into(),
-                check("Check again", cx),
-            ),
-            Updates::Available(release) => {
-                let page = release.page.clone();
-                (
-                    format!("Wisp {} is available. You have {current}.", release.version()).into(),
-                    h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("release-notes")
-                                .ghost()
-                                .label("What's new")
-                                .on_click(move |_, _, cx| cx.open_url(&page)),
-                        )
-                        .child(
-                            Button::new("install-update")
-                                .primary()
-                                .label("Update")
-                                .on_click(cx.listener(|this, _, _, cx| this.install_update(cx))),
-                        )
-                        .into_any_element(),
-                )
-            }
-            Updates::Installing => (
-                "Downloading and installing. Wisp restarts when it is done.".into(),
-                busy("Updating…"),
-            ),
-            Updates::Installed(version) => (
-                format!("Wisp {version} is installed. Restart settings to use the new version.").into(),
-                Button::new("restart-settings")
-                    .primary()
-                    .label("Restart")
-                    .on_click(cx.listener(|this, _, _, cx| match update::restart_settings() {
-                        Ok(()) => cx.quit(),
-                        Err(error) => {
-                            this.updates = Updates::Failed(error);
-                            cx.notify();
-                        }
-                    }))
-                    .into_any_element(),
-            ),
-            Updates::Failed(_) => (format!("You have version {current}.").into(), check("Try again", cx)),
-        };
-        let error = match &self.updates {
-            Updates::Failed(error) => Some(div().px_4().pb_3().child(error_text(error, p))),
-            _ => None,
-        };
-        v_flex().child(row("Updates", description, control, p)).children(error)
-    }
-
-    /// A quiet link at the bottom of the sidebar while an update is waiting.
-    fn update_link(&self, p: Palette, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
-        let Updates::Available(release) = &self.updates else {
-            return None;
-        };
-        Some(
-            h_flex()
-                .id("update-link")
-                .gap_2()
-                .items_center()
-                .px_3()
-                .py_1()
-                .rounded_md()
-                .cursor_pointer()
-                .text_xs()
-                .text_color(p.muted)
-                .hover(|s| s.bg(p.surface).text_color(p.fg))
-                .child(div().size(px(6.)).rounded_full().bg(p.accent))
-                .child(format!("Wisp {} is available", release.version()))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.page = Page::About;
-                    this.recording = false;
-                    cx.notify();
-                })),
-        )
     }
 
     fn add_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -810,26 +638,19 @@ impl Settings {
         );
         v_flex()
             .gap_2()
-            .child(label("Apps and web", p))
+            .child(label("Apps", p))
             .child(
-                group(p)
-                    .child(row(
-                        "Recent apps",
-                        "Show recently opened apps when the search box is empty.",
-                        Switch::new("recent")
-                            .checked(self.config.show_recent)
-                            .accessibility_label("Show recent apps")
-                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
-                                this.save("show_recent", (*enabled).into(), window, cx);
-                            })),
-                        p,
-                    ))
-                    .child(divider(p))
-                    .child(
-                        item("Web search URL", "Wisp replaces {query} with your search text.", p)
-                            .child(Input::new(&self.url).aria_label("Web search URL"))
-                            .children(self.url_error.as_ref().map(|e| error_text(e, p))),
-                    ),
+                group(p).child(row(
+                    "Recent apps",
+                    "Show recently opened apps when the search box is empty.",
+                    Switch::new("recent")
+                        .checked(self.config.show_recent)
+                        .accessibility_label("Show recent apps")
+                        .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                            this.save("show_recent", (*enabled).into(), window, cx);
+                        })),
+                    p,
+                )),
             )
             .child(div().h_3())
             .child(label("Files", p))
@@ -889,7 +710,6 @@ impl Settings {
                             .child(hint(format!("Version {}", env!("CARGO_PKG_VERSION")), p)),
                     ),
             )
-            .child(group(p).child(self.updates_row(p, cx)))
             .child(
                 group(p)
                     .child(row(
@@ -962,9 +782,7 @@ impl Settings {
                         Page::ALL
                             .into_iter()
                             .map(|page| nav_item(page, self.page == page, p, cx)),
-                    )
-                    .child(div().flex_1())
-                    .children(self.update_link(p, cx)),
+                    ),
             )
             .child(
                 v_flex()

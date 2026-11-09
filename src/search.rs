@@ -1,4 +1,4 @@
-//! Ranks app, file, calculator, URL, command and web search results.
+//! Ranks app, file, calculator, URL and command results.
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config as MatcherConfig, Matcher, Utf32Str};
@@ -23,7 +23,6 @@ pub enum Kind {
     Calc,
     Url,
     Shell,
-    Web,
     /// A built-in command, such as Wi-Fi.
     Command,
 }
@@ -35,7 +34,6 @@ impl Kind {
             Kind::App | Kind::File | Kind::Folder | Kind::Url => "Open",
             Kind::Calc => "Copy",
             Kind::Shell => "Run",
-            Kind::Web => "Search",
             Kind::Command => "Run",
         }
     }
@@ -350,12 +348,6 @@ impl Searcher {
             results.push(app_result(app, highlights));
         }
 
-        results.push(ResultItem::new(
-            Kind::Web,
-            format!("Search the web for \u{201C}{query}\u{201D}"),
-            host(&config.search_url).unwrap_or("Web search"),
-            Action::Open(config.search_url.replace("{query}", &url_encode(query))),
-        ));
         results
     }
 }
@@ -444,23 +436,6 @@ fn as_url(query: &str) -> Option<String> {
     }
 }
 
-fn host(url: &str) -> Option<&str> {
-    let rest = url.split("://").nth(1)?;
-    rest.split(['/', '?']).next()
-}
-
-fn url_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() * 3);
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
-            b' ' => out.push('+'),
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,7 +459,6 @@ mod tests {
         let results = searcher.search("vsc", &apps, &History::default(), &Config::default());
         assert_eq!(results[0].title, "Visual Studio Code");
         assert_eq!(results[0].highlights, vec![(0, 1), (7, 1), (14, 1)]);
-        assert_eq!(results.last().unwrap().kind, Kind::Web);
 
         let apps = [
             app("Visual Studio Code"),
@@ -579,12 +553,11 @@ mod tests {
             "https://www.rust-lang.org"
         );
         assert!(searcher.search("", &[app("Notepad")], &h, &c).is_empty());
+        assert!(searcher.search("unmatched query", &[], &h, &c).is_empty());
     }
 
     #[test]
-    fn encodes_urls_extracts_hosts_and_converts_highlights() {
-        assert_eq!(url_encode("a b&c"), "a+b%26c");
-        assert_eq!(host("https://www.google.com/search?q={query}"), Some("www.google.com"));
+    fn converts_highlights_to_utf16() {
         assert_eq!(utf16_ranges("a🎉bc", &[0, 2, 3]), vec![(0, 1), (3, 2)]);
     }
 }

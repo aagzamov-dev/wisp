@@ -47,7 +47,7 @@ impl Payload {
                 },
             ) => Some(Self::App(path.clone())),
             (_, Action::Copy(text)) => Some(Self::Text(text.clone())),
-            (Kind::Url | Kind::Web, Action::Open(url)) => Some(Self::Url(url.clone())),
+            (Kind::Url, Action::Open(url)) => Some(Self::Url(url.clone())),
             _ => None,
         }
     }
@@ -185,12 +185,10 @@ mod tests {
                 Some(Payload::Text("value".into()))
             );
         }
-        for kind in [Kind::Url, Kind::Web] {
-            assert_eq!(
-                Payload::from_result(&item(kind, Action::Open("https://example.com/".into()))),
-                Some(Payload::Url("https://example.com/".into()))
-            );
-        }
+        assert_eq!(
+            Payload::from_result(&item(Kind::Url, Action::Open("https://example.com/".into()))),
+            Some(Payload::Url("https://example.com/".into()))
+        );
         let app = |path, admin| {
             item(
                 Kind::App,

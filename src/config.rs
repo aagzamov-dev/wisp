@@ -62,7 +62,6 @@ pub struct Config {
     pub backdrop: Backdrop,
     pub position: Position,
     pub show_recent: bool,
-    pub search_url: String,
     pub file_search: bool,
     pub file_search_exclude: Vec<String>,
     pub window_list: WindowListMode,
