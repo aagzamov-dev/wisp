@@ -865,7 +865,7 @@ pub fn open(
         if width <= 0 || height <= 0 {
             return Err(Error::from_hresult(windows::Win32::Foundation::E_FAIL));
         }
-        let x = (anchor.right - width).clamp(
+        let x = (anchor.left + (anchor.right - anchor.left - width) / 2).clamp(
             info.rcWork.left + 8,
             (info.rcWork.right - width - 8).max(info.rcWork.left + 8),
         );
@@ -994,6 +994,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return DefWindowProcW(hwnd, msg, wp, LPARAM(-1));
         }
         if msg == WM_NCDESTROY {
+            if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
+                let _ = InvalidateRect(Some(owner), None, false);
+            }
             let data = panel(hwnd);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
             if !data.is_null() {

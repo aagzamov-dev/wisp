@@ -14,7 +14,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Interface, PWSTR, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AppEntry {
     pub name: String,
     /// Windows shell parsing name in `shell:AppsFolder`: a path or an AppUserModelID.

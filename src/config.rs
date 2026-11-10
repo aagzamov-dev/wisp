@@ -72,6 +72,8 @@ pub struct Config {
     pub backdrop_color: String,
     pub dock: bool,
     pub dock_autohide: bool,
+    pub dock_smart_hide: bool,
+    pub dock_current_monitor_only: bool,
     pub dock_icon_size: usize,
     pub dock_open_ms: u32,
     pub dock_close_ms: u32,

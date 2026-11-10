@@ -616,6 +616,32 @@ impl Settings {
                         p,
                     ))
                     .child(divider(p))
+                    .child(row(
+                        "Smart auto-hide",
+                        "Keep the dock visible while its space is clear. Reveal it from the bottom edge when a window overlaps it.",
+                        Switch::new("dock-smart-hide")
+                            .checked(self.config.dock_smart_hide)
+                            .disabled(!self.config.dock || !self.config.dock_autohide)
+                            .accessibility_label("Smart auto-hide")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("dock_smart_hide", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(row(
+                        "Show apps from this monitor only",
+                        "Keep pinned apps. Previews still show windows from all monitors for each visible app.",
+                        Switch::new("dock-current-monitor")
+                            .checked(self.config.dock_current_monitor_only)
+                            .disabled(!self.config.dock)
+                            .accessibility_label("Show apps from this monitor only")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("dock_current_monitor_only", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    ))
+                    .child(divider(p))
                     .child(
                         item(
                             "App icon size",

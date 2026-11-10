@@ -85,6 +85,7 @@ pub const PREVIEW_PAD: f32 = 8.;
 pub const PREVIEW_WIDTH: f32 = 168.;
 pub const PREVIEW_HEIGHT: f32 = 100.;
 pub const PREVIEW_HEADER: f32 = 28.;
+pub const PREVIEW_MONITOR: f32 = 17.;
 pub const PREVIEW_FOOTER: f32 = 24.;
 
 pub fn show_window_list(mode: WindowListMode, windows: usize) -> bool {

@@ -61,6 +61,12 @@ pub struct Renderer {
     shared_target: Option<Target>,
 }
 
+pub(super) struct DragFrame {
+    pub from: usize,
+    pub to: Option<usize>,
+    pub offset: f32,
+}
+
 pub struct Frame<'a> {
     pub animation_scale: f32,
     pub dpi: u32,
@@ -80,6 +86,8 @@ pub struct Frame<'a> {
     pub tray: &'a [Shown],
     pub inline: &'a [usize],
     pub flyout_open: bool,
+    pub sound_open: bool,
+    pub(super) drag: Option<DragFrame>,
 }
 
 /// The notification-area flyout's grid.
@@ -538,6 +546,7 @@ impl Renderer {
         dpi: u32,
         palette: &Palette,
         rows: &[String],
+        (monitors, monitor_height): (&[String], f32),
         hover: Option<(usize, bool)>,
         (card_width, preview_height): (f32, f32),
         previews: &[Option<isize>],
@@ -547,7 +556,8 @@ impl Renderer {
             background(target, palette, 1.0);
             let pad = logic::PREVIEW_PAD;
             let header = logic::PREVIEW_HEADER;
-            let bottom = pad + header + preview_height;
+            let image_bottom = pad + header + preview_height;
+            let bottom = image_bottom + monitor_height;
             let rt = &target.rt;
             let brush = &target.brush;
             unsafe {
@@ -584,7 +594,19 @@ impl Renderer {
                             brush,
                             &formats.small,
                             "Preview unavailable",
-                            rect(left + 5., pad + header, right - 5., bottom),
+                            rect(left + 5., pad + header, right - 5., image_bottom),
+                        );
+                    }
+                    if monitor_height > 0.
+                        && let Some(label) = monitors.get(index)
+                    {
+                        brush.SetColor(&palette.subtext);
+                        text(
+                            rt,
+                            brush,
+                            &formats.small,
+                            label,
+                            rect(left + 5., image_bottom, right - 5., bottom),
                         );
                     }
                 }
@@ -908,7 +930,9 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
         let running = frame.count();
         let foreground = GetForegroundWindow().0 as isize;
         target.bitmaps.retain(|key, _| icons.contains_key(key));
-        for index in 0..=running {
+        let lifted = frame.drag.as_ref().map(|drag| drag.from);
+        // Paint the moving icon last so it stays above its neighbors.
+        for index in (0..=running).filter(|&index| Some(index) != lifted).chain(lifted) {
             let x = logic::left_scaled(index, frame.layout_scale);
             let slot = logic::slot(frame.layout_scale);
             let item = index.checked_sub(1).and_then(|i| items.get(i + scroll));
@@ -932,13 +956,20 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 );
             }
             let progress = frame.hover_levels.get(index).copied().unwrap_or(0.0);
-            let lift = 2.0 * progress * progress * (3.0 - 2.0 * progress);
-            let icon_size = *app_icon_size;
+            let moving = frame.drag.as_ref().filter(|drag| drag.from == index);
+            let lift = if moving.is_some() { 6.0 } else { 2.0 } * progress * progress * (3.0 - 2.0 * progress);
+            let icon_size = *app_icon_size * if moving.is_some() { 1.12 } else { 1.0 };
             let icon_top = ICON_CENTER_Y * frame.layout_scale - icon_size / 2.0 - lift * frame.layout_scale;
+            let icon_x = moving.map_or(x, |drag| {
+                (x + drag.offset).clamp(
+                    logic::left_scaled(1, frame.layout_scale),
+                    logic::left_scaled(running, frame.layout_scale),
+                )
+            });
             let icon_rect = frame.snap_rect(
-                x + (slot - icon_size) / 2.0,
+                icon_x + (slot - icon_size) / 2.0,
                 icon_top,
-                x + (slot + icon_size) / 2.0,
+                icon_x + (slot + icon_size) / 2.0,
                 icon_top + icon_size,
             );
             let Some(item) = item else {
@@ -1021,6 +1052,18 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 );
             }
         }
+        if let Some(drag) = &frame.drag
+            && let Some(to) = drag.to
+        {
+            let edge = to + usize::from(to > drag.from);
+            let scale = frame.layout_scale;
+            let x = logic::left_scaled(edge, scale);
+            target.brush.SetColor(&p.accent);
+            target.rt.FillRoundedRectangle(
+                &rounded(frame.snap_rect(x - scale, 12. * scale, x + scale, 40. * scale), scale),
+                &target.brush,
+            );
+        }
         Ok(())
     }
 }
@@ -1077,7 +1120,10 @@ fn draw_status(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
             continue;
         };
         let right = left + part.width_scaled(frame.layout_scale);
-        if *hover_part == Some(part) || part == Part::Chevron && frame.flyout_open {
+        if *hover_part == Some(part)
+            || part == Part::Chevron && frame.flyout_open
+            || part == Part::Volume && frame.sound_open
+        {
             tile(
                 target,
                 frame,

@@ -40,14 +40,17 @@ To update this fork, quit Wisp and Settings, then replace both executables with 
 
 ## Dock
 
-The dock appears when the pointer touches the bottom edge of a screen, and hides when you move away. To keep it on screen, turn on **Keep the dock visible** in Settings. Maximized windows then stop above it.
+Wisp places a dock on each connected monitor. Each dock appears when the pointer touches that monitor's bottom edge. **Smart auto-hide** keeps it visible while its space is clear and lets the bottom edge reveal it when a window overlaps it. **Keep the dock visible** reserves space on the main screen when Wisp replaces the taskbar.
+
+**Show apps from this monitor only** filters running apps to the current screen and keeps pinned apps visible. Window previews include all windows for a visible app, with local windows first when the preview opens.
 
 | Do this | To |
 | --- | --- |
-| Click an app | Switch to its window, or choose from thumbnails when it has multiple windows |
+| Click an app | Launch it if closed, switch to its window, or choose from thumbnails when it has multiple windows |
 | Click the app in front | Minimize it |
 | Middle-click an app | Open a new window of it |
-| Right-click an app | Close its windows |
+| Right-click an app | Open a new window, pin or unpin the app, or close its windows |
+| Drag an app icon | Reorder pins within the pinned section or running apps within the running section. Wisp saves the pin order. |
 | Hover an app with open windows | See a thumbnail card for each window. Click to switch, or use the close button to close that window. Use the arrows or wheel when the cards span multiple pages. |
 | Click a tray icon | Use it as you would on the taskbar |
 | Click **⌄** | Show the hidden tray icons |
@@ -62,7 +65,7 @@ The dock appears when the pointer touches the bottom edge of a screen, and hides
 
 The monitor icon in Control Center opens Display settings and brightness controls for monitors that expose DDC/CI. The Sound row shows the connected Bluetooth output’s battery percentage when Windows reports a level for the matching device. Do Not Disturb opens Windows notification settings.
 
-The dock hides over full-screen apps. Tray icons you pin in Windows show in the dock; the rest are behind **⌄**.
+A fullscreen app hides the dock on its own screen. The docks share the same app pins and Windows tray icons. Tray icons you pin in Windows appear inline, and the rest are behind **⌄**.
 
 If Wisp quits or crashes, the taskbar comes back with every tray icon.
 

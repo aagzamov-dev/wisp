@@ -24,6 +24,8 @@ pub struct Config {
     pub position: String,
     pub dock: bool,
     pub dock_autohide: bool,
+    pub dock_smart_hide: bool,
+    pub dock_current_monitor_only: bool,
     pub dock_icon_size: i64,
     pub dock_open_ms: i64,
     pub dock_close_ms: i64,
@@ -124,6 +126,8 @@ impl Config {
             position,
             dock: boolean("dock")?,
             dock_autohide: boolean("dock_autohide")?,
+            dock_current_monitor_only: boolean("dock_current_monitor_only")?,
+            dock_smart_hide: boolean("dock_smart_hide")?,
             dock_icon_size,
             dock_open_ms: duration("dock_open_ms")?,
             dock_close_ms: duration("dock_close_ms")?,
@@ -259,6 +263,8 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         | "position"
         | "dock"
         | "dock_autohide"
+        | "dock_current_monitor_only"
+        | "dock_smart_hide"
         | "dock_icon_size"
         | "dock_open_ms"
         | "dock_close_ms"

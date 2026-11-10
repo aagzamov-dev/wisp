@@ -650,7 +650,12 @@ impl Launcher {
                 }
             }
         }
+        let dark = self.dark_theme();
         if let Some(dock) = &mut self.dock {
+            if let Err(error) = dock.sync_monitors() {
+                eprintln!("Could not synchronize monitor docks: {error}");
+            }
+            dock.apply_theme(dark, self.config.backdrop, &self.config.backdrop_color);
             dock.pace_frames();
             dock.set_apps(&self.apps, &self.icons);
             dock.set_window_list_mode(self.config.window_list);
@@ -662,7 +667,8 @@ impl Launcher {
             );
             // Notification icons need a home while the taskbar is hidden.
             dock.set_tray(self.taskbar.as_ref().is_some_and(TaskbarHider::is_active));
-            dock.set_autohide(self.config.dock_autohide);
+            dock.set_visibility(self.config.dock_autohide, self.config.dock_smart_hide);
+            dock.set_current_monitor_only(self.config.dock_current_monitor_only);
             if self.start_open {
                 dock.set_start_open(true);
             } else if self.visible {
@@ -1045,7 +1051,7 @@ impl Launcher {
             if self.start_open
                 && let Some(dock) = &self.dock
             {
-                let anchor = dock.resting_rect();
+                let anchor = dock.start_rect();
                 cursor = POINT {
                     x: (anchor.left + anchor.right) / 2,
                     y: (anchor.top + anchor.bottom) / 2,
@@ -1072,7 +1078,7 @@ impl Launcher {
         if self.start_open {
             let scale = 96. / self.dpi as f32;
             self.start_width = start::WIDTH.min(((work.right - work.left - 2 * margin) as f32 * scale).max(320.));
-            let dock_top = self.dock.as_ref().map_or(work.bottom, |dock| dock.resting_rect().top);
+            let dock_top = self.dock.as_ref().map_or(work.bottom, |dock| dock.start_rect().top);
             let bottom = work.bottom.min(dock_top) - self.px(8.);
             let available = ((bottom - work.top - margin) as f32 * scale).max(180.);
             self.start_height = start::HEIGHT.min(available);
@@ -2708,6 +2714,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         WM_PAINT
                             | WM_MOUSEMOVE
                             | WM_MOUSELEAVE
+                            | WM_CAPTURECHANGED
+                            | WM_CANCELMODE
                             | WM_MOUSEACTIVATE
                             | WM_LBUTTONDOWN
                             | WM_LBUTTONUP
@@ -3026,11 +3034,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             with_launcher(|l| {
                 l.on_taskbar_message(msg);
-                if msg == WM_DISPLAYCHANGE
-                    && !l.visible
-                    && let Some(dock) = &mut l.dock
-                {
-                    dock.refresh();
+                if msg == WM_DISPLAYCHANGE {
+                    l.sync_shell();
+                    if l.start_open {
+                        l.place_on_active_monitor();
+                    }
                 }
             });
         }
@@ -3040,7 +3048,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         dock::sound::WM_SOUND_REFRESH => {
             with_launcher(|l| {
                 if let Some(dock) = &l.dock
-                    && dock.sound_window().is_some_and(|hwnd| hwnd.0 as usize == wparam.0)
+                    && dock.sound_window(wparam.0).is_some()
                 {
                     dock.update_sound(&l.command_state);
                     l.commands.refresh_sound();
@@ -3054,12 +3062,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         dock::sound::WM_SOUND_ACTION => {
             with_launcher(|l| {
                 use dock::sound::Action;
-                let Some(window) = l
-                    .dock
-                    .as_ref()
-                    .and_then(Dock::sound_window)
-                    .filter(|hwnd| hwnd.0 as usize == wparam.0)
-                else {
+                let Some(window) = l.dock.as_ref().and_then(|dock| dock.sound_window(wparam.0)) else {
                     return;
                 };
                 let Some(action) = dock::sound::take_action(window) else {
