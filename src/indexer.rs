@@ -14,13 +14,23 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Interface, PWSTR, Result};
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DesktopLaunch {
+    pub target: String,
+    pub arguments: Option<String>,
+    pub directory: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AppEntry {
     pub name: String,
     /// Windows shell parsing name in `shell:AppsFolder`: a path or an AppUserModelID.
     pub id: String,
     /// File path for desktop apps, if Windows can resolve it.
     pub path: Option<String>,
+    /// Optional shell metadata; absent in older caches and pin files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop: Option<DesktopLaunch>,
 }
 
 /// Premultiplied BGRA pixels.
@@ -128,8 +138,16 @@ unsafe fn enumerate_apps() -> Result<Vec<(AppEntry, IShellItem)>> {
             if !is_launchable(&name, &id) || !seen.insert(id.clone()) {
                 continue;
             }
-            let path = resolve_path(&id);
-            apps.push((AppEntry { name, id, path }, item));
+            let (path, desktop) = desktop_metadata(&item, &id);
+            apps.push((
+                AppEntry {
+                    name,
+                    id,
+                    path,
+                    desktop,
+                },
+                item,
+            ));
         }
         apps.sort_by_key(|(app, _)| app.name.to_lowercase());
         Ok(apps)
@@ -160,7 +178,7 @@ unsafe fn display_name(item: &IShellItem, kind: SIGDN) -> Option<String> {
 
 /// Desktop app IDs use paths such as `{KnownFolderGUID}\sub\app.exe` or `C:\path\app.exe`.
 fn resolve_path(id: &str) -> Option<String> {
-    if id.as_bytes().get(1..3) == Some(b":\\") {
+    if absolute_desktop_path(id) {
         return Some(id.to_string());
     }
     let rest = id.strip_prefix('{')?;
@@ -173,6 +191,77 @@ fn resolve_path(id: &str) -> Option<String> {
         folder?
     };
     Some(format!("{folder}{}", &rest[close + 1..]))
+}
+
+pub fn absolute_desktop_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    !path.contains('\0')
+        && ((bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1..3) == Some(b":\\"))
+            || path.starts_with(r"\\"))
+}
+
+pub fn executable_path(path: &str) -> bool {
+    absolute_desktop_path(path)
+        && [".exe", ".com", ".lnk"]
+            .iter()
+            .any(|ext| path.to_ascii_lowercase().ends_with(ext))
+}
+
+/// AppsFolder identities are often AUMIDs even for desktop apps. Ask the shell
+/// item for its filesystem/link metadata on the existing background worker.
+unsafe fn desktop_metadata(item: &IShellItem, id: &str) -> (Option<String>, Option<DesktopLaunch>) {
+    unsafe {
+        let item2 = item.cast::<IShellItem2>().ok();
+        let string = |name: &str| -> Option<String> {
+            let mut key = Default::default();
+            PropertiesSystem::PSGetPropertyKeyFromName(&HSTRING::from(name), &mut key).ok()?;
+            let ptr = item2.as_ref()?.GetString(&key).ok()?;
+            let value = ptr.to_string().ok();
+            CoTaskMemFree(Some(ptr.0 as _));
+            value.filter(|value| !value.is_empty() && !value.contains('\0'))
+        };
+        let item_path = display_name(item, SIGDN_FILESYSPATH)
+            .or_else(|| string("System.ItemPathDisplay"))
+            .filter(|path| absolute_desktop_path(path));
+        let target = string("System.Link.TargetParsingPath").filter(|path| absolute_desktop_path(path));
+        let arguments = string("System.Link.Arguments");
+        let directory = string("System.Link.WorkingDirectory").filter(|path| absolute_desktop_path(path));
+        let packaged = string("System.AppUserModel.PackageInstallPath").is_some()
+            || (id.contains('!') && !absolute_desktop_path(id));
+        metadata_paths(item_path, target, resolve_path(id), arguments, directory, packaged)
+    }
+}
+
+fn metadata_paths(
+    item_path: Option<String>,
+    target: Option<String>,
+    fallback: Option<String>,
+    arguments: Option<String>,
+    directory: Option<String>,
+    packaged: bool,
+) -> (Option<String>, Option<DesktopLaunch>) {
+    let item_path = item_path.filter(|path| absolute_desktop_path(path));
+    let target = target.filter(|path| absolute_desktop_path(path));
+    let fallback = fallback.filter(|path| absolute_desktop_path(path));
+    let path = target
+        .clone()
+        .or_else(|| item_path.clone())
+        .or_else(|| fallback.clone());
+    // Prefer the original shortcut: the shell preserves arguments, working
+    // directory and shortcut-specific elevation behavior itself.
+    let launch_path = item_path
+        .filter(|path| executable_path(path))
+        .or_else(|| target.filter(|path| executable_path(path)))
+        .or_else(|| fallback.filter(|path| executable_path(path)));
+    let desktop = launch_path.filter(|_| !packaged).map(|target| {
+        let shortcut = target.to_ascii_lowercase().ends_with(".lnk");
+        DesktopLaunch {
+            target,
+            arguments: if shortcut { None } else { arguments },
+            directory: if shortcut { None } else { directory },
+        }
+    });
+    (path, desktop)
 }
 
 pub(crate) unsafe fn load_icon(item: &IShellItem, size: i32) -> Option<IconPixels> {
@@ -245,5 +334,98 @@ unsafe fn bitmap_pixels(bitmap: HBITMAP) -> Option<IconPixels> {
             height: height as u32,
             bgra,
         })
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    fn text(value: &str) -> Option<String> {
+        Some(value.into())
+    }
+
+    #[test]
+    fn shell_target_works_without_filesystem_display_name_and_preserves_arguments() {
+        let (path, desktop) = metadata_paths(
+            None,
+            text(r"C:\Tools\editor.exe"),
+            None,
+            text(r#"--profile "Work files""#),
+            text(r"C:\Work"),
+            false,
+        );
+        assert_eq!(path.as_deref(), Some(r"C:\Tools\editor.exe"));
+        let desktop = desktop.unwrap();
+        assert_eq!(desktop.target, r"C:\Tools\editor.exe");
+        assert_eq!(desktop.arguments.as_deref(), Some(r#"--profile "Work files""#));
+        assert_eq!(desktop.directory.as_deref(), Some(r"C:\Work"));
+    }
+
+    #[test]
+    fn original_shortcut_keeps_its_own_launch_semantics_and_reveals_target() {
+        let (path, desktop) = metadata_paths(
+            text(r"C:\Start Menu\editor.lnk"),
+            text(r"C:\Tools\editor.exe"),
+            None,
+            text("--do-not-duplicate"),
+            text(r"C:\Work"),
+            false,
+        );
+        assert_eq!(path.as_deref(), Some(r"C:\Tools\editor.exe"));
+        let desktop = desktop.unwrap();
+        assert_eq!(desktop.target, r"C:\Start Menu\editor.lnk");
+        assert_eq!(desktop.arguments, None);
+        assert_eq!(desktop.directory, None);
+    }
+
+    #[test]
+    fn resolved_known_folder_fallback_unc_and_missing_metadata_are_safe() {
+        // The already-resolved known-folder fallback enters the same selector;
+        // this test does not query machine folders or touch a network share.
+        for path in [r"C:\Program Files\Editor\editor.exe", r"\\server\share\editor.exe"] {
+            let (reveal, desktop) = metadata_paths(None, None, text(path), None, None, false);
+            assert_eq!(reveal.as_deref(), Some(path));
+            assert_eq!(desktop.unwrap().target, path);
+        }
+        assert_eq!(metadata_paths(None, None, None, None, None, false), (None, None));
+        assert_eq!(
+            metadata_paths(text("relative.exe"), text("package!app"), None, None, None, false),
+            (None, None)
+        );
+        assert!(!absolute_desktop_path("C:\\editor.exe\0injected"));
+        assert!(!executable_path(r"C:\Docs\readme.txt"));
+    }
+
+    #[test]
+    fn packaged_executable_never_becomes_an_elevation_target() {
+        let (_, desktop) = metadata_paths(
+            text(r"C:\Program Files\WindowsApps\package\app.exe"),
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(desktop.is_none());
+    }
+
+    #[test]
+    fn old_cache_and_pin_app_records_load_without_desktop_metadata() {
+        let old = "name = 'Editor'\nid = 'editor'\npath = 'C:\\Editor.exe'\n";
+        let app: AppEntry = toml::from_str(old).unwrap();
+        assert!(app.desktop.is_none());
+        assert_eq!(app.path.as_deref(), Some(r"C:\Editor.exe"));
+        let new = AppEntry {
+            desktop: Some(DesktopLaunch {
+                target: r"C:\Editor.exe".into(),
+                arguments: Some("--work".into()),
+                directory: None,
+            }),
+            ..app
+        };
+        assert_eq!(
+            toml::from_str::<AppEntry>(&toml::to_string(&new).unwrap()).unwrap(),
+            new
+        );
     }
 }

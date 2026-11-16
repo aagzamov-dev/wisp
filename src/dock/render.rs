@@ -14,7 +14,9 @@ use windows::Win32::Graphics::Direct2D::{Common::*, *};
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetForegroundWindow};
-use windows::core::{PCWSTR, Result, w};
+use windows::core::{Interface, PCWSTR, Result, w};
+#[path = "render_layered.rs"]
+mod layered;
 use windows_numerics::Matrix3x2;
 
 /// Vertical layout, in DIPs, shared by the app slots and the status parts.
@@ -22,13 +24,17 @@ use windows_numerics::Matrix3x2;
 use super::logic::{ICON_CENTER_Y, INDICATOR_TOP, TILE_BOTTOM, TILE_RADIUS, TILE_TOP};
 const UPPER: (f32, f32) = (8.0, 29.0);
 const LOWER: (f32, f32) = (28.0, 48.0);
+/// Shared by top-bar tray foreground pixels, border and native blur clip, in DIPs.
+pub(super) const TOPBAR_FLYOUT_RADIUS: f32 = 12.;
 
 struct Target {
-    rt: ID2D1HwndRenderTarget,
+    rt: ID2D1RenderTarget,
+    window: Option<ID2D1HwndRenderTarget>,
     brush: ID2D1SolidColorBrush,
     bitmaps: HashMap<String, (Arc<IconPixels>, ID2D1Bitmap)>,
     /// Notification-area icons, by their tray identity.
     tray: HashMap<Key, (Arc<IconPixels>, ID2D1Bitmap)>,
+    media_shapes: HashMap<u8, ID2D1PathGeometry>,
     size: D2D_SIZE_U,
 }
 
@@ -37,6 +43,7 @@ struct Formats {
     /// A fallback tile's initial.
     letter: IDWriteTextFormat,
     time: IDWriteTextFormat,
+    island_clock: IDWriteTextFormat,
     small: IDWriteTextFormat,
     /// Segoe Fluent Icons for the status glyphs.
     glyph: IDWriteTextFormat,
@@ -47,6 +54,7 @@ struct Formats {
     row: IDWriteTextFormat,
     control_title: IDWriteTextFormat,
     control_detail: IDWriteTextFormat,
+    heading_leading: IDWriteTextFormat,
 }
 
 pub struct Renderer {
@@ -59,6 +67,7 @@ pub struct Renderer {
     format_scale: f32,
     target: Option<Target>,
     shared_target: Option<Target>,
+    layered: Option<layered::Surface>,
 }
 
 pub(super) struct DragFrame {
@@ -71,7 +80,7 @@ pub struct Frame<'a> {
     pub animation_scale: f32,
     pub dpi: u32,
     pub palette: &'a Palette,
-    pub items: &'a [Item],
+    pub(super) items: &'a [Item],
     pub icons: &'a HashMap<String, Arc<IconPixels>>,
     pub hover: Option<usize>,
     pub hover_levels: &'a [f32],
@@ -96,6 +105,44 @@ pub struct FlyoutFrame<'a> {
     pub palette: &'a Palette,
     pub tray: &'a [Shown],
     pub hover: Option<usize>,
+}
+
+pub(super) struct TopbarFrame<'a> {
+    pub dpi: u32,
+    pub palette: &'a Palette,
+    pub layout: super::topbar::model::Layout,
+    pub shown: &'a [Shown],
+    pub inline: &'a [usize],
+    pub status: &'a Status,
+    pub commands: &'a crate::commands::State,
+    pub hover: Option<super::topbar::model::Hit>,
+    pub hover_level: f32,
+    pub drag_target: Option<bool>,
+}
+pub(super) struct TopbarFlyoutFrame<'a> {
+    pub dpi: u32,
+    pub palette: &'a Palette,
+    pub shown: &'a [Shown],
+    pub overflow: &'a [usize],
+    pub hover: Option<usize>,
+    pub presentation: (f32, f32),
+}
+pub(super) struct IslandFrame<'a> {
+    pub dpi: u32,
+    pub palette: &'a Palette,
+    pub status: &'a Status,
+    pub track: Option<&'a crate::commands::media::NotchTrack>,
+    pub previous_track: Option<&'a crate::commands::media::NotchTrack>,
+    pub track_fade: f32,
+    pub reveal: f32,
+    pub mix: f32,
+    pub width: f32,
+    pub compact: bool,
+    pub time_width: f32,
+    pub date_width: f32,
+    pub hover: Option<super::topbar::model::Hit>,
+    pub hover_level: f32,
+    pub press: f32,
 }
 
 fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCWSTR, scale: f32) -> Result<Formats> {
@@ -150,9 +197,12 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             let ellipsis = dw.CreateEllipsisTrimmingSign(format)?;
             format.SetTrimming(&trimming, &ellipsis)?;
         }
+        let heading_leading = format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 18.)?;
+        heading_leading.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
         Ok(Formats {
             letter: format(display, DWRITE_FONT_WEIGHT_SEMI_BOLD, 15.0)?,
             time: format(text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 14.0)?,
+            island_clock: format(text, DWRITE_FONT_WEIGHT_NORMAL, 13.0)?,
             small: format(text, DWRITE_FONT_WEIGHT_NORMAL, 12.5)?,
             glyph: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 17.0)?,
             chevron: format(icons, DWRITE_FONT_WEIGHT_NORMAL, 12.0)?,
@@ -160,6 +210,7 @@ fn create_formats(dw: &IDWriteFactory, text: PCWSTR, display: PCWSTR, icons: PCW
             row,
             control_title,
             control_detail,
+            heading_leading,
         })
     }
 }
@@ -186,6 +237,155 @@ impl Frame<'_> {
 }
 
 impl Renderer {
+    pub(super) fn measure_topbar(&self, date: &str, time: &str, title: &str) -> Result<(f32, f32, f32)> {
+        let measure = |value: &str, format: &IDWriteTextFormat| -> Result<f32> {
+            let wide: Vec<u16> = value.encode_utf16().collect();
+            let layout = unsafe { self.dw.CreateTextLayout(&wide, format, 2000., 48.) }?;
+            let mut metrics = DWRITE_TEXT_METRICS::default();
+            unsafe {
+                layout.GetMetrics(&mut metrics)?;
+            }
+            Ok(metrics.widthIncludingTrailingWhitespace.ceil() + 1.)
+        };
+        Ok((
+            measure(date, &self.formats.small)?,
+            measure(time, &self.formats.island_clock)?,
+            measure(title, &self.formats.control_detail)?,
+        ))
+    }
+    pub(super) fn draw_topbar(&mut self, hwnd: HWND, frame: TopbarFrame) -> Result<()> {
+        let TopbarFrame {
+            dpi,
+            palette,
+            layout,
+            shown,
+            inline,
+            status,
+            commands,
+            hover,
+            hover_level,
+            drag_target,
+        } = frame;
+        use super::topbar::model::Hit;
+        self.update_formats(1.)?;
+        self.paint_layered(hwnd, dpi, palette, |target, formats| {
+            let rt = target.rt.clone();
+            let brush = target.brush.clone();
+            unsafe {
+                rt.Clear(Some(&palette.background));
+            }
+            target.tray.retain(|key, _| shown.iter().any(|s| s.icon.key() == *key));
+            for (i, &index) in inline.iter().enumerate() {
+                let left = 12. + i as f32 * 28.;
+                hit_backdrop(target, rect(left, 0., left + 28., layout.height));
+                if hover == Some(Hit::Tray(i)) {
+                    highlight(target, palette, left, 28., layout.height, hover_level);
+                }
+                if let Some(icon) = shown.get(index) {
+                    tray_icon(target, dpi, icon, left + 14., layout.height / 2.)?;
+                }
+            }
+            let start = layout.right();
+            let mut controls = vec![
+                (
+                    Hit::Overflow,
+                    12. + inline.len() as f32 * 28.,
+                    28.,
+                    "\u{E70D}".to_owned(),
+                ),
+                (Hit::Wifi, start, 32., crate::commands::glyph::WIFI.to_owned()),
+                (
+                    Hit::Sound,
+                    start + 32.,
+                    32.,
+                    if commands
+                        .audio
+                        .as_ref()
+                        .and_then(|v| v.as_ref())
+                        .is_some_and(|a| a.muted)
+                    {
+                        crate::commands::glyph::MUTED
+                    } else {
+                        crate::commands::glyph::VOLUME
+                    }
+                    .to_owned(),
+                ),
+                (Hit::Controls, layout.width - 52., 40., "\u{E9E9}".to_owned()),
+            ];
+            if let Some(battery) = status.battery {
+                controls.push((Hit::Battery, start + 64., 48., format!("{}%", battery.percent)));
+            }
+            for (hit, left, width, label) in controls {
+                hit_backdrop(target, rect(left, 0., left + width, layout.height));
+                if hover == Some(hit) {
+                    highlight(target, palette, left, width, layout.height, hover_level);
+                }
+                unsafe {
+                    brush.SetColor(&palette.text);
+                }
+                text(
+                    &rt,
+                    &brush,
+                    if hit == Hit::Battery {
+                        &formats.small
+                    } else {
+                        &formats.glyph
+                    },
+                    &label,
+                    rect(left, 0., left + width, layout.height),
+                );
+            }
+            if let Some(target_inline) = drag_target {
+                let right = (44. + inline.len() as f32 * 28.).max(128.);
+                hit_backdrop(target, rect(8., 0., right, layout.height));
+                if target_inline {
+                    unsafe {
+                        brush.SetColor(&palette.accent);
+                        rt.DrawRoundedRectangle(
+                            &rounded(rect(8., 2., right, layout.height - 2.), 5.),
+                            &brush,
+                            1.5,
+                            None,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn draw_topbar_island(&mut self, hwnd: HWND, frame: IslandFrame) -> Result<()> {
+        let dpi = frame.dpi;
+        let palette = frame.palette;
+        self.update_formats(1.)?;
+        self.paint_surface(
+            hwnd,
+            dpi,
+            palette,
+            (layered::Contour::Island, 255),
+            |target, formats| draw_island_content(target, formats, frame),
+        )
+    }
+
+    pub(super) fn draw_topbar_flyout(&mut self, hwnd: HWND, frame: TopbarFlyoutFrame) -> Result<()> {
+        let p = frame.presentation;
+        self.paint_surface(
+            hwnd,
+            frame.dpi,
+            frame.palette,
+            (
+                layered::Contour::Round(TOPBAR_FLYOUT_RADIUS * p.0),
+                (p.1.clamp(0., 1.) * 255.).round() as u8,
+            ),
+            |target, _| draw_topbar_overflow_content(target, &frame),
+        )
+    }
+    pub(super) fn clear_media_artwork(&mut self) {
+        self.layered = None;
+        if let Some(target) = &mut self.target {
+            target.bitmaps.clear();
+        }
+    }
     pub fn new() -> Result<Self> {
         unsafe {
             let factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
@@ -202,6 +402,7 @@ impl Renderer {
                 dw,
                 target: None,
                 shared_target: None,
+                layered: None,
             })
         }
     }
@@ -218,6 +419,7 @@ impl Renderer {
             format_scale: self.format_scale,
             target: None,
             shared_target: None,
+            layered: None,
         }
     }
 
@@ -231,12 +433,15 @@ impl Renderer {
 
     pub fn draw_on(&mut self, rt: &ID2D1HwndRenderTarget, frame: &Frame) -> Result<()> {
         self.update_formats(frame.layout_scale)?;
-        if self.shared_target.as_ref().is_none_or(|t| t.rt != *rt) {
+        let base: ID2D1RenderTarget = rt.cast()?;
+        if self.shared_target.as_ref().is_none_or(|t| t.rt != base) {
             self.shared_target = Some(Target {
-                rt: rt.clone(),
+                rt: base,
+                window: None,
                 brush: unsafe { rt.CreateSolidColorBrush(&frame.palette.text, None)? },
                 bitmaps: HashMap::new(),
                 tray: HashMap::new(),
+                media_shapes: HashMap::new(),
                 size: D2D_SIZE_U::default(),
             });
         }
@@ -262,243 +467,301 @@ impl Renderer {
         max_scroll: f32,
         focus: Option<usize>,
         dragging: Option<(usize, u32)>,
-        page_opacity: f32,
+        presentation: (f32, f32, f32),
+        remote_alpha: Option<u8>,
     ) -> Result<()> {
-        use super::sound::Style;
-        self.paint(hwnd, dpi, palette, |target, formats| {
-            let color = |hex: u32| D2D1_COLOR_F {
-                r: ((hex >> 16) & 255) as f32 / 255.,
-                g: ((hex >> 8) & 255) as f32 / 255.,
-                b: (hex & 255) as f32 / 255.,
-                a: 1.,
-            };
-            unsafe {
+        self.paint_surface_with_alpha(
+            hwnd,
+            dpi,
+            palette,
+            (
+                layered::Contour::Round(18. * presentation.1),
+                (presentation.2.clamp(0., 1.) * 255.).round() as u8,
+            ),
+            remote_alpha.unwrap_or(255),
+            |target, formats| {
+                draw_control_content(
+                    target,
+                    formats,
+                    ControlFrame {
+                        palette,
+                        elements,
+                        scroll,
+                        max_scroll,
+                        focus,
+                        dragging,
+                        presentation,
+                    },
+                )
+            },
+        )
+    }
+
+    /// Start's immutable eight-action popup shares only the retained layered
+    /// surface; Direct2D targets and font formats remain renderer-private.
+    pub(crate) fn draw_app_menu(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        palette: &Palette,
+        model: &crate::app::start::app_menu::Model,
+        alpha: u8,
+    ) -> Result<()> {
+        use crate::app::start::app_menu::{PAD, RADIUS};
+        self.paint_surface_with_alpha(
+            hwnd,
+            dpi,
+            palette,
+            (layered::Contour::Round(RADIUS), 255),
+            alpha,
+            |target, formats| {
+                crate::theme::paint_background(&target.rt, &target.brush, palette, RADIUS);
+                let width = unsafe { target.rt.GetSize() }.width;
                 let rt = &target.rt;
                 let brush = &target.brush;
-                let size = rt.GetSize();
-                crate::theme::paint_background(rt, brush, palette, 30.);
-                if page_opacity < 1. {
-                    rt.PushLayer(
-                        &D2D1_LAYER_PARAMETERS {
-                            contentBounds: rect(0., 0., size.width, size.height),
-                            opacity: page_opacity,
-                            maskTransform: Matrix3x2::identity(),
-                            ..Default::default()
-                        },
-                        None,
+                unsafe {
+                    rt.PushAxisAlignedClip(
+                        &rect(PAD, PAD, width - PAD, model.view - PAD),
+                        D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
                     );
-                }
-                let rgb = |color: &D2D1_COLOR_F| {
-                    ((color.r * 255.) as u32) << 16 | ((color.g * 255.) as u32) << 8 | (color.b * 255.) as u32
-                };
-                let surface = |strength: f32| {
-                    let base = &palette.background_solid;
-                    let ink = &palette.text;
-                    rgb(&D2D1_COLOR_F {
-                        r: base.r + (ink.r - base.r) * strength,
-                        g: base.g + (ink.g - base.g) * strength,
-                        b: base.b + (ink.b - base.b) * strength,
-                        a: 1.,
-                    })
-                };
-                let card = surface(0.13);
-                let row = surface(0.17);
-                let hover = surface(0.24);
-                let muted = surface(0.68);
-                let main = rgb(&palette.text);
-                let fill = |r, radius, hex| {
-                    brush.SetColor(&color(hex));
-                    rt.FillRoundedRectangle(&rounded(r, radius), brush);
-                };
-                let text = |label: &str, format: &IDWriteTextFormat, r, hex| {
-                    if !label.is_empty() {
-                        brush.SetColor(&color(hex));
-                        let units: Vec<u16> = label.encode_utf16().collect();
-                        rt.DrawText(
-                            &units,
-                            format,
-                            &r,
+                    for (index, row) in model.rows.iter().enumerate() {
+                        let top = model.top(index);
+                        let bottom = top + row.height();
+                        if bottom <= PAD || top >= model.view - PAD {
+                            continue;
+                        }
+                        if model.focus == Some(index) && row.enabled() {
+                            brush.SetColor(&palette.row_selected);
+                            rt.FillRoundedRectangle(&rounded(rect(PAD, top, width - PAD, bottom), RADIUS - PAD), brush);
+                            brush.SetColor(&palette.divider);
+                            rt.DrawRoundedRectangle(
+                                &rounded(
+                                    rect(PAD + 0.5, top + 0.5, width - PAD - 0.5, bottom - 0.5),
+                                    RADIUS - PAD,
+                                ),
+                                brush,
+                                1.,
+                                None,
+                            );
+                        }
+                        brush.SetColor(if row.enabled() {
+                            &palette.subtext
+                        } else {
+                            &palette.placeholder
+                        });
+                        text(
+                            rt,
                             brush,
-                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                            DWRITE_MEASURING_MODE_NATURAL,
+                            &formats.glyph,
+                            row.glyph,
+                            rect(16., top + 1., 34., top + 33.),
+                        );
+                        brush.SetColor(if row.enabled() {
+                            &palette.text
+                        } else {
+                            &palette.placeholder
+                        });
+                        let label_bottom = if row.reason.is_some() { top + 27. } else { bottom };
+                        text(
+                            rt,
+                            brush,
+                            &formats.control_detail,
+                            row.label,
+                            rect(44., top, width - 16., label_bottom),
+                        );
+                        if let Some(reason) = row.reason {
+                            brush.SetColor(&palette.subtext);
+                            text(
+                                rt,
+                                brush,
+                                &formats.row,
+                                reason,
+                                rect(44., top + 25., width - 16., bottom - 2.),
+                            );
+                        }
+                    }
+                    rt.PopAxisAlignedClip();
+                    if model.max_scroll() > 0. {
+                        let rail = model.view - 2. * PAD;
+                        let thumb = (rail * model.view / (model.view + model.max_scroll()))
+                            .max(20.)
+                            .min(rail);
+                        let top = PAD + (rail - thumb) * model.scroll / model.max_scroll();
+                        brush.SetColor(&palette.scrollbar);
+                        rt.FillRoundedRectangle(&rounded(rect(width - 5., top, width - 3., top + thumb), 1.), brush);
+                    }
+                }
+                Ok(())
+            },
+        )
+    }
+
+    pub(crate) fn draw_notch(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        palette: &Palette,
+        track: &crate::commands::media::NotchTrack,
+        progress: f32,
+        hover: Option<(f32, f32)>,
+    ) -> Result<()> {
+        use crate::commands::glyph;
+        self.paint(hwnd, dpi, palette, |target, formats| {
+            let rt = &target.rt;
+            let brush = &target.brush;
+            let width = unsafe { rt.GetSize() }.width;
+            let lerp = |a: f32, b: f32| a + (b - a) * progress;
+            let cover_size = lerp(26., 66.);
+            let inset = lerp(7., 17.);
+            let top = lerp(6., 16.);
+            let cover = rect(inset, top, inset + cover_size, top + cover_size);
+            let media = &track.media;
+            let title = if media.title.is_empty() {
+                &media.app
+            } else {
+                &media.title
+            };
+            let faded = |mut color: D2D1_COLOR_F, alpha: f32| {
+                color.a *= alpha;
+                color
+            };
+            let detail_opacity = ((progress - 0.45) / 0.55).clamp(0., 1.);
+            let compact_opacity = (1. - progress * 1.6).clamp(0., 1.);
+            unsafe {
+                rt.Clear(Some(&palette.background));
+                target
+                    .bitmaps
+                    .retain(|_, (pixels, _)| track.artwork.as_ref().is_some_and(|art| Arc::ptr_eq(art, pixels)));
+                if let Some(pixels) = &track.artwork {
+                    if !target.bitmaps.contains_key("cover") {
+                        let bitmap = rt.CreateBitmap(
+                            D2D_SIZE_U {
+                                width: pixels.width,
+                                height: pixels.height,
+                            },
+                            Some(pixels.bgra.as_ptr().cast()),
+                            pixels.width * 4,
+                            &D2D1_BITMAP_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT {
+                                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.,
+                                dpiY: 96.,
+                            },
+                        )?;
+                        target.bitmaps.insert("cover".into(), (pixels.clone(), bitmap));
+                    }
+                    let crop = pixels.width.min(pixels.height) as f32;
+                    let x = (pixels.width as f32 - crop) / 2.;
+                    let y = (pixels.height as f32 - crop) / 2.;
+                    rt.DrawBitmap(
+                        &target.bitmaps["cover"].1,
+                        Some(&cover),
+                        1.,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        Some(&rect(x, y, x + crop, y + crop)),
+                    );
+                } else {
+                    brush.SetColor(&palette.tile);
+                    rt.FillRoundedRectangle(&rounded(cover, 7.), brush);
+                    brush.SetColor(&palette.text);
+                    text(rt, brush, &formats.glyph, "\u{E8D6}", cover);
+                }
+                if compact_opacity > 0. {
+                    brush.SetColor(&faded(palette.text, compact_opacity));
+                    text(
+                        rt,
+                        brush,
+                        &formats.row,
+                        title,
+                        rect(cover.right + 9., 0., width - 34., 38.),
+                    );
+                    brush.SetColor(&faded(palette.accent, compact_opacity));
+                    let elapsed = std::time::UNIX_EPOCH.elapsed().unwrap_or_default().as_millis() % 2000;
+                    for i in 0..3 {
+                        let x = width - 25. + i as f32 * 5.;
+                        let phase = elapsed as f32 * 0.009 + i as f32 * 1.5;
+                        let h = if media.playing && super::client_animations_enabled() {
+                            5. + 7. * phase.sin().abs()
+                        } else {
+                            7.
+                        };
+                        rt.FillRoundedRectangle(&rounded(rect(x, 19. - h / 2., x + 2.5, 19. + h / 2.), 1.25), brush);
+                    }
+                }
+                if detail_opacity > 0. {
+                    let left = cover.right + 14.;
+                    brush.SetColor(&faded(palette.text, detail_opacity));
+                    text(rt, brush, &formats.control_title, title, rect(left, 19., 304., 46.));
+                    brush.SetColor(&faded(palette.subtext, detail_opacity));
+                    let artist = if media.artist.is_empty() {
+                        &media.app
+                    } else {
+                        &media.artist
+                    };
+                    text(rt, brush, &formats.control_detail, artist, rect(left, 45., 327., 69.));
+                    text(rt, brush, &formats.glyph, "\u{E70E}", rect(310., 10., 342., 41.));
+
+                    if let Some(timeline) = media.timeline {
+                        let position = timeline.position(media.playing);
+                        let ratio =
+                            ((position - timeline.start) as f32 / (timeline.end - timeline.start) as f32).clamp(0., 1.);
+                        let thumb = 24. + 306. * ratio;
+                        brush.SetColor(&faded(palette.tile, detail_opacity));
+                        rt.FillRoundedRectangle(&rounded(rect(24., 101., 330., 106.), 2.5), brush);
+                        brush.SetColor(&faded(palette.accent, detail_opacity));
+                        rt.FillRoundedRectangle(&rounded(rect(24., 101., thumb, 106.), 2.5), brush);
+                        rt.FillEllipse(
+                            &D2D1_ELLIPSE {
+                                point: windows_numerics::Vector2 { X: thumb, Y: 103.5 },
+                                radiusX: 4.5,
+                                radiusY: 4.5,
+                            },
+                            brush,
+                        );
+                        brush.SetColor(&faded(palette.subtext, detail_opacity));
+                        let clock = |ticks: i64| {
+                            let seconds = ticks.max(0) / 10_000_000;
+                            format!("{}:{:02}", seconds / 60, seconds % 60)
+                        };
+                        text(
+                            rt,
+                            brush,
+                            &formats.small,
+                            &clock(position - timeline.start),
+                            rect(20., 109., 62., 129.),
+                        );
+                        text(
+                            rt,
+                            brush,
+                            &formats.small,
+                            &clock(timeline.end - timeline.start),
+                            rect(289., 109., 334., 129.),
                         );
                     }
-                };
-                for (i, item) in elements.iter().enumerate() {
-                    let b = item.bounds;
-                    let (x, y, w, h) = (b.x, b.y - scroll, b.w, b.h);
-                    if y >= size.height || y + h <= 0. {
-                        continue;
-                    }
-                    let selected = focus == Some(i);
-                    let bounds = rect(x, y, x + w, y + h);
-                    match item.style {
-                        Style::Card => {
-                            fill(bounds, 18., card);
-                            text(
-                                &item.title,
-                                &formats.control_title,
-                                rect(x + 15., y + 9., x + w - 12., y + 34.),
-                                main,
-                            );
-                        }
-                        Style::Tile(active) => {
-                            fill(bounds, 18., if selected { hover } else { card });
-                            let cy = y + h / 2.;
-                            fill(
-                                rect(x + 15., cy - 20., x + 55., cy + 20.),
-                                20.,
-                                if active { 0x087ff2 } else { 0x606065 },
-                            );
-                            text(
-                                item.icon,
-                                &formats.glyph,
-                                rect(x + 15., cy - 20., x + 55., cy + 20.),
-                                main,
-                            );
-                            text(
-                                &item.title,
-                                &formats.control_title,
-                                rect(x + 67., cy - 22., x + w - 8., cy + 3.),
-                                main,
-                            );
-                            text(
-                                &item.detail,
-                                &formats.control_detail,
-                                rect(x + 67., cy + 1., x + w - 8., cy + 25.),
-                                muted,
-                            );
-                        }
-                        Style::Row(active) => {
-                            fill(bounds, 12., if selected || active { hover } else { row });
-                            let start = if item.icon.is_empty() { x + 12. } else { x + 39. };
-                            text(item.icon, &formats.glyph, rect(x + 7., y, x + 36., y + h), main);
-                            if item.detail.is_empty() || item.detail == "✓" || item.detail.ends_with('›') {
-                                let tail = match item.detail.as_str() {
-                                    "" => 9.,
-                                    "✓" | "›" => 36.,
-                                    _ => 62.,
-                                };
-                                text(
-                                    &item.title,
-                                    &formats.control_detail,
-                                    rect(start, y, x + w - tail, y + h),
-                                    main,
-                                );
-                                text(
-                                    &item.detail,
-                                    &formats.small,
-                                    rect(x + w - tail + 2., y, x + w - 9., y + h),
-                                    if active { 0x58aaff } else { muted },
-                                );
-                            } else {
-                                text(
-                                    &item.title,
-                                    &formats.control_title,
-                                    rect(start, y + 1., x + w - 10., y + h * 0.55),
-                                    main,
-                                );
-                                text(
-                                    &item.detail,
-                                    &formats.control_detail,
-                                    rect(start, y + h * 0.48, x + w - 10., y + h),
-                                    muted,
-                                );
-                            }
-                        }
-                        Style::Slider(value) => {
-                            let value = dragging
-                                .filter(|(index, _)| *index == i)
-                                .map_or(value, |(_, value)| value);
-                            let thumb = x + 26. + (w - 39.) * value as f32 / 100.;
-                            fill(bounds, 16., surface(0.26));
-                            fill(rect(x, y, (thumb + 14.).min(x + w), y + h), 16., 0xefeff0);
-                            fill(rect(thumb - 12., y + 3., thumb + 12., y + h - 3.), 13., 0xffffff);
-                            text(item.icon, &formats.glyph, rect(x + 3., y, x + 35., y + h), 0x616167);
-                        }
-                        Style::MediaTitle => {
-                            let subtitle = !item.detail.is_empty();
-                            let format = if subtitle {
-                                &formats.control_detail
-                            } else {
-                                &formats.control_title
-                            };
-                            text(&item.title, format, bounds, if subtitle { muted } else { main });
-                        }
-                        Style::MediaButton(primary) => {
-                            if selected || primary {
-                                fill(bounds, h / 2., if selected { hover } else { row });
-                            }
-                            text(item.icon, &formats.glyph, bounds, main);
-                        }
-                        Style::Timeline(timeline, playing) => {
-                            let duration = timeline.end - timeline.start;
-                            let offset = dragging.filter(|(index, _)| *index == i).map_or_else(
-                                || timeline.position(playing) - timeline.start,
-                                |(_, percent)| (duration as f64 * f64::from(percent) / 100.) as i64,
-                            );
-                            let thumb = x + w * (offset as f64 / duration as f64) as f32;
-                            let bar = y + 11.;
-                            fill(rect(x, bar - 2., x + w, bar + 2.), 2., 0x606066);
-                            if thumb > x {
-                                fill(rect(x, bar - 2., thumb, bar + 2.), 2., 0xefeff0);
-                            }
-                            if item.is_interactive() {
-                                fill(rect(thumb - 4., bar - 4., thumb + 4., bar + 4.), 4., 0xffffff);
-                            }
-                            let time = |ticks: i64| {
-                                let seconds = ticks / 10_000_000;
-                                if seconds >= 3600 {
-                                    format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+                    for (x, glyph, primary) in [
+                        (117., glyph::PREVIOUS, false),
+                        (177., if media.playing { glyph::PAUSE } else { glyph::PLAY }, true),
+                        (237., glyph::NEXT, false),
+                    ] {
+                        let highlighted =
+                            hover.is_some_and(|(hx, hy)| (hx - x).abs() < 24. && (130. ..170.).contains(&hy));
+                        let bounds = rect(x - 22., 130., x + 22., 170.);
+                        if primary || highlighted {
+                            brush.SetColor(&faded(
+                                if highlighted {
+                                    palette.row_selected
                                 } else {
-                                    format!("{}:{:02}", seconds / 60, seconds % 60)
-                                }
-                            };
-                            text(
-                                &time(offset),
-                                &formats.control_detail,
-                                rect(x, y + 23., x + 65., y + h),
-                                muted,
-                            );
-                            text(
-                                &time(duration),
-                                &formats.small,
-                                rect(x + w - 54., y + 23., x + w, y + h),
-                                muted,
-                            );
+                                    palette.tile
+                                },
+                                detail_opacity,
+                            ));
+                            rt.FillRoundedRectangle(&rounded(bounds, 18.), brush);
                         }
-                        Style::Text => {
-                            if selected {
-                                fill(bounds, 12., hover);
-                            }
-                            let split = if item.detail.is_empty() { w } else { w * 0.68 };
-                            text(
-                                &item.title,
-                                &formats.control_detail,
-                                rect(x + 4., y, x + split, y + h),
-                                main,
-                            );
-                            text(
-                                &item.detail,
-                                &formats.control_detail,
-                                rect(x + split, y, x + w, y + h),
-                                muted,
-                            );
-                        }
+                        brush.SetColor(&faded(palette.text, detail_opacity));
+                        text(rt, brush, &formats.glyph, glyph, bounds);
                     }
-                    if selected {
-                        brush.SetColor(&color(0x75b7ff));
-                        rt.DrawRoundedRectangle(&rounded(bounds, 12.), brush, 1., None);
-                    }
-                }
-                if max_scroll > 0. {
-                    let track = (size.height - 32.).max(0.);
-                    let thumb = (track * size.height / (size.height + max_scroll)).clamp(18_f32.min(track), track);
-                    let top = 16. + (track - thumb) * (scroll / max_scroll).clamp(0., 1.);
-                    fill(rect(size.width - 7., top, size.width - 4., top + thumb), 1.5, muted);
-                }
-                if page_opacity < 1. {
-                    rt.PopLayer();
                 }
             }
             Ok(())
@@ -537,6 +800,49 @@ impl Renderer {
                 metrics.height.ceil() + 2.0 * TIP_PAD.1,
             ))
         }
+    }
+
+    /// Frame for a pointer-transparent, enlarged live DWM window thumbnail.
+    pub fn draw_window_zoom(&mut self, hwnd: HWND, dpi: u32, palette: &Palette, title: &str) -> Result<()> {
+        self.paint(hwnd, dpi, palette, |target, formats| {
+            background(target, palette, 1.0);
+            unsafe {
+                target.brush.SetColor(&palette.text);
+                text(
+                    &target.rt,
+                    &target.brush,
+                    &formats.row,
+                    title,
+                    rect(12., 4., target.rt.GetSize().width - 12., 32.),
+                );
+            }
+            Ok(())
+        })
+    }
+
+    pub fn draw_remote_flyout(&mut self, hwnd: HWND, frame: &FlyoutFrame, alpha: u8) -> Result<()> {
+        self.paint_surface_with_alpha(
+            hwnd,
+            frame.dpi,
+            frame.palette,
+            (layered::Contour::Round(8.), 255),
+            alpha,
+            |target, _| draw_flyout(target, frame),
+        )
+    }
+    pub fn cached_popup_matches(&self, hwnd: HWND, dpi: u32) -> Result<bool> {
+        self.layered
+            .as_ref()
+            .map_or(Ok(false), |surface| surface.cached_matches(hwnd, dpi))
+    }
+    pub fn present_cached_popup(&self, hwnd: HWND, dpi: u32, alpha: u8) -> Result<()> {
+        self.layered
+            .as_ref()
+            .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?
+            .present_cached(hwnd, dpi, alpha)
+    }
+    pub fn discard_popup_surface(&mut self) {
+        self.layered = None;
     }
 
     /// Draws an app's windows as a list, highlighting the row under the pointer.
@@ -735,15 +1041,17 @@ impl Renderer {
                 rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
                 self.target = Some(Target {
                     brush: rt.CreateSolidColorBrush(&palette.text, None)?,
-                    rt,
+                    rt: rt.cast()?,
+                    window: Some(rt),
                     bitmaps: HashMap::new(),
                     tray: HashMap::new(),
+                    media_shapes: HashMap::new(),
                     size,
                 });
             }
             let target = self.target.as_mut().unwrap();
             if target.size.width != size.width || target.size.height != size.height {
-                target.rt.Resize(&size)?;
+                target.window.as_ref().unwrap().Resize(&size)?;
                 target.size = size;
             }
             target.rt.SetDpi(dpi as f32, dpi as f32);
@@ -758,6 +1066,729 @@ impl Renderer {
             result
         }
     }
+
+    fn paint_layered(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        palette: &Palette,
+        f: impl FnOnce(&mut Target, &Formats) -> Result<()>,
+    ) -> Result<()> {
+        self.paint_surface(hwnd, dpi, palette, (layered::Contour::Rectangle, 255), f)
+    }
+    fn paint_surface(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        palette: &Palette,
+        presentation: (layered::Contour, u8),
+        f: impl FnOnce(&mut Target, &Formats) -> Result<()>,
+    ) -> Result<()> {
+        self.paint_surface_with_alpha(hwnd, dpi, palette, presentation, 255, f)
+    }
+    fn paint_surface_with_alpha(
+        &mut self,
+        hwnd: HWND,
+        dpi: u32,
+        palette: &Palette,
+        presentation: (layered::Contour, u8),
+        alpha: u8,
+        f: impl FnOnce(&mut Target, &Formats) -> Result<()>,
+    ) -> Result<()> {
+        if self.layered.is_none() {
+            self.layered = Some(layered::Surface::new(&self.factory, palette)?);
+        }
+        let result = self
+            .layered
+            .as_mut()
+            .unwrap()
+            .paint_with_alpha(hwnd, dpi, &self.formats, presentation, alpha, f);
+        if result.as_ref().is_err_and(|e| e.code() == D2DERR_RECREATE_TARGET) {
+            self.layered = None;
+        }
+        result
+    }
+}
+
+fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFrame) -> Result<()> {
+    let IslandFrame {
+        dpi: _,
+        palette,
+        status,
+        track,
+        track_fade,
+        previous_track,
+        reveal,
+        mix,
+        width,
+        compact,
+        time_width,
+        date_width,
+        hover,
+        hover_level,
+        press,
+    } = frame;
+    use super::topbar::model::Hit;
+
+    let rt = target.rt.clone();
+    let brush = target.brush.clone();
+    let height = unsafe { rt.GetSize() }.height;
+    let island = super::topbar::model::IslandLayout::new(width, compact, time_width);
+    let mix = mix.clamp(0., 1.);
+    island_background(target, palette);
+    let color = |opacity: f32| D2D1_COLOR_F {
+        a: opacity * reveal,
+        ..palette.text
+    };
+    // The clock stays anchored at the physical center through every morph.
+    unsafe {
+        brush.SetColor(&color(1.));
+    }
+    text(
+        &rt,
+        &brush,
+        &formats.island_clock,
+        &status.time,
+        rect(island.clock, 0., island.clock + time_width, height),
+    );
+    if mix < 1. {
+        unsafe {
+            brush.SetColor(&color(1. - mix));
+        }
+        text(
+            &rt,
+            &brush,
+            &formats.small,
+            &status.date,
+            rect(
+                14.,
+                -mix * 3.,
+                (14. + date_width).min(island.clock - 10.),
+                height - mix * 3.,
+            ),
+        );
+    }
+    target.bitmaps.retain(|_, (pixels, _)| {
+        [track, previous_track]
+            .into_iter()
+            .flatten()
+            .any(|track| track.artwork.as_ref().is_some_and(|art| Arc::ptr_eq(pixels, art)))
+    });
+    if mix > 0. {
+        for (track, weight, offset) in [
+            (previous_track, 1. - track_fade, -2. * track_fade),
+            (
+                track,
+                if previous_track.is_some() { track_fade } else { 1. },
+                2. * (1. - track_fade),
+            ),
+        ] {
+            let Some(track) = track else {
+                continue;
+            };
+            if weight <= 0. {
+                continue;
+            }
+
+            let track_alpha = mix * weight.clamp(0., 1.);
+            let top = (height - 20.) / 2. + offset;
+            let art = rect(8., top, 28., top + 20.);
+            let cover_key = format!("topbar-cover:{}:{}", track.media.source, track.media.title);
+            if let Some(pixels) = &track.artwork
+                && island.title_right.is_some()
+            {
+                if !target.bitmaps.contains_key(&cover_key) {
+                    let bitmap = unsafe {
+                        rt.CreateBitmap(
+                            D2D_SIZE_U {
+                                width: pixels.width,
+                                height: pixels.height,
+                            },
+                            Some(pixels.bgra.as_ptr().cast()),
+                            pixels.width * 4,
+                            &D2D1_BITMAP_PROPERTIES {
+                                pixelFormat: D2D1_PIXEL_FORMAT {
+                                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                                },
+                                dpiX: 96.,
+                                dpiY: 96.,
+                            },
+                        )
+                    }?;
+                    target.bitmaps.insert(cover_key.clone(), (pixels.clone(), bitmap));
+                }
+                unsafe {
+                    rt.DrawBitmap(
+                        &target.bitmaps[&cover_key].1,
+                        Some(&art),
+                        track_alpha,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+            } else if island.title_right.is_some() {
+                unsafe {
+                    brush.SetColor(&color(track_alpha));
+                }
+                text(&rt, &brush, &formats.glyph, "\u{E8D6}", art);
+            }
+            unsafe {
+                brush.SetColor(&color(track_alpha));
+            }
+            if let Some(right) = island.title_right {
+                text(
+                    &rt,
+                    &brush,
+                    &formats.control_detail,
+                    if track.media.title.is_empty() {
+                        &track.media.app
+                    } else {
+                        &track.media.title
+                    },
+                    rect(36., offset, right, height + offset),
+                );
+            }
+        }
+        let Some(track) = track.or(previous_track) else {
+            return Ok(());
+        };
+        for (hit, left) in [
+            (Hit::Previous, island.controls[0]),
+            (Hit::PlayPause, island.controls[1]),
+            (Hit::Next, island.controls[2]),
+        ] {
+            if left + island.button > width {
+                continue;
+            }
+            if hover == Some(hit) {
+                highlight(target, palette, left, island.button, height, hover_level * mix);
+            }
+            let inset = if hover == Some(hit) { press * 2. } else { 0. };
+            unsafe {
+                brush.SetColor(&color(mix));
+            }
+            playback_icon(
+                target,
+                rect(left + inset, inset, left + island.button - inset, height - inset),
+                hit,
+                track.media.playing,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn draw_topbar_overflow_content(target: &mut Target, frame: &TopbarFlyoutFrame) -> Result<()> {
+    let TopbarFlyoutFrame {
+        dpi,
+        palette,
+        shown,
+        overflow,
+        hover,
+        presentation,
+    } = frame;
+    crate::theme::paint_background(
+        &target.rt,
+        &target.brush,
+        palette,
+        TOPBAR_FLYOUT_RADIUS * presentation.0,
+    );
+    unsafe {
+        target
+            .rt
+            .SetTransform(&Matrix3x2::scale(presentation.0, presentation.0));
+    }
+    let result = (|| {
+        for (i, &index) in overflow.iter().enumerate() {
+            let (x, y) = logic::flyout_cell(i);
+            if *hover == Some(i) {
+                unsafe {
+                    target.brush.SetColor(&palette.row_selected);
+                    target
+                        .rt
+                        .FillRoundedRectangle(&rounded(rect(x + 2., y + 2., x + 38., y + 38.), 8.), &target.brush);
+                }
+            }
+            if let Some(icon) = shown.get(index) {
+                tray_icon(target, *dpi, icon, x + 20., y + 20.)?;
+            }
+        }
+        Ok(())
+    })();
+    target.tray.retain(|key, _| shown.iter().any(|s| s.icon.key() == *key));
+    unsafe {
+        target.rt.SetTransform(&Matrix3x2::identity());
+    }
+    result
+}
+
+fn playback_icon(target: &mut Target, bounds: D2D_RECT_F, hit: super::topbar::model::Hit, playing: bool) -> Result<()> {
+    use super::topbar::model::Hit;
+    let cx = (bounds.left + bounds.right) / 2.;
+    let cy = (bounds.top + bounds.bottom) / 2.;
+    let half = 5.;
+    unsafe {
+        if hit == Hit::PlayPause && playing {
+            for x in [cx - 4.5, cx + 1.5] {
+                target
+                    .rt
+                    .FillRoundedRectangle(&rounded(rect(x, cy - half, x + 3., cy + half), 0.6), &target.brush);
+            }
+        } else {
+            let direction = if hit == Hit::Previous { -1. } else { 1. };
+            let shift = if hit == Hit::PlayPause { 0.5 } else { -direction };
+            let key = match hit {
+                Hit::Previous => 0,
+                Hit::Next => 1,
+                _ => 2,
+            };
+            if let std::collections::hash_map::Entry::Vacant(entry) = target.media_shapes.entry(key) {
+                let factory = target.rt.GetFactory()?;
+                let geometry = factory.CreatePathGeometry()?;
+                let sink = geometry.Open()?;
+                sink.BeginFigure(
+                    windows_numerics::Vector2 {
+                        X: shift - direction * 3.5,
+                        Y: -half,
+                    },
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
+                sink.AddLine(windows_numerics::Vector2 {
+                    X: shift + direction * 4.,
+                    Y: 0.,
+                });
+                sink.AddLine(windows_numerics::Vector2 {
+                    X: shift - direction * 3.5,
+                    Y: half,
+                });
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close()?;
+                entry.insert(geometry);
+            }
+            let mut transform = Matrix3x2::identity();
+            target.rt.GetTransform(&mut transform);
+            target.rt.SetTransform(&(Matrix3x2::translation(cx, cy) * transform));
+            target.rt.FillGeometry(&target.media_shapes[&key], &target.brush, None);
+            target.rt.SetTransform(&transform);
+            if hit != Hit::PlayPause {
+                let x = cx + direction * 5.;
+                target.rt.FillRoundedRectangle(
+                    &rounded(rect(x - 0.8, cy - half, x + 0.8, cy + half), 0.5),
+                    &target.brush,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+struct ControlFrame<'a> {
+    palette: &'a Palette,
+    elements: &'a [super::sound::Element],
+    scroll: f32,
+    max_scroll: f32,
+    focus: Option<usize>,
+    dragging: Option<(usize, u32)>,
+    presentation: (f32, f32, f32),
+}
+fn draw_control_content(target: &mut Target, formats: &Formats, frame: ControlFrame) -> Result<()> {
+    let ControlFrame {
+        palette,
+        elements,
+        scroll,
+        max_scroll,
+        focus,
+        dragging,
+        presentation,
+    } = frame;
+    let (page_opacity, surface_scale, _) = presentation;
+    use super::sound::Style;
+    use crate::commands::glyph;
+
+    let color = |hex: u32| D2D1_COLOR_F {
+        r: ((hex >> 16) & 255) as f32 / 255.,
+        g: ((hex >> 8) & 255) as f32 / 255.,
+        b: (hex & 255) as f32 / 255.,
+        a: 1.,
+    };
+    unsafe {
+        let rt = &target.rt;
+        let brush = &target.brush;
+        let size = rt.GetSize();
+        rt.SetTransform(&Matrix3x2::identity());
+        crate::theme::paint_background(rt, brush, palette, 18. * surface_scale);
+        rt.SetTransform(&Matrix3x2 {
+            M11: surface_scale,
+            M22: surface_scale,
+            ..Matrix3x2::identity()
+        });
+        let size = D2D_SIZE_F {
+            width: size.width / surface_scale,
+            height: size.height / surface_scale,
+        };
+        if page_opacity < 1. {
+            rt.PushLayer(
+                &D2D1_LAYER_PARAMETERS {
+                    contentBounds: rect(0., 0., size.width, size.height),
+                    opacity: page_opacity,
+                    maskTransform: Matrix3x2::identity(),
+                    ..Default::default()
+                },
+                None,
+            );
+        }
+        let rgb = |color: &D2D1_COLOR_F| {
+            ((color.r * 255.) as u32) << 16 | ((color.g * 255.) as u32) << 8 | (color.b * 255.) as u32
+        };
+        let surface = |strength: f32| {
+            let base = &palette.background_solid;
+            let ink = &palette.text;
+            rgb(&D2D1_COLOR_F {
+                r: base.r + (ink.r - base.r) * strength,
+                g: base.g + (ink.g - base.g) * strength,
+                b: base.b + (ink.b - base.b) * strength,
+                a: 1.,
+            })
+        };
+        let card = surface(0.13);
+        let row = surface(0.17);
+        let hover = surface(0.24);
+        let muted = surface(0.68);
+        let main = rgb(&palette.text);
+        let fill = |r, radius, hex| {
+            brush.SetColor(&color(hex));
+            rt.FillRoundedRectangle(&rounded(r, radius), brush);
+        };
+        let text = |label: &str, format: &IDWriteTextFormat, r, hex| {
+            if !label.is_empty() {
+                brush.SetColor(&color(hex));
+                let units: Vec<u16> = label.encode_utf16().collect();
+                rt.DrawText(
+                    &units,
+                    format,
+                    &r,
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
+        };
+        for (i, item) in elements.iter().enumerate() {
+            let b = item.bounds;
+            let (x, y, w, h) = (b.x, b.y - scroll, b.w, b.h);
+            if y >= size.height || y + h <= 0. {
+                continue;
+            }
+            let selected = focus == Some(i);
+            let bounds = rect(x, y, x + w, y + h);
+            match item.style {
+                Style::Header => {
+                    let start = if item.icon.is_empty() { x } else { x + 36. };
+                    text(item.icon, &formats.glyph, rect(x, y, x + 28., y + h), main);
+                    text(
+                        &item.title,
+                        &formats.heading_leading,
+                        rect(
+                            start,
+                            y,
+                            start + w - (start - x),
+                            y + if item.detail.is_empty() { h } else { 26. },
+                        ),
+                        main,
+                    );
+                    text(
+                        &item.detail,
+                        &formats.control_detail,
+                        rect(start, y + 26., x + w, y + h),
+                        muted,
+                    );
+                }
+                Style::Toggle(on) => {
+                    fill(
+                        rect(x + 2., y + 2., x + w - 2., y + h - 2.),
+                        (h - 4.) / 2.,
+                        if on { 0x087ff2 } else { surface(0.3) },
+                    );
+                    let left = if on { x + w - h + 2. } else { x + 4. };
+                    fill(rect(left, y + 4., left + h - 8., y + h - 4.), (h - 8.) / 2., 0xf4f5f7);
+                }
+                Style::CurrentRow => {
+                    fill(bounds, 12., card);
+                    text(
+                        item.icon,
+                        &formats.glyph,
+                        rect(x + 12., y + 8., x + 36., y + h - 8.),
+                        main,
+                    );
+                    text(
+                        &item.title,
+                        &formats.control_title,
+                        rect(x + 46., y + 5., x + w - 12., y + 28.),
+                        main,
+                    );
+                    text(
+                        &item.detail,
+                        &formats.control_detail,
+                        rect(x + 46., y + 28., x + w - 12., y + h - 4.),
+                        muted,
+                    );
+                }
+                Style::CompactCard(active) => {
+                    fill(bounds, 14., if selected || active { hover } else { row });
+                    text(item.icon, &formats.glyph, rect(x + 10., y + 9., x + 32., y + 34.), main);
+                    text(
+                        &item.title,
+                        &formats.control_detail,
+                        rect(x + 40., y + 8., x + w - 12., y + 34.),
+                        main,
+                    );
+                    text(
+                        &item.detail,
+                        &formats.control_detail,
+                        rect(x + 12., y + 30., x + w - 12., y + h - 4.),
+                        muted,
+                    );
+                    if active {
+                        text(
+                            glyph::CHECK,
+                            &formats.chevron,
+                            rect(x + w - 28., y + 36., x + w - 10., y + h - 8.),
+                            main,
+                        );
+                    }
+                }
+                Style::Footer => {
+                    if selected {
+                        fill(bounds, 10., row);
+                    }
+                    let icon_w = if item.icon.is_empty() { 0. } else { 26. };
+                    text(item.icon, &formats.glyph, rect(x + 4., y, x + 30., y + h), muted);
+                    text(
+                        &item.title,
+                        &formats.control_detail,
+                        rect(x + 8. + icon_w, y, x + w - 4., y + h),
+                        muted,
+                    );
+                }
+                Style::CalendarDay {
+                    today,
+                    selected: day_selected,
+                    in_month,
+                } => {
+                    let inset = (w - h.min(36.)) / 2.;
+                    let circle = rect(x + inset, y + 2., x + w - inset, y + h - 2.);
+                    if today {
+                        fill(circle, 18., 0x087ff2);
+                    } else if day_selected {
+                        fill(circle, 18., row);
+                    } else if selected && item.is_interactive() {
+                        fill(circle, 18., hover);
+                    }
+                    if day_selected && !today {
+                        brush.SetColor(&color(muted));
+                        rt.DrawRoundedRectangle(&rounded(circle, 18.), brush, 1., None);
+                    }
+                    text(
+                        &item.title,
+                        &formats.small,
+                        bounds,
+                        if today {
+                            0xffffff
+                        } else if in_month {
+                            main
+                        } else {
+                            muted
+                        },
+                    );
+                }
+                Style::Card => {
+                    fill(bounds, 18., card);
+                    text(
+                        &item.title,
+                        &formats.control_title,
+                        rect(x + 15., y + 9., x + w - 12., y + 34.),
+                        main,
+                    );
+                }
+                Style::Tile(active) => {
+                    fill(bounds, 10., if selected { hover } else { card });
+                    let cy = y + h / 2.;
+                    text(
+                        item.icon,
+                        &formats.glyph,
+                        rect(x + 10., cy - 10., x + 30., cy + 10.),
+                        if active { rgb(&palette.accent) } else { main },
+                    );
+                    text(
+                        &item.title,
+                        &formats.control_detail,
+                        rect(x + 40., cy - 20., x + w - 20., cy + 2.),
+                        main,
+                    );
+                    text(
+                        &item.detail,
+                        &formats.control_detail,
+                        rect(x + 40., cy + 1., x + w - 20., cy + 22.),
+                        muted,
+                    );
+                    text(
+                        "\u{E76C}",
+                        &formats.chevron,
+                        rect(x + w - 18., y, x + w - 5., y + h),
+                        muted,
+                    );
+                }
+                Style::Row(active) => {
+                    fill(bounds, 12., if selected || active { hover } else { row });
+                    let start = if item.icon.is_empty() { x + 12. } else { x + 39. };
+                    text(
+                        item.icon,
+                        &formats.glyph,
+                        if item.title.is_empty() {
+                            bounds
+                        } else {
+                            rect(x + 7., y, x + 36., y + h)
+                        },
+                        main,
+                    );
+                    if item.detail.is_empty() || item.detail == "✓" || item.detail.ends_with('›') {
+                        let tail = match item.detail.as_str() {
+                            "" => 9.,
+                            "✓" | "›" => 36.,
+                            _ => 62.,
+                        };
+                        text(
+                            &item.title,
+                            &formats.control_detail,
+                            rect(start, y, x + w - tail, y + h),
+                            main,
+                        );
+                        text(
+                            &item.detail,
+                            &formats.small,
+                            rect(x + w - tail + 2., y, x + w - 9., y + h),
+                            if active { 0x58aaff } else { muted },
+                        );
+                    } else {
+                        text(
+                            &item.title,
+                            &formats.control_title,
+                            rect(start, y + 1., x + w - 10., y + h * 0.55),
+                            main,
+                        );
+                        text(
+                            &item.detail,
+                            &formats.control_detail,
+                            rect(start, y + h * 0.48, x + w - 10., y + h),
+                            muted,
+                        );
+                    }
+                }
+                Style::Slider(value) => {
+                    let value = dragging
+                        .filter(|(index, _)| *index == i)
+                        .map_or(value, |(_, value)| value);
+                    let start = x + 36.;
+                    let end = x + w - 8.;
+                    let thumb = start + (end - start) * value as f32 / 100.;
+                    let cy = y + h / 2.;
+                    fill(rect(start, cy - 2., end, cy + 2.), 2., surface(0.32));
+                    if thumb > start {
+                        fill(rect(start, cy - 2., thumb, cy + 2.), 2., main);
+                    }
+                    fill(rect(thumb - 7., cy - 7., thumb + 7., cy + 7.), 7., main);
+                    text(item.icon, &formats.glyph, rect(x, y, x + 24., y + h), main);
+                }
+                Style::MediaTitle => {
+                    let subtitle = !item.detail.is_empty();
+                    let format = if subtitle {
+                        &formats.control_detail
+                    } else {
+                        &formats.control_title
+                    };
+                    text(&item.title, format, bounds, if subtitle { muted } else { main });
+                }
+                Style::MediaButton(primary) => {
+                    if selected || primary {
+                        fill(bounds, h / 2., if selected { hover } else { row });
+                    }
+                    text(item.icon, &formats.glyph, bounds, main);
+                }
+                Style::Timeline(timeline, playing) => {
+                    let duration = timeline.end - timeline.start;
+                    let offset = dragging.filter(|(index, _)| *index == i).map_or_else(
+                        || timeline.position(playing) - timeline.start,
+                        |(_, percent)| (duration as f64 * f64::from(percent) / 100.) as i64,
+                    );
+                    let thumb = x + w * (offset as f64 / duration as f64) as f32;
+                    let bar = y + 11.;
+                    fill(rect(x, bar - 2., x + w, bar + 2.), 2., 0x606066);
+                    if thumb > x {
+                        fill(rect(x, bar - 2., thumb, bar + 2.), 2., 0xefeff0);
+                    }
+                    if item.is_interactive() {
+                        fill(rect(thumb - 4., bar - 4., thumb + 4., bar + 4.), 4., 0xffffff);
+                    }
+                    let time = |ticks: i64| {
+                        let seconds = ticks / 10_000_000;
+                        if seconds >= 3600 {
+                            format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+                        } else {
+                            format!("{}:{:02}", seconds / 60, seconds % 60)
+                        }
+                    };
+                    text(
+                        &time(offset),
+                        &formats.control_detail,
+                        rect(x, y + 23., x + 65., y + h),
+                        muted,
+                    );
+                    text(
+                        &time(duration),
+                        &formats.small,
+                        rect(x + w - 54., y + 23., x + w, y + h),
+                        muted,
+                    );
+                }
+                Style::Section => {
+                    text(&item.title, &formats.control_title, bounds, main);
+                }
+                Style::Text => {
+                    if selected {
+                        fill(bounds, 12., hover);
+                    }
+                    let split = if item.detail.is_empty() { w } else { w * 0.68 };
+                    text(
+                        &item.title,
+                        &formats.control_detail,
+                        rect(x + 4., y, x + split, y + h),
+                        main,
+                    );
+                    text(
+                        &item.detail,
+                        &formats.control_detail,
+                        rect(x + split, y, x + w, y + h),
+                        muted,
+                    );
+                }
+            }
+            if selected {
+                brush.SetColor(&color(0x75b7ff));
+                rt.DrawRoundedRectangle(&rounded(bounds, 12.), brush, 1., None);
+            }
+        }
+        if max_scroll > 0. {
+            let track = (size.height - 32.).max(0.);
+            let thumb = (track * size.height / (size.height + max_scroll)).clamp(18_f32.min(track), track);
+            let top = 16. + (track - thumb) * (scroll / max_scroll).clamp(0., 1.);
+            fill(rect(size.width - 7., top, size.width - 4., top + thumb), 1.5, muted);
+        }
+        if page_opacity < 1. {
+            rt.PopLayer();
+        }
+    }
+    Ok(())
 }
 
 /// A tooltip's text inset, in DIPs.
@@ -775,6 +1806,59 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
         top,
         right,
         bottom,
+    }
+}
+
+fn island_radius(height: f32) -> f32 {
+    7_f32.min(height * 0.3)
+}
+fn island_background(target: &Target, palette: &Palette) {
+    let size = unsafe { target.rt.GetSize() };
+    let (width, height) = (size.width, size.height);
+    unsafe {
+        target.rt.Clear(Some(&D2D1_COLOR_F {
+            r: 0.,
+            g: 0.,
+            b: 0.,
+            a: 0.,
+        }));
+        // Alpha-zero ULW pixels pass input through. Keep the complete island
+        // hit surface while its configured tint remains visually transparent.
+        target.brush.SetColor(&D2D1_COLOR_F {
+            a: palette.background.a.max(1. / 255.),
+            ..palette.background
+        });
+        target.rt.FillRoundedRectangle(
+            &rounded(rect(0., 0., width, height), island_radius(height).min(width / 2.)),
+            &target.brush,
+        );
+    }
+}
+
+/// Alpha-zero layered pixels pass input through. Only actual control cells get
+/// one alpha step, invisible in practice but retaining the full mouse target.
+fn hit_backdrop(target: &Target, area: D2D_RECT_F) {
+    unsafe {
+        target.brush.SetColor(&D2D1_COLOR_F {
+            r: 0.,
+            g: 0.,
+            b: 0.,
+            a: 1. / 255.,
+        });
+        target.rt.FillRectangle(&area, &target.brush);
+    }
+}
+
+fn highlight(target: &Target, palette: &Palette, x: f32, width: f32, height: f32, alpha: f32) {
+    unsafe {
+        target.brush.SetColor(&D2D1_COLOR_F {
+            a: 0.13 * alpha,
+            ..palette.text
+        });
+        target.rt.FillRoundedRectangle(
+            &rounded(rect(x + 2., 2., x + width - 2., height - 2.), 6.),
+            &target.brush,
+        );
     }
 }
 fn rounded(rect: D2D_RECT_F, radius: f32) -> D2D1_ROUNDED_RECT {
@@ -1069,7 +2153,7 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
 }
 
 fn text(
-    rt: &ID2D1HwndRenderTarget,
+    rt: &ID2D1RenderTarget,
     brush: &ID2D1SolidColorBrush,
     format: &IDWriteTextFormat,
     text: &str,

@@ -53,6 +53,26 @@ pub fn remove(hwnd: HWND) {
 }
 
 pub fn notify(hwnd: HWND, title: &str, message: &str, warning: bool) {
+    if warning {
+        // Notification bodies may contain user input or application content.
+        // Keep only the operation context; safe native errors are logged where
+        // they are produced.
+        let context = match title {
+            "Wisp config" => "config",
+            "Windows key" => "windows-key",
+            "Could not register shortcut" => "shortcut",
+            "Could not show the dock" => "dock-create",
+            "Could not show the music notch" => "notch-create",
+            "Could not change the taskbar" => "taskbar",
+            "Wisp Start pins" => "start-pins",
+            "Could not change Start with Windows" => "autostart",
+            "Wisp surfaces" => "surfaces",
+            "Control Center" => "controls",
+            // Some notification titles include an app/document name.
+            _ => "user-action",
+        };
+        crate::logging::error("notification", format_args!("context={context} reported=true"));
+    }
     let mut d = data(hwnd);
     d.uFlags = NIF_INFO;
     d.dwInfoFlags = if warning { NIIF_WARNING } else { NIIF_INFO };

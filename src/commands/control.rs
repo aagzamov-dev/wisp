@@ -26,10 +26,13 @@ pub struct Hardware {
     pub displays: Option<Vec<Display>>,
     pub batteries: Vec<(String, Option<u8>)>,
     pub networks: Option<super::wifi::Networks>,
+    pub network_scan: super::wifi::ScanStatus,
 }
 
 #[derive(Clone)]
 pub enum Request {
+    /// Menu callers go through Commands::control, which coalesces a fresh scan
+    /// on its dedicated worker instead of waiting behind hardware discovery.
     Networks,
     Displays,
     Batteries,

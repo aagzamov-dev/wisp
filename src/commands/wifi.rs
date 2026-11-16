@@ -17,6 +17,23 @@ use windows::{
 };
 
 use super::radio;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+
+/// Menu discovery is separate from the launcher's inexpensive cached lookup.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ScanStatus {
+    #[default]
+    Idle,
+    Scanning,
+    Ready,
+    Failed(String),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct State {
@@ -61,30 +78,210 @@ pub fn set_power(on: bool) -> Result<(), String> {
 pub fn networks() -> Result<Networks, String> {
     let client = Client::open()?;
     let interface = client.interface().ok_or("This PC has no Wi-Fi adapter.")?;
-    let connected = connected_name();
-    match client.available(&interface) {
+    read_networks(&client, &interface)
+}
+
+fn read_networks(client: &Client, interface: &GUID) -> Result<Networks, String> {
+    match client.available(interface) {
         Ok(list) => Ok(Networks {
             list,
             location_off: false,
         }),
         Err(code) if code == ERROR_ACCESS_DENIED.0 => {
-            let list = client
-                .profiles(&interface)
-                .into_iter()
-                .map(|name| Network {
-                    connected: connected.as_deref() == Some(name.as_str()),
-                    profile: Some(name.clone()),
-                    name,
-                    secured: true,
-                    signal: None,
-                })
-                .collect();
-            Ok(Networks {
-                list: sorted(list),
-                location_off: true,
-            })
+            let connected = connection_name(client, interface);
+            Ok(saved_networks(client, interface, connected.as_deref()))
         }
         Err(code) => Err(windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code)).message()),
+    }
+}
+
+fn saved_networks(client: &Client, interface: &GUID, connected: Option<&str>) -> Networks {
+    let list = client
+        .profiles(interface)
+        .into_iter()
+        .map(|name| Network {
+            connected: connected == Some(name.as_str()),
+            profile: Some(name.clone()),
+            name,
+            secured: true,
+            signal: None,
+        })
+        .collect();
+    Networks {
+        list: sorted(list),
+        location_off: true,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScanSignal {
+    Complete,
+    Failed,
+}
+
+fn scan_signal(interface: &GUID, data: &L2_NOTIFICATION_DATA) -> Option<ScanSignal> {
+    if data.InterfaceGuid != *interface
+        || data.NotificationSource & WLAN_NOTIFICATION_SOURCE_ACM == WLAN_NOTIFICATION_SOURCES(0)
+    {
+        return None;
+    }
+    if data.NotificationCode == wlan_notification_acm_scan_complete.0 as u32 {
+        Some(ScanSignal::Complete)
+    } else if data.NotificationCode == wlan_notification_acm_scan_fail.0 as u32 {
+        Some(ScanSignal::Failed)
+    } else {
+        None
+    }
+}
+
+struct ScanContext {
+    interface: GUID,
+    signals: mpsc::SyncSender<ScanSignal>,
+    armed: AtomicBool,
+}
+unsafe extern "system" fn scan_notification(data: *mut L2_NOTIFICATION_DATA, context: *mut core::ffi::c_void) {
+    // No blocking work, shared locks, WLAN calls or pointer retention in the callback.
+    if let (Some(data), Some(context)) = (unsafe { data.as_ref() }, unsafe {
+        context.cast::<ScanContext>().as_ref()
+    }) && context.armed.load(Ordering::Acquire)
+        && let Some(signal) = scan_signal(&context.interface, data)
+    {
+        let _ = context.signals.try_send(signal);
+    }
+}
+
+struct ScanSession {
+    client: Option<Client>,
+    context: Box<ScanContext>,
+    signals: mpsc::Receiver<ScanSignal>,
+}
+impl ScanSession {
+    fn new(client: Client, interface: GUID) -> Result<Self, String> {
+        let (sender, signals) = mpsc::sync_channel(1);
+        let session = Self {
+            client: Some(client),
+            context: Box::new(ScanContext {
+                interface,
+                signals: sender,
+                armed: AtomicBool::new(false),
+            }),
+            signals,
+        };
+        let code = unsafe {
+            WlanRegisterNotification(
+                session.handle(),
+                WLAN_NOTIFICATION_SOURCE_ACM,
+                false,
+                Some(scan_notification),
+                Some((&raw const *session.context).cast()),
+                None,
+                None,
+            )
+        };
+        if code != 0 {
+            return Err(win32_error(code));
+        }
+        Ok(session)
+    }
+    fn handle(&self) -> HANDLE {
+        self.client.as_ref().expect("active WLAN session").0
+    }
+    fn request(&self) -> Result<bool, String> {
+        self.context.armed.store(true, Ordering::Release);
+        let code = unsafe { WlanScan(self.handle(), &self.context.interface, None, None, None) };
+        if code == ERROR_ACCESS_DENIED.0 {
+            return Ok(false);
+        }
+        if code != 0 {
+            return Err(win32_error(code));
+        }
+        match self.signals.recv_timeout(Duration::from_secs(4)) {
+            Ok(ScanSignal::Complete) => Ok(true),
+            Ok(ScanSignal::Failed) => Err("Windows could not complete the Wi-Fi scan. Refresh to try again.".into()),
+            Err(_) => Err("Wi-Fi scan timed out. Refresh to try again.".into()),
+        }
+    }
+}
+impl Drop for ScanSession {
+    fn drop(&mut self) {
+        self.context.armed.store(false, Ordering::Release);
+        if let Some(client) = self.client.take() {
+            unsafe {
+                WlanRegisterNotification(client.0, WLAN_NOTIFICATION_SOURCE_NONE, false, None, None, None, None);
+            }
+            // CloseHandle waits for callbacks even if unregister failed. The context
+            // is still alive here and is only dropped after this function returns.
+            drop(client);
+        }
+    }
+}
+fn win32_error(code: u32) -> String {
+    windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code)).message()
+}
+
+/// Requests fresh discovery on its dedicated worker. Cached results are published
+/// first, and denied location access retains the existing saved-profile behavior.
+pub fn scan_networks(publish_cached: impl FnMut(Networks)) -> Result<Networks, String> {
+    let client = Client::open()?;
+    let interface = client.interface().ok_or("This PC has no Wi-Fi adapter.")?;
+    discover(
+        &mut NativeDiscovery {
+            client: Some(client),
+            interface,
+            session: None,
+        },
+        publish_cached,
+    )
+}
+
+trait Discovery {
+    fn read(&mut self) -> Result<Networks, String>;
+    fn scan(&mut self) -> Result<bool, String>;
+    fn saved(&mut self) -> Networks;
+}
+fn discover(backend: &mut impl Discovery, mut publish_cached: impl FnMut(Networks)) -> Result<Networks, String> {
+    // Cached enumeration can fail while Windows is starting the adapter/service.
+    // It is a preview, not a prerequisite for the one fresh scan the user asked for.
+    if let Ok(cached) = backend.read() {
+        publish_cached(cached.clone());
+        if cached.location_off {
+            return Ok(cached);
+        }
+    }
+    if backend.scan()? {
+        backend.read()
+    } else {
+        Ok(backend.saved())
+    }
+}
+struct NativeDiscovery {
+    client: Option<Client>,
+    interface: GUID,
+    session: Option<ScanSession>,
+}
+impl NativeDiscovery {
+    fn client(&self) -> &Client {
+        self.session
+            .as_ref()
+            .and_then(|session| session.client.as_ref())
+            .or(self.client.as_ref())
+            .expect("active WLAN session")
+    }
+}
+impl Discovery for NativeDiscovery {
+    fn read(&mut self) -> Result<Networks, String> {
+        read_networks(self.client(), &self.interface)
+    }
+    fn scan(&mut self) -> Result<bool, String> {
+        self.session = Some(ScanSession::new(
+            self.client.take().expect("unscanned WLAN client"),
+            self.interface,
+        )?);
+        self.session.as_ref().expect("scan session").request()
+    }
+    fn saved(&mut self) -> Networks {
+        let connected = connection_name(self.client(), &self.interface);
+        saved_networks(self.client(), &self.interface, connected.as_deref())
     }
 }
 
@@ -115,7 +312,11 @@ pub fn connect(profile: &str) -> Result<(), String> {
 fn connected_name() -> Option<String> {
     let client = Client::open().ok()?;
     let interface = client.interface()?;
-    client.current_ssid(&interface).or_else(|| nlm_name(&interface))
+    connection_name(&client, &interface)
+}
+
+fn connection_name(client: &Client, interface: &GUID) -> Option<String> {
+    client.current_ssid(interface).or_else(|| nlm_name(interface))
 }
 
 fn nlm_name(interface: &GUID) -> Option<String> {
@@ -294,5 +495,174 @@ mod tests {
         ]);
         let names: Vec<_> = list.iter().map(|n| n.name.as_str()).collect();
         assert_eq!(names, ["home", "library", "office", "cafe"]);
+    }
+
+    struct FakeDiscovery {
+        reads: std::collections::VecDeque<Result<Networks, String>>,
+        result: Result<bool, String>,
+        scans: usize,
+    }
+    impl Discovery for FakeDiscovery {
+        fn read(&mut self) -> Result<Networks, String> {
+            self.reads.pop_front().expect("expected network read")
+        }
+        fn scan(&mut self) -> Result<bool, String> {
+            self.scans += 1;
+            self.result.clone()
+        }
+        fn saved(&mut self) -> Networks {
+            Networks {
+                list: vec![network("saved", true, false, None)],
+                location_off: true,
+            }
+        }
+    }
+    fn snapshot(name: Option<&str>, location_off: bool) -> Networks {
+        Networks {
+            list: name
+                .map(|name| vec![network(name, false, false, Some(70))])
+                .unwrap_or_default(),
+            location_off,
+        }
+    }
+    #[test]
+    fn cached_empty_list_is_published_then_replaced_only_after_scan_completion() {
+        let mut backend = FakeDiscovery {
+            reads: [Ok(snapshot(None, false)), Ok(snapshot(Some("fresh"), false))].into(),
+            result: Ok(true),
+            scans: 0,
+        };
+        let mut shown = Vec::new();
+        let final_list = discover(&mut backend, |cached| shown.push(cached)).unwrap();
+        assert!(shown[0].list.is_empty());
+        assert_eq!(backend.scans, 1);
+        assert_eq!(final_list.list[0].name, "fresh");
+        assert!(backend.reads.is_empty());
+    }
+    #[test]
+    fn initial_cache_failure_does_not_abort_the_single_requested_fresh_scan() {
+        let mut backend = FakeDiscovery {
+            reads: [
+                Err("adapter cache not ready".into()),
+                Ok(snapshot(Some("fresh"), false)),
+            ]
+            .into(),
+            result: Ok(true),
+            scans: 0,
+        };
+        let mut shown = Vec::new();
+        let final_list = discover(&mut backend, |cached| shown.push(cached)).unwrap();
+        assert!(shown.is_empty(), "a cache error must not publish an empty snapshot");
+        assert_eq!(final_list.list[0].name, "fresh");
+        assert_eq!(backend.scans, 1, "a cache miss adds no retries");
+        assert!(backend.reads.is_empty());
+    }
+    #[test]
+    fn cache_failure_keeps_real_scan_and_final_read_errors_visible() {
+        let mut scan_failure = FakeDiscovery {
+            reads: [Err("cache not ready".into())].into(),
+            result: Err("radio unavailable".into()),
+            scans: 0,
+        };
+        assert_eq!(
+            discover(&mut scan_failure, |_| panic!("no cached result")),
+            Err("radio unavailable".into())
+        );
+        assert_eq!(scan_failure.scans, 1);
+        let mut read_failure = FakeDiscovery {
+            reads: [Err("cache not ready".into()), Err("fresh enumeration failed".into())].into(),
+            result: Ok(true),
+            scans: 0,
+        };
+        assert_eq!(
+            discover(&mut read_failure, |_| panic!("no cached result")),
+            Err("fresh enumeration failed".into())
+        );
+        assert_eq!(read_failure.scans, 1);
+    }
+    #[test]
+    fn completed_empty_discovery_is_distinct_from_unknown_or_failed_discovery() {
+        let mut backend = FakeDiscovery {
+            reads: [Err("cache not ready".into()), Ok(snapshot(None, false))].into(),
+            result: Ok(true),
+            scans: 0,
+        };
+        let final_list = discover(&mut backend, |_| panic!("unknown cache is not an empty result")).unwrap();
+        assert!(final_list.list.is_empty());
+        assert!(!final_list.location_off);
+        assert_eq!(backend.scans, 1);
+    }
+    #[test]
+    fn failed_or_timed_out_scan_never_marks_cached_results_fresh() {
+        for error in ["timed out", "scan failed"] {
+            let mut backend = FakeDiscovery {
+                reads: [Ok(snapshot(Some("cached"), false))].into(),
+                result: Err(error.into()),
+                scans: 0,
+            };
+            let mut shown = Vec::new();
+            assert_eq!(discover(&mut backend, |cached| shown.push(cached)), Err(error.into()));
+            assert_eq!(shown[0].list[0].name, "cached");
+            assert_eq!(backend.scans, 1);
+        }
+    }
+    #[test]
+    fn location_denial_keeps_saved_profiles_without_scanning_or_claiming_nearby_results() {
+        let cached = snapshot(Some("profile"), true);
+        let mut backend = FakeDiscovery {
+            reads: [Ok(cached.clone())].into(),
+            result: Ok(true),
+            scans: 0,
+        };
+        assert_eq!(discover(&mut backend, |_| {}).unwrap(), cached);
+        assert_eq!(backend.scans, 0);
+        let mut backend = FakeDiscovery {
+            reads: [Ok(snapshot(None, false))].into(),
+            result: Ok(false),
+            scans: 0,
+        };
+        let saved = discover(&mut backend, |_| {}).unwrap();
+        assert!(saved.location_off);
+        assert_eq!(saved.list[0].name, "saved");
+    }
+    #[test]
+    fn notifications_ignore_other_interfaces_sources_and_unarmed_sessions() {
+        let interface = GUID::from_u128(1);
+        let mut data = L2_NOTIFICATION_DATA {
+            InterfaceGuid: interface,
+            NotificationSource: WLAN_NOTIFICATION_SOURCE_ACM,
+            NotificationCode: wlan_notification_acm_scan_complete.0 as u32,
+            ..Default::default()
+        };
+        assert_eq!(scan_signal(&interface, &data), Some(ScanSignal::Complete));
+        data.InterfaceGuid = GUID::from_u128(2);
+        assert_eq!(scan_signal(&interface, &data), None);
+        data.InterfaceGuid = interface;
+        data.NotificationSource = WLAN_NOTIFICATION_SOURCE_NONE;
+        assert_eq!(scan_signal(&interface, &data), None);
+        data.NotificationSource = WLAN_NOTIFICATION_SOURCE_ACM;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let mut context = ScanContext {
+            interface,
+            signals: sender,
+            armed: AtomicBool::new(false),
+        };
+        unsafe {
+            scan_notification(&raw mut data, (&raw mut context).cast());
+        }
+        assert!(receiver.try_recv().is_err());
+        context.armed.store(true, Ordering::Release);
+        unsafe {
+            scan_notification(&raw mut data, (&raw mut context).cast());
+        }
+        assert_eq!(receiver.try_recv().unwrap(), ScanSignal::Complete);
+        context.armed.store(false, Ordering::Release);
+        unsafe {
+            scan_notification(&raw mut data, (&raw mut context).cast());
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "late completion after timeout/teardown must be ignored"
+        );
     }
 }

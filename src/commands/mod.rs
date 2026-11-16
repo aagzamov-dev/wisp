@@ -18,8 +18,8 @@ pub mod time;
 pub mod wifi;
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
@@ -118,6 +118,8 @@ pub struct State {
 }
 
 pub enum Event {
+    TopbarStatus(Option<audio::State>, Option<wifi::State>, u64),
+    Notch(usize, Option<media::NotchTrack>),
     Control(control::Hardware),
     /// New state, icons for new programs, and how many commands the worker
     /// had run when it read the state.
@@ -128,6 +130,7 @@ pub enum Event {
 }
 
 enum Request {
+    TopbarStatus,
     Refresh,
     RefreshSound,
     List(Drill),
@@ -138,7 +141,13 @@ pub struct Commands {
     requests: Sender<Request>,
     refresh_pending: Arc<std::sync::atomic::AtomicBool>,
     sound_pending: Arc<std::sync::atomic::AtomicBool>,
+    topbar_pending: Arc<std::sync::atomic::AtomicBool>,
+    notch_reader: std::sync::OnceLock<std::sync::mpsc::SyncSender<(usize, Vec<String>)>>,
     control: std::sync::OnceLock<std::sync::mpsc::SyncSender<control::Request>>,
+    network_scan: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>>,
+    network_epoch: Arc<std::sync::atomic::AtomicU64>,
+    network_gate: Arc<Mutex<NetworkGate>>,
+    hardware: Arc<Mutex<control::Hardware>>,
     control_events: Sender<Event>,
     notify_window: isize,
     notify_message: u32,
@@ -153,13 +162,23 @@ impl Commands {
         let pending = refresh_pending.clone();
         let sound_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending_sound = sound_pending.clone();
+        let topbar_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pending_topbar = topbar_pending.clone();
         let control_events = events.clone();
         std::thread::Builder::new()
             .name("commands".into())
             .spawn(move || {
-                worker(rx, events, icon_size, pending, pending_sound, move || unsafe {
-                    let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
-                })
+                worker(
+                    rx,
+                    events,
+                    icon_size,
+                    pending,
+                    pending_sound,
+                    pending_topbar,
+                    move || unsafe {
+                        let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
+                    },
+                )
             })
             .expect("could not start commands thread");
         (
@@ -167,7 +186,13 @@ impl Commands {
                 requests,
                 refresh_pending,
                 sound_pending,
+                topbar_pending,
+                notch_reader: std::sync::OnceLock::new(),
                 control: std::sync::OnceLock::new(),
+                network_scan: std::sync::OnceLock::new(),
+                network_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                network_gate: Arc::new(Mutex::new(NetworkGate::default())),
+                hardware: Arc::new(Mutex::new(control::Hardware::default())),
                 control_events,
                 notify_window: hwnd,
                 notify_message: notify_msg,
@@ -188,10 +213,15 @@ impl Commands {
             let _ = self.requests.send(Request::RefreshSound);
         }
     }
+    pub fn refresh_topbar_status(&self) {
+        if !self.topbar_pending.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let _ = self.requests.send(Request::TopbarStatus);
+        }
+    }
 
-    pub fn control(&self, request: control::Request) -> bool {
-        let sender = self.control.get_or_init(|| {
-            let (sender, requests) = std::sync::mpsc::sync_channel(4);
+    pub fn refresh_notch(&self, notch: usize, exclusions: &[String]) {
+        let sender = self.notch_reader.get_or_init(|| {
+            let (sender, requests) = std::sync::mpsc::sync_channel::<(usize, Vec<String>)>(1);
             let events = self.control_events.clone();
             let window = self.notify_window;
             let message = self.notify_message;
@@ -199,15 +229,50 @@ impl Commands {
                 unsafe {
                     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                 }
-                let mut hardware = control::Hardware::default();
+                let mut reader = media::NotchReader::default();
+                while let Ok((notch, exclusions)) = requests.recv() {
+                    if events.send(Event::Notch(notch, reader.read(&exclusions))).is_err() {
+                        break;
+                    }
+                    unsafe {
+                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
+                    }
+                }
+            });
+            sender
+        });
+        let _ = sender.try_send((notch, exclusions.to_vec()));
+    }
+
+    pub fn control(&self, request: control::Request) -> bool {
+        if matches!(request, control::Request::Networks) {
+            return self.refresh_networks();
+        }
+        let sender = self.control.get_or_init(|| {
+            let (sender, requests) = std::sync::mpsc::sync_channel(4);
+            let events = self.control_events.clone();
+            let window = self.notify_window;
+            let message = self.notify_message;
+            let shared = self.hardware.clone();
+            std::thread::spawn(move || {
+                unsafe {
+                    let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                }
                 while let Ok(request) = requests.recv() {
+                    let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner()).clone();
                     if let Err(error) = control::run(request, &mut hardware)
                         && events.send(Event::Failed(error)).is_err()
                     {
                         break;
                     }
-                    if events.send(Event::Control(hardware.clone())).is_err() {
-                        break;
+                    {
+                        // Only the control worker owns these fields. Publish while
+                        // locked so a later scan snapshot cannot be sent first.
+                        let mut current = shared.lock().unwrap_or_else(|error| error.into_inner());
+                        merge_control_snapshot(&mut current, hardware);
+                        if events.send(Event::Control(current.clone())).is_err() {
+                            break;
+                        }
                     }
                     unsafe {
                         let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
@@ -219,6 +284,105 @@ impl Commands {
         sender.try_send(request).is_ok()
     }
 
+    fn refresh_networks(&self) -> bool {
+        let sender = self.network_scan.get_or_init(|| {
+            let (sender, requests) = std::sync::mpsc::sync_channel(1);
+            let shared = self.hardware.clone();
+            let gate = self.network_gate.clone();
+            let epoch = self.network_epoch.clone();
+            let events = self.control_events.clone();
+            let window = self.notify_window;
+            let message = self.notify_message;
+            let _ = std::thread::Builder::new()
+                .name("Wi-Fi discovery".into())
+                .spawn(move || {
+                    unsafe {
+                        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+                    }
+                    while requests.recv().is_ok() {
+                        loop {
+                            let generation = {
+                                let mut current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
+                                let generation = current_gate.current(epoch.load(std::sync::atomic::Ordering::Acquire));
+                                if generation.is_none() {
+                                    let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner());
+                                    hardware.network_scan = wifi::ScanStatus::Idle;
+                                    let _ = events.send(Event::Control(hardware.clone()));
+                                    unsafe {
+                                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
+                                    }
+                                }
+                                generation
+                            };
+                            let Some(generation) = generation else { break };
+                            // Native scanning and callback teardown are outside both locks.
+                            let result = wifi::scan_networks(|cached| {
+                                let current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
+                                if current_gate.active == Some(generation)
+                                    && epoch.load(std::sync::atomic::Ordering::Acquire) == generation
+                                {
+                                    let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner());
+                                    hardware.networks = Some(cached);
+                                    hardware.network_scan = wifi::ScanStatus::Scanning;
+                                    let _ = events.send(Event::Control(hardware.clone()));
+                                    unsafe {
+                                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
+                                    }
+                                }
+                            });
+                            let mut current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
+                            let current = generation == epoch.load(std::sync::atomic::Ordering::Acquire);
+                            let again = current_gate.finish(generation);
+                            let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner());
+                            apply_network_result(&mut hardware, result, current, again);
+                            if events.send(Event::Control(hardware.clone())).is_err() {
+                                return;
+                            }
+                            unsafe {
+                                let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
+                            }
+                            drop(hardware);
+                            drop(current_gate);
+                            if !again {
+                                break;
+                            }
+                        }
+                    }
+                });
+            sender
+        });
+        let generation = self.network_epoch.load(std::sync::atomic::Ordering::Acquire);
+        let mut gate = self.network_gate.lock().unwrap_or_else(|error| error.into_inner());
+        let start = gate.request(generation);
+        let mut hardware = self.hardware.lock().unwrap_or_else(|error| error.into_inner());
+        hardware.network_scan = wifi::ScanStatus::Scanning;
+        if start && sender.try_send(()).is_err() {
+            gate.active = None;
+            gate.queued = None;
+            hardware.network_scan = wifi::ScanStatus::Failed("Could not start Wi-Fi discovery.".into());
+            let _ = self.control_events.send(Event::Control(hardware.clone()));
+            unsafe {
+                let _ = PostMessageW(
+                    Some(HWND(self.notify_window as _)),
+                    self.notify_message,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            return false;
+        }
+        let _ = self.control_events.send(Event::Control(hardware.clone()));
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(self.notify_window as _)),
+                self.notify_message,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        true
+    }
+
     pub fn list(&self, drill: Drill) {
         let _ = self.requests.send(Request::List(drill));
     }
@@ -226,8 +390,77 @@ impl Commands {
     /// Runs a command on the worker thread, then reads the state again. State
     /// events count the commands run so far, in the order of these calls.
     pub fn run(&self, command: Command) {
+        if matches!(command, Command::WifiPower(_)) {
+            self.network_epoch.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
         let _ = self.requests.send(Request::Run(command));
     }
+}
+
+/// One active scan, coalesced by power epoch. A changed power epoch
+/// can retain one follow-up request without growing a work queue.
+#[derive(Default)]
+struct NetworkGate {
+    active: Option<u64>,
+    queued: Option<u64>,
+}
+impl NetworkGate {
+    fn current(&mut self, generation: u64) -> Option<u64> {
+        while let Some(active) = self.active {
+            if active == generation {
+                return Some(active);
+            }
+            self.finish(active);
+        }
+        None
+    }
+    fn request(&mut self, generation: u64) -> bool {
+        match self.active {
+            None => {
+                self.active = Some(generation);
+                true
+            }
+            Some(active) => {
+                if active != generation {
+                    self.queued = Some(generation);
+                }
+                false
+            }
+        }
+    }
+    fn finish(&mut self, generation: u64) -> bool {
+        if self.active != Some(generation) {
+            return false;
+        }
+        self.active = self.queued.take();
+        self.active.is_some()
+    }
+}
+fn apply_network_result(
+    hardware: &mut control::Hardware,
+    result: Result<wifi::Networks, String>,
+    current: bool,
+    again: bool,
+) {
+    if current {
+        match result {
+            Ok(networks) => {
+                hardware.networks = Some(networks);
+                hardware.network_scan = wifi::ScanStatus::Ready;
+            }
+            Err(error) => hardware.network_scan = wifi::ScanStatus::Failed(error),
+        }
+    } else {
+        hardware.network_scan = wifi::ScanStatus::Idle;
+    }
+    if again {
+        hardware.network_scan = wifi::ScanStatus::Scanning;
+    }
+}
+
+fn merge_control_snapshot(current: &mut control::Hardware, snapshot: control::Hardware) {
+    current.displays = snapshot.displays;
+    current.batteries = snapshot.batteries;
 }
 
 fn worker(
@@ -236,6 +469,7 @@ fn worker(
     icon_size: i32,
     refresh_pending: Arc<std::sync::atomic::AtomicBool>,
     sound_pending: Arc<std::sync::atomic::AtomicBool>,
+    topbar_pending: Arc<std::sync::atomic::AtomicBool>,
     notify: impl Fn(),
 ) {
     unsafe {
@@ -280,6 +514,10 @@ fn worker(
         while let Some(request) = next.take() {
             handled += 1;
             match request {
+                Request::TopbarStatus => {
+                    topbar_pending.store(false, std::sync::atomic::Ordering::Release);
+                    send(Event::TopbarStatus(audio::state(), wifi::state(), ran));
+                }
                 Request::Refresh | Request::RefreshSound => {
                     if matches!(request, Request::Refresh) {
                         full = true;
@@ -1090,5 +1328,108 @@ mod tests {
             network_items(state.wifi.as_ref(), None)[0].title,
             "Looking for networks…"
         );
+    }
+}
+
+#[cfg(test)]
+mod network_scan_tests {
+    use super::*;
+    fn networks(name: &str) -> wifi::Networks {
+        wifi::Networks {
+            list: vec![wifi::Network {
+                name: name.into(),
+                profile: None,
+                connected: false,
+                secured: true,
+                signal: Some(60),
+            }],
+            location_off: false,
+        }
+    }
+    #[test]
+    fn repeated_refreshes_coalesce_and_changed_power_queues_only_the_latest_epoch() {
+        let mut gate = NetworkGate::default();
+        assert!(gate.request(1));
+        for _ in 0..50 {
+            assert!(!gate.request(1));
+        }
+        assert_eq!(gate.queued, None);
+        assert!(!gate.request(2));
+        assert!(!gate.request(3));
+        assert_eq!(gate.queued, Some(3));
+        assert!(gate.finish(1));
+        assert_eq!(gate.active, Some(3));
+        assert!(!gate.finish(1));
+        assert_eq!(gate.active, Some(3));
+        assert!(!gate.finish(3));
+        assert_eq!(gate.active, None);
+        assert!(gate.request(3));
+    }
+    #[test]
+    fn queued_enable_scan_is_skipped_if_radio_was_disabled_before_it_started() {
+        let mut gate = NetworkGate::default();
+        assert!(gate.request(0));
+        assert!(!gate.request(1)); // Enable while the first scan is in progress.
+        assert!(gate.finish(0));
+        // Disable advances the epoch but does not request another scan.
+        let mut scans = 0;
+        if gate.current(2).is_some() {
+            scans += 1;
+        }
+        assert_eq!(scans, 0);
+        assert_eq!(gate.active, None);
+        assert_eq!(gate.queued, None);
+    }
+    #[test]
+    fn stale_completion_is_discarded_and_error_preserves_the_cached_networks() {
+        let mut hardware = control::Hardware {
+            networks: Some(networks("cached")),
+            ..Default::default()
+        };
+        apply_network_result(&mut hardware, Ok(networks("stale")), false, true);
+        assert_eq!(hardware.networks.as_ref().unwrap().list[0].name, "cached");
+        assert_eq!(hardware.network_scan, wifi::ScanStatus::Scanning);
+        apply_network_result(&mut hardware, Err("timeout".into()), true, false);
+        assert_eq!(hardware.networks.as_ref().unwrap().list[0].name, "cached");
+        assert_eq!(hardware.network_scan, wifi::ScanStatus::Failed("timeout".into()));
+        apply_network_result(&mut hardware, Ok(networks("fresh")), true, false);
+        assert_eq!(hardware.networks.as_ref().unwrap().list[0].name, "fresh");
+        assert_eq!(hardware.network_scan, wifi::ScanStatus::Ready);
+    }
+    #[test]
+    fn unknown_failure_does_not_become_an_empty_ready_list() {
+        let mut hardware = control::Hardware::default();
+        apply_network_result(&mut hardware, Err("timeout".into()), true, false);
+        assert_eq!(hardware.networks, None);
+        assert_eq!(hardware.network_scan, wifi::ScanStatus::Failed("timeout".into()));
+        apply_network_result(
+            &mut hardware,
+            Ok(wifi::Networks {
+                list: Vec::new(),
+                location_off: false,
+            }),
+            true,
+            false,
+        );
+        assert!(hardware.networks.as_ref().unwrap().list.is_empty());
+        assert_eq!(hardware.network_scan, wifi::ScanStatus::Ready);
+    }
+    #[test]
+    fn control_results_cannot_overwrite_a_newer_network_snapshot() {
+        let mut current = control::Hardware {
+            networks: Some(networks("fresh")),
+            network_scan: wifi::ScanStatus::Scanning,
+            ..Default::default()
+        };
+        let older_control_result = control::Hardware {
+            networks: Some(networks("old")),
+            network_scan: wifi::ScanStatus::Ready,
+            batteries: vec![("Headphones".into(), Some(60))],
+            ..Default::default()
+        };
+        merge_control_snapshot(&mut current, older_control_result);
+        assert_eq!(current.networks.unwrap().list[0].name, "fresh");
+        assert_eq!(current.network_scan, wifi::ScanStatus::Scanning);
+        assert_eq!(current.batteries[0].1, Some(60));
     }
 }

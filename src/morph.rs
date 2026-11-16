@@ -15,6 +15,12 @@ pub fn fades(expanded: f32) -> (f32, f32) {
     )
 }
 
+/// A separate dock keeps its own HWND. Start never paints a second copy,
+/// including while its logical input visibility is already false on close.
+pub fn dock_opacity(expanded: f32, shared: bool, start: bool) -> f32 {
+    if shared && !start { fades(expanded).0 } else { 0. }
+}
+
 pub fn can_morph(visible: bool, hidden_fraction: f32) -> bool {
     visible && hidden_fraction <= 0.4
 }
@@ -43,6 +49,16 @@ pub fn content_offset(width: f32, height: f32, content_width: f32, content_heigh
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn start_close_and_separate_launcher_never_paint_another_dock() {
+        for progress in [0., 0.1, 0.5, 1.] {
+            assert_eq!(dock_opacity(progress, false, true), 0.);
+            assert_eq!(dock_opacity(progress, true, true), 0.);
+            assert_eq!(dock_opacity(progress, false, false), 0.);
+        }
+        assert_eq!(dock_opacity(0., true, false), 1.);
+        assert_eq!(dock_opacity(1., true, false), 0.);
+    }
     #[test]
     fn endpoints_and_reversal() {
         for scale in [1.0, 1.25] {

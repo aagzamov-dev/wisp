@@ -5,14 +5,24 @@ mod desktops;
 #[path = "dock/logic.rs"]
 mod logic;
 #[path = "dock/render.rs"]
-mod render;
+pub(crate) mod render;
 #[path = "dock/space.rs"]
 pub mod space;
 
+#[path = "dock/calendar.rs"]
+mod calendar;
+#[path = "dock/calendar_model.rs"]
+mod calendar_model;
 #[path = "dock/pins.rs"]
 mod pins;
 #[path = "dock/status.rs"]
 mod status;
+#[path = "dock/topbar.rs"]
+pub mod topbar;
+#[path = "dock/topbar_blur.rs"]
+pub(crate) mod topbar_blur;
+#[path = "dock/topbar_space.rs"]
+mod topbar_space;
 #[path = "dock/tray.rs"]
 mod tray;
 
@@ -58,6 +68,7 @@ const WM_TRAY_CHANGED: u32 = WM_APP + 22;
 /// dock lacks.
 pub const WM_DOCK_SHOW_TASKBAR: u32 = WM_APP + 23;
 const WM_CLOSE_FLYOUT: u32 = WM_APP + 24;
+const WM_SURFACE_MATERIAL: u32 = WM_APP + 50;
 #[path = "dock/sound.rs"]
 pub mod sound;
 /// Shows a notification icon's tooltip after a short hover.
@@ -69,11 +80,95 @@ const TIP_MAX: f32 = 320.0;
 /// has left both the list and the dock.
 const WINDOWS_TIMER: usize = 107;
 const WINDOWS_HIDE_TIMER: usize = 108;
+const PREVIEW_ZOOM_TIMER: usize = 111;
 pub(crate) const POPUP_FADE_TIMER: usize = 110;
 #[derive(Clone, Copy)]
 pub(crate) struct PopupFade {
     started: Instant,
     ms: u32,
+    motion: crate::animation::Motion,
+}
+/// Remote tray frames reuse their complete bitmap for opacity-only ticks.
+type RemotePopupFade = PopupFade;
+impl PopupFade {
+    const INTERVAL: u32 = crate::animation::REMOTE_INTERVAL;
+    fn from_motion(mut motion: crate::animation::Motion, opening: bool, ms: u32) -> Self {
+        motion.retarget_duration(opening, ms);
+        Self {
+            started: Instant::now(),
+            ms,
+            motion,
+        }
+    }
+    fn new(ms: u32, enabled: bool) -> Option<Self> {
+        (ms != 0 && enabled).then(|| Self::from_motion(crate::animation::Motion::at(190. / 255.), true, ms.min(120)))
+    }
+    fn sample(self) -> crate::animation::Motion {
+        let mut motion = self.motion;
+        motion.tick(self.started.elapsed().as_secs_f32());
+        motion
+    }
+    fn alpha_at(elapsed: Duration, ms: u32) -> u8 {
+        let mut motion = crate::animation::Motion::at(190. / 255.);
+        motion.retarget_duration(true, ms);
+        motion.tick(elapsed.as_secs_f32());
+        (motion.value * 255.).round() as u8
+    }
+    fn alpha(self) -> u8 {
+        (self.sample().value * 255.).round().clamp(0., 255.) as u8
+    }
+    fn finished(self) -> bool {
+        self.started.elapsed().as_millis() >= u128::from(self.ms) || !self.sample().active()
+    }
+}
+#[cfg(test)]
+mod remote_popup_tests {
+    use super::*;
+    #[test]
+    fn tray_close_reopens_from_its_actual_position_and_velocity() {
+        let mut opening = PopupFade::from_motion(crate::animation::Motion::at(0.), true, 180);
+        opening.started -= Duration::from_millis(60);
+        let from = opening.sample();
+        let closing = PopupFade::from_motion(from, false, 140);
+        assert_eq!(
+            (closing.motion.value, closing.motion.velocity),
+            (from.value, from.velocity)
+        );
+        let reopening = PopupFade::from_motion(closing.motion, true, 180);
+        assert_eq!(
+            (reopening.motion.value, reopening.motion.velocity),
+            (from.value, from.velocity)
+        );
+        let mut retired = closing;
+        retired.started -= Duration::from_secs(1);
+        assert!(retired.finished());
+        assert_eq!(retired.alpha(), 0);
+    }
+    #[test]
+    fn remote_popup_fade_is_bounded_and_respects_disabled_motion() {
+        assert!(RemotePopupFade::new(0, true).is_none());
+        assert!(RemotePopupFade::new(120, false).is_none());
+        assert_eq!(RemotePopupFade::new(500, true).unwrap().ms, 120);
+        assert_eq!(RemotePopupFade::new(35, true).unwrap().ms, 35);
+        let alphas = [0, 30, 60, 90, 120, 300].map(|ms| RemotePopupFade::alpha_at(Duration::from_millis(ms), 120));
+        assert_eq!(alphas[0], 190);
+        assert_eq!(alphas[4], 255);
+        assert_eq!(alphas[5], 255);
+        assert!(alphas.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+    #[test]
+    fn remote_popup_reopen_starts_visible_and_cancel_retires_the_old_fade() {
+        let mut fade = RemotePopupFade::new(120, true);
+        let old = fade.as_mut().unwrap();
+        old.started = Instant::now() - Duration::from_millis(300);
+        assert!(old.finished());
+        assert_eq!(old.alpha(), 255);
+        fade.take(); // Close/menu completion retires the active fade, even mid-open.
+        assert!(fade.is_none());
+        fade = RemotePopupFade::new(120, true);
+        assert!(!fade.unwrap().finished());
+        assert!(fade.unwrap().alpha() >= 190);
+    }
 }
 const POPUP_START_ALPHA: u8 = 115;
 
@@ -98,28 +193,27 @@ pub(crate) fn start_popup_fade(hwnd: HWND, ms: u32) -> Option<PopupFade> {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
         if SetLayeredWindowAttributes(hwnd, COLORREF(0), POPUP_START_ALPHA, LWA_ALPHA).is_err()
-            || SetTimer(Some(hwnd), POPUP_FADE_TIMER, 15, None) == 0
+            || SetTimer(Some(hwnd), POPUP_FADE_TIMER, crate::animation::LOCAL_INTERVAL, None) == 0
         {
             finish_popup_fade(hwnd);
             return None;
         }
     }
-    Some(PopupFade {
-        started: Instant::now(),
+    Some(PopupFade::from_motion(
+        crate::animation::Motion::at(POPUP_START_ALPHA as f32 / 255.),
+        true,
         ms,
-    })
+    ))
 }
 
 pub(crate) fn tick_popup_fade(hwnd: HWND, fade: &mut Option<PopupFade>) {
     let Some(animation) = *fade else { return };
-    let t = animation.started.elapsed().as_secs_f32() * 1000. / animation.ms as f32;
-    if t >= 1. {
+    if animation.finished() {
         fade.take();
         finish_popup_fade(hwnd);
     } else {
-        let alpha = POPUP_START_ALPHA as f32 + (255 - POPUP_START_ALPHA) as f32 * (1. - (1. - t).powi(3));
         unsafe {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha.round() as u8, LWA_ALPHA);
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), animation.alpha(), LWA_ALPHA);
         }
     }
 }
@@ -150,6 +244,7 @@ const DESKTOP_PILL_MS: u32 = 1100;
 /// Wheel input right after a switch is the same flick, not another request.
 const DESKTOP_PAUSE: Duration = Duration::from_millis(300);
 thread_local! {
+    static SURFACE_CACHE: RefCell<Option<(Instant, Rc<Vec<SurfaceWindow>>)>> = const { RefCell::new(None) };
     static DOCK_WINDOWS: RefCell<Vec<HWND>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -168,14 +263,17 @@ struct DockData {
     pins: RefCell<pins::Pins>,
     tray: RefCell<Option<TrayHost>>,
     tray_anchor: Cell<HWND>,
+    topbar_status: Cell<bool>,
+    topbar_strips: RefCell<Option<topbar_space::Strips>>,
+    dock_enabled: Cell<bool>,
     windows: RefCell<Option<(Instant, Rc<Vec<Window>>)>>,
-    surfaces: RefCell<Option<(Instant, Rc<Vec<SurfaceWindow>>)>>,
 }
 
 impl DockData {
     fn new() -> Self {
         Self {
             pins: RefCell::new(pins::Pins::load()),
+            dock_enabled: Cell::new(true),
             ..Default::default()
         }
     }
@@ -191,9 +289,10 @@ impl DockData {
         *cache = Some((Instant::now(), windows.clone()));
         windows
     }
+}
 
-    fn surfaces(&self) -> Rc<Vec<SurfaceWindow>> {
-        let mut cache = self.surfaces.borrow_mut();
+fn surface_windows() -> Rc<Vec<SurfaceWindow>> {
+    SURFACE_CACHE.with_borrow_mut(|cache| {
         if let Some((at, windows)) = &*cache
             && at.elapsed() < Duration::from_millis(150)
         {
@@ -204,12 +303,74 @@ impl DockData {
         let windows = Rc::new(windows);
         *cache = Some((Instant::now(), windows.clone()));
         windows
-    }
+    })
+}
+
+pub(crate) fn primary_fullscreen() -> bool {
+    monitor_info(primary_monitor()).is_some_and(|info| fullscreen_on(&surface_windows(), info.rcMonitor, info.rcWork))
 }
 
 struct Item {
     app: AppEntry,
     windows: Vec<Window>,
+}
+
+enum DockMenu {
+    App {
+        hwnd: HWND,
+        app: AppEntry,
+        pinned: bool,
+        windows: Vec<(isize, u32)>,
+    },
+    Chevron {
+        hwnd: HWND,
+        owner: HWND,
+    },
+}
+enum DockEffect {
+    None,
+    Controls,
+    Launch { app: AppEntry, indexed: bool },
+    Close(Vec<(isize, u32)>),
+    Taskbar(HWND),
+    Open(&'static str),
+    Focus((isize, u32)),
+    Minimize(Vec<(isize, u32)>),
+}
+
+/// Native modal dispatch is allowed to pump app updates. Only snapshot and
+/// result application borrow State; the native callback owns no RefCell guard.
+fn modal_action<S, T, R>(
+    cell: &RefCell<S>,
+    prepare: impl FnOnce(&mut S) -> Option<T>,
+    display: impl FnOnce(&T) -> u32,
+    apply: impl FnOnce(&mut S, T, u32) -> R,
+) -> Option<R> {
+    let snapshot = { prepare(&mut cell.borrow_mut()) }?;
+    let command = display(&snapshot);
+    Some(apply(&mut cell.borrow_mut(), snapshot, command))
+}
+
+#[derive(Clone, Copy)]
+struct PanelTarget {
+    id: sound::Identity,
+    epoch: u64,
+    material_version: u64,
+}
+fn panel_generation_current(expected: (u64, u64), current: (u64, u64), same_panel: bool, owner_current: bool) -> bool {
+    owner_current && same_panel && expected == current
+}
+fn dock_panel_current(cell: &RefCell<State>, target: PanelTarget) -> bool {
+    let current = {
+        let s = cell.borrow();
+        panel_generation_current(
+            (target.epoch, target.material_version),
+            (s.sound_epoch, s.material_version),
+            s.sound_identity == Some(target.id),
+            s.alive && unsafe { GetWindowLongPtrW(s.hwnd, GWLP_USERDATA) == cell as *const _ as isize },
+        )
+    };
+    current && sound::is_current(target.id)
 }
 
 struct AppPress {
@@ -220,6 +381,7 @@ struct AppPress {
 }
 
 struct State {
+    alive: bool,
     hwnd: HWND,
     owner: HWND,
     apps: Vec<AppEntry>,
@@ -229,8 +391,12 @@ struct State {
     primary: bool,
     app_press: Option<AppPress>,
     palette: Palette,
+    tip_palette: Palette,
+    windows_palette: Palette,
+    zoom_palette: Palette,
     backdrop: Backdrop,
     backdrop_color: String,
+    material_options: crate::theme::MaterialOptions,
     dark: bool,
     window_list_mode: WindowListMode,
     app_icon_size: f32,
@@ -254,8 +420,11 @@ struct State {
     /// Whether the dock hides until the pointer touches a bottom edge. When
     /// false it stays on the primary screen.
     autohide: bool,
+    reveal_height: u32,
     smart_hide: bool,
+    remote: bool,
     current_monitor_only: bool,
+    preview_current_monitor_only: bool,
     monitor: HMONITOR,
     fullscreen_clear_since: Option<Instant>,
     suspended: bool,
@@ -264,7 +433,7 @@ struct State {
     /// Where the window rests, in physical pixels, and when it began sliding there.
     top: i32,
     slide: Option<Instant>,
-    slide_from: f32,
+    slide_motion: crate::animation::Motion,
     slide_to: f32,
     slide_ms: u32,
     open_ms: u32,
@@ -273,6 +442,8 @@ struct State {
     layered: bool,
     tray_interaction: Option<(u32, Instant)>,
     sound: HWND,
+    sound_identity: Option<sound::Identity>,
+    sound_epoch: u64,
     sound_state: crate::commands::State,
     sound_hardware: crate::commands::control::Hardware,
     previews: Vec<Option<isize>>,
@@ -281,6 +452,7 @@ struct State {
     preview_page: usize,
     preview_count: usize,
     windows_clicked: bool,
+    native_menu_open: bool,
     hover_levels: Vec<f32>,
     hover_tick: Option<Instant>,
     /// Wheel delta over the volume not yet spent on a whole percent.
@@ -303,6 +475,12 @@ struct State {
     flyout_open: bool,
     start_open: bool,
     flyout_fade: Option<PopupFade>,
+    remote_flyout_fade: Option<RemotePopupFade>,
+    flyout_exit: Option<PopupFade>,
+    flyout_material: Option<crate::theme::SurfaceMaterial>,
+    flyout_palette: Palette,
+    material_version: u64,
+    flyout_prepared: bool,
     flyout_hover: Option<usize>,
     flyout_renderer: render::Renderer,
     tip: HWND,
@@ -318,7 +496,15 @@ struct State {
     windows_rows: Vec<String>,
     windows_monitors: Vec<String>,
     windows_targets: Vec<isize>,
+    /// Full chooser order, including off-page cards, independent of app z-order.
+    windows_order: Vec<isize>,
     windows_hover: Option<(usize, bool)>,
+    windows_press: Option<logic::PreviewPress>,
+    zoom: HWND,
+    zoom_renderer: render::Renderer,
+    zoom_thumbnail: Option<isize>,
+    zoom_source: Option<(isize, u32)>,
+    zoom_title: String,
     /// The last click on a notification icon, to tell double clicks.
     tray_click: Option<(tray_host::Key, Instant)>,
     /// The demo's flyout and its hovered icon, applied as icons arrive.
@@ -329,12 +515,44 @@ struct State {
 pub struct Dock {
     hwnd: HWND,
     shared: bool,
-    state: Box<RefCell<State>>,
+    state: Rc<RefCell<State>>,
     hooks: Vec<HWINEVENTHOOK>,
     secondary: Vec<Dock>,
+    topbars: Vec<topbar::Bar>,
+    topbar_space: Option<topbar_space::TopbarSpace>,
+}
+
+/// Owned pin handle for Start: persistence and dock notifications run after
+/// releasing the Launcher borrow, just like native app actions.
+#[derive(Clone)]
+pub(crate) struct AppPins(Rc<DockData>);
+impl AppPins {
+    pub fn contains(&self, id: &str) -> bool {
+        self.0.pins.borrow().position(id).is_some()
+    }
+    pub fn set(&self, app: AppEntry, pinned: bool) -> std::io::Result<()> {
+        self.0.pins.borrow_mut().set_pinned(app, pinned)?;
+        post_to_docks(WM_REFRESH, None);
+        Ok(())
+    }
+}
+
+pub(crate) fn set_start_pin(handle: Option<&AppPins>, app: AppEntry, pinned: bool) -> std::io::Result<()> {
+    if let Some(handle) = handle {
+        handle.set(app, pinned)
+    } else {
+        pins::Pins::load().set_pinned(app, pinned)
+    }
+}
+
+pub(crate) fn saved_start_pinned(id: &str) -> bool {
+    pins::Pins::load().position(id).is_some()
 }
 
 impl Dock {
+    pub(crate) fn app_pins(&self) -> AppPins {
+        AppPins(self.state.borrow().data.clone())
+    }
     pub fn new(owner: HWND) -> Result<Self> {
         Self::create(owner, false, primary_monitor(), Rc::new(DockData::new()), true)
     }
@@ -344,7 +562,8 @@ impl Dock {
     }
 
     fn create(owner: HWND, shared: bool, monitor: HMONITOR, data: Rc<DockData>, primary: bool) -> Result<Self> {
-        let mut state = Box::new(RefCell::new(State {
+        let state = Rc::new(RefCell::new(State {
+            alive: true,
             hwnd: HWND::default(),
             owner,
             apps: Vec::new(),
@@ -354,8 +573,12 @@ impl Dock {
             primary,
             app_press: None,
             palette: Palette::new(true, true),
+            tip_palette: Palette::new(true, false),
+            windows_palette: Palette::new(true, false),
+            zoom_palette: Palette::new(true, false),
             backdrop: Backdrop::Acrylic,
             backdrop_color: String::new(),
+            material_options: Default::default(),
             dark: true,
             window_list_mode: WindowListMode::default(),
             app_icon_size: logic::DEFAULT_APP_ICON_SIZE,
@@ -374,8 +597,11 @@ impl Dock {
             away: 0,
             held: false,
             autohide: true,
+            reveal_height: 8,
             smart_hide: false,
+            remote: false,
             current_monitor_only: false,
+            preview_current_monitor_only: false,
             monitor,
             fullscreen_clear_since: None,
             suspended: false,
@@ -383,7 +609,7 @@ impl Dock {
             held_dpi: None,
             top: 0,
             slide: None,
-            slide_from: 0.0,
+            slide_motion: crate::animation::Motion::at(1.),
             slide_to: 0.0,
             slide_ms: 0,
             open_ms: 180,
@@ -392,6 +618,8 @@ impl Dock {
             layered: false,
             tray_interaction: None,
             sound: HWND::default(),
+            sound_identity: None,
+            sound_epoch: 0,
             sound_state: crate::commands::State::default(),
             sound_hardware: crate::commands::control::Hardware::default(),
             previews: Vec::new(),
@@ -400,6 +628,7 @@ impl Dock {
             preview_page: 0,
             preview_count: 0,
             windows_clicked: false,
+            native_menu_open: false,
             hover_levels: Vec::new(),
             hover_tick: None,
             wheel: 0,
@@ -415,6 +644,12 @@ impl Dock {
             flyout_open: false,
             start_open: false,
             flyout_fade: None,
+            remote_flyout_fade: None,
+            flyout_exit: None,
+            flyout_material: None,
+            flyout_palette: Palette::new(true, false),
+            material_version: 0,
+            flyout_prepared: false,
             flyout_hover: None,
             flyout_renderer: render::Renderer::new()?,
             tip: HWND::default(),
@@ -427,7 +662,14 @@ impl Dock {
             windows_rows: Vec::new(),
             windows_monitors: Vec::new(),
             windows_targets: Vec::new(),
+            windows_order: Vec::new(),
             windows_hover: None,
+            windows_press: None,
+            zoom: HWND::default(),
+            zoom_renderer: render::Renderer::new()?,
+            zoom_thumbnail: None,
+            zoom_source: None,
+            zoom_title: String::new(),
             tray_click: None,
             held_flyout: None,
         }));
@@ -445,7 +687,7 @@ impl Dock {
         }
         let hwnd = if shared {
             unsafe {
-                SetWindowLongPtrW(owner, GWLP_USERDATA, (&raw mut *state) as isize);
+                SetWindowLongPtrW(owner, GWLP_USERDATA, Rc::as_ptr(&state) as isize);
             }
             owner
         } else {
@@ -462,7 +704,7 @@ impl Dock {
                     None,
                     None,
                     Some(instance.into()),
-                    Some((&raw mut *state).cast()),
+                    Some(Rc::as_ptr(&state).cast()),
                 )?
             }
         };
@@ -473,6 +715,8 @@ impl Dock {
             state,
             hooks: Vec::new(),
             secondary: Vec::new(),
+            topbars: Vec::new(),
+            topbar_space: None,
         };
         // The flyout and tooltips are owned by the dock, so they stay above it.
         let popup = WNDCLASSEXW {
@@ -498,6 +742,10 @@ impl Dock {
                 WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
                 w!("Wisp Dock windows"),
             ),
+            (
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT | WS_EX_LAYERED,
+                w!("Wisp Window preview"),
+            ),
         ] {
             let window = unsafe {
                 CreateWindowExW(
@@ -512,7 +760,7 @@ impl Dock {
                     Some(hwnd),
                     None,
                     Some(instance.into()),
-                    Some((&raw mut *dock.state).cast()),
+                    Some(Rc::as_ptr(&dock.state).cast()),
                 )?
             };
             let mut s = dock.state.borrow_mut();
@@ -520,8 +768,10 @@ impl Dock {
                 s.flyout = window;
             } else if s.tip.is_invalid() {
                 s.tip = window;
-            } else {
+            } else if s.windows.is_invalid() {
                 s.windows = window;
+            } else {
+                s.zoom = window;
             }
         }
         DOCK_WINDOWS.with_borrow_mut(|docks| docks.push(hwnd));
@@ -554,7 +804,7 @@ impl Dock {
         if primary {
             dock.state.borrow().data.tray_anchor.set(hwnd);
         }
-        dock.apply_theme(true, Backdrop::Acrylic, "");
+        dock.apply_theme(true, Backdrop::Acrylic, "", Default::default());
         if !primary {
             dock.state.borrow_mut().sync_tray();
         }
@@ -567,13 +817,17 @@ impl Dock {
         if self.shared {
             return Ok(());
         }
+        let previous: Vec<_> = std::iter::once(&*self)
+            .chain(&self.secondary)
+            .map(|dock| dock.state.borrow().monitor)
+            .collect();
         let main = primary_monitor();
         let mut monitors = Vec::new();
         unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), LPARAM(&raw mut monitors as isize)).ok()? };
-        let (owner, data) = {
+        let (owner, data, reveal_height) = {
             let mut state = self.state.borrow_mut();
             state.set_monitor(main);
-            (state.owner, state.data.clone())
+            (state.owner, state.data.clone(), state.reveal_height)
         };
         self.secondary.retain(|dock| {
             let monitor = dock.state.borrow().monitor;
@@ -581,9 +835,17 @@ impl Dock {
         });
         for monitor in monitors.into_iter().filter(|&monitor| monitor != main) {
             if !self.secondary.iter().any(|dock| dock.state.borrow().monitor == monitor) {
-                self.secondary
-                    .push(Self::create(owner, false, monitor, data.clone(), false)?);
+                let mut dock = Self::create(owner, false, monitor, data.clone(), false)?;
+                dock.set_reveal_height(reveal_height);
+                self.secondary.push(dock);
             }
+        }
+        let current: Vec<_> = std::iter::once(&*self)
+            .chain(&self.secondary)
+            .map(|dock| dock.state.borrow().monitor)
+            .collect();
+        if previous != current {
+            crate::logging::event("dock.monitors.changed", format_args!("count={}", current.len()));
         }
         let mut state = self.state.borrow_mut();
         if data.tray_anchor.get().is_invalid() {
@@ -622,7 +884,7 @@ impl Dock {
 
     pub fn owns_message(msg: u32, wp: WPARAM) -> bool {
         msg == WM_TIMER && (REFRESH_TIMER..=WINDOWS_HIDE_TIMER).contains(&wp.0)
-            || matches!(msg, WM_REFRESH | WM_TRAY_CHANGED)
+            || matches!(msg, WM_REFRESH | WM_TRAY_CHANGED | WM_SURFACE_MATERIAL)
     }
 
     pub fn mostly_visible(&self) -> bool {
@@ -676,7 +938,8 @@ impl Dock {
             if !IsWindowVisible(self.hwnd).as_bool() {
                 let height = rect.bottom - rect.top;
                 let layout_scale = logic::layout_scale(s.app_icon_size);
-                rect.top = s.top + height + (logic::margin(layout_scale) * s.dpi as f32 / 96.0).round() as i32;
+                rect.top =
+                    s.top + height + (logic::margin(layout_scale, s.remote) * s.dpi as f32 / 96.0).round() as i32;
                 rect.bottom = rect.top + height;
             }
             let _ = KillTimer(Some(self.hwnd), POLL_TIMER);
@@ -754,6 +1017,61 @@ impl Dock {
         }
     }
 
+    pub fn set_remote(&mut self, remote: bool) {
+        for dock in &mut self.secondary {
+            dock.set_remote(remote);
+        }
+        if self.state.borrow().remote == remote {
+            return;
+        }
+        let material = self.state.borrow_mut().flyout_material.take();
+        if let Some(host) = &material {
+            host.hide();
+        }
+        self.state.borrow_mut().flyout_material = material;
+        let mut s = self.state.borrow_mut();
+        if s.remote == remote {
+            return;
+        }
+        s.close_flyout();
+        if s.remote {
+            // ULW and native alpha must never share an uncleared layered style.
+            unsafe {
+                let style = GetWindowLongPtrW(s.flyout, GWL_EXSTYLE);
+                SetWindowLongPtrW(s.flyout, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+            }
+            s.flyout_renderer.discard_popup_surface();
+        }
+        s.remote = remote;
+        s.material_version = s.material_version.wrapping_add(1);
+        let _ = unsafe { PostMessageW(Some(s.hwnd), WM_SURFACE_MATERIAL, WPARAM(0), LPARAM(0)) };
+        if remote {
+            s.flyout_palette = crate::theme::apply_layered_surface(
+                s.flyout,
+                s.dark,
+                s.backdrop,
+                &s.backdrop_color,
+                s.material_options,
+            );
+        } else {
+            s.flyout_palette = crate::theme::apply_backdrop(
+                s.flyout,
+                s.dark,
+                s.backdrop,
+                true,
+                &s.backdrop_color,
+                s.material_options,
+            );
+        }
+        s.hover_part = None;
+        s.close_sound();
+        s.hide_tip();
+        s.place();
+        unsafe {
+            let _ = InvalidateRect(Some(s.hwnd), None, false);
+        }
+    }
+
     pub fn set_animation(&mut self, open_ms: u32, close_ms: u32, animation: DockAnimation) {
         for dock in &mut self.secondary {
             dock.set_animation(open_ms, close_ms, animation);
@@ -765,44 +1083,189 @@ impl Dock {
     }
 
     pub fn sound_window(&self, id: usize) -> Option<HWND> {
-        std::iter::once(self).chain(&self.secondary).find_map(|dock| {
-            let state = dock.state.borrow();
-            (state.sound.0 as usize == id && state.sound_open()).then_some(state.sound)
+        self.topbars.iter().find_map(|bar| bar.panel(id)).or_else(|| {
+            std::iter::once(self).chain(&self.secondary).find_map(|dock| {
+                let state = dock.state.borrow();
+                (state.sound.0 as usize == id && state.sound_open()).then_some(state.sound)
+            })
         })
     }
 
     pub fn update_control_hardware(&self, hardware: crate::commands::control::Hardware) {
+        for bar in &self.topbars {
+            bar.update_hardware(hardware.clone());
+        }
         for dock in &self.secondary {
             dock.update_control_hardware(hardware.clone());
         }
-        let mut s = self.state.borrow_mut();
-        if s.sound_open() {
-            sound::update_hardware(s.sound, hardware.clone());
-        }
-        s.sound_hardware = hardware;
+        let panel_hardware = hardware.clone();
+        unborrowed_action(
+            &self.state,
+            |s| {
+                s.sound_hardware = hardware;
+                s.sound_identity.map(|id| PanelTarget {
+                    id,
+                    epoch: s.sound_epoch,
+                    material_version: s.material_version,
+                })
+            },
+            |target| {
+                if let Some(target) = target.filter(|target| dock_panel_current(&self.state, *target)) {
+                    sound::update_hardware(target.id.hwnd, panel_hardware);
+                }
+            },
+        );
     }
 
+    pub fn confirm_wifi(&self, on: bool) {
+        for bar in &self.topbars {
+            bar.confirm_wifi(on);
+        }
+        for dock in &self.secondary {
+            dock.confirm_wifi(on);
+        }
+        let target = {
+            let s = self.state.borrow();
+            s.sound_identity.map(|id| PanelTarget {
+                id,
+                epoch: s.sound_epoch,
+                material_version: s.material_version,
+            })
+        };
+        if let Some(target) = target.filter(|target| dock_panel_current(&self.state, *target)) {
+            sound::confirm_wifi(target.id.hwnd, on);
+        }
+    }
     pub fn update_sound(&self, state: &crate::commands::State) {
+        for bar in &self.topbars {
+            bar.update_commands(state);
+        }
         for dock in &self.secondary {
             dock.update_sound(state);
         }
-        let mut s = self.state.borrow_mut();
-        if s.sound_open() {
-            sound::update(s.sound, state);
-            sound::update_hardware(s.sound, s.sound_hardware.clone());
-        }
-        s.sound_state.clone_from(state);
+        unborrowed_action(
+            &self.state,
+            |s| {
+                s.sound_state.clone_from(state);
+                s.sound_identity.map(|id| PanelTarget {
+                    id,
+                    epoch: s.sound_epoch,
+                    material_version: s.material_version,
+                })
+            },
+            |target| {
+                if let Some(target) = target.filter(|target| dock_panel_current(&self.state, *target)) {
+                    sound::update(target.id.hwnd, state);
+                    if dock_panel_current(&self.state, target) {
+                        let hardware = self.state.borrow().sound_hardware.clone();
+                        sound::update_hardware(target.id.hwnd, hardware);
+                    }
+                }
+            },
+        );
     }
 
     pub fn refresh(&mut self) {
         self.state.borrow_mut().refresh();
     }
 
-    pub fn apply_theme(&mut self, dark: bool, backdrop: Backdrop, color: &str) {
-        for dock in &mut self.secondary {
-            dock.apply_theme(dark, backdrop, color);
+    pub fn set_topbar(&mut self, config: &crate::config::Config) -> Result<()> {
+        self.state.borrow().data.dock_enabled.set(config.dock);
+        let options = topbar::Options::from_config(config);
+        let displays = topbar::displays()
+            .into_iter()
+            .filter(|d| config.topbar && topbar::model::selected(&options.monitors, &d.id, d.primary))
+            .collect::<Vec<_>>();
+        self.topbars
+            .retain(|bar| displays.iter().any(|d| d.handle == bar.monitor()));
+        let (owner, data) = {
+            let s = self.state.borrow();
+            (s.owner, s.data.clone())
+        };
+        let mut failure = None;
+        for display in &displays {
+            if !self.topbars.iter().any(|bar| bar.monitor() == display.handle) {
+                match topbar::Bar::new(owner, display, data.clone(), options.clone()) {
+                    Ok(bar) => self.topbars.push(bar),
+                    Err(error) => failure = Some(error),
+                }
+            }
         }
-        self.state.borrow_mut().apply_material(dark, backdrop, color);
+        for (i, bar) in self.topbars.iter().enumerate() {
+            bar.configure(options.clone(), i == 0);
+        }
+        let targets = displays
+            .iter()
+            .filter(|d| self.topbars.iter().any(|bar| bar.monitor() == d.handle))
+            .map(|d| (d.id.clone(), options.height as f32))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            let material = self.state.borrow_mut().flyout_material.take();
+            drop(material);
+            self.topbar_space = None;
+        } else if let Some(space) = &self.topbar_space {
+            space.set_targets(targets);
+        } else {
+            match topbar_space::TopbarSpace::new(targets) {
+                Ok(space) => self.topbar_space = Some(space),
+                Err(error) => failure = Some(error),
+            }
+        }
+        *data.topbar_strips.borrow_mut() = self.topbar_space.as_ref().map(|space| space.strips());
+        data.topbar_status.set(!self.topbars.is_empty());
+        data.tray_anchor
+            .set(self.topbars.first().map_or(self.hwnd, |bar| HWND(bar.id() as _)));
+        for dock in std::iter::once(&*self).chain(&self.secondary) {
+            let mut s = dock.state.borrow_mut();
+            s.close_flyout();
+            s.close_sound();
+            s.place();
+            let _ = unsafe { InvalidateRect(Some(s.hwnd), None, false) };
+        }
+        if let Some(error) = failure { Err(error) } else { Ok(()) }
+    }
+
+    pub fn set_media_exclusions(&mut self, exclusions: &[String]) {
+        for bar in &self.topbars {
+            bar.set_media_exclusions(exclusions);
+        }
+    }
+    pub fn topbar_active(&self) -> bool {
+        !self.topbars.is_empty()
+    }
+    pub fn topbar_matches(&self, id: usize) -> bool {
+        self.topbars.iter().any(|bar| bar.id() == id)
+    }
+    pub fn topbar_polling(&self, id: usize) -> bool {
+        self.topbar_matches(id) && self.topbars.iter().any(|bar| bar.visible())
+    }
+    pub fn update_topbar_status(
+        &self,
+        audio: Option<crate::commands::audio::State>,
+        wifi: Option<crate::commands::wifi::State>,
+    ) {
+        for bar in &self.topbars {
+            bar.update_status(audio.clone(), wifi.clone());
+        }
+    }
+    pub fn update_topbar(&self, id: usize, track: Option<crate::commands::media::NotchTrack>) {
+        if self.topbar_matches(id) {
+            for bar in &self.topbars {
+                bar.update_track(track.clone());
+            }
+        }
+    }
+    pub fn take_topbar_action(&self, id: usize) -> Option<crate::commands::Command> {
+        self.topbars.iter().find(|bar| bar.id() == id)?.take_action()
+    }
+
+    pub fn apply_theme(&mut self, dark: bool, backdrop: Backdrop, color: &str, options: crate::theme::MaterialOptions) {
+        let material = self.state.borrow_mut().flyout_material.take();
+        drop(material);
+        for dock in &mut self.secondary {
+            dock.apply_theme(dark, backdrop, color, options);
+        }
+        self.state.borrow_mut().apply_material(dark, backdrop, color, options);
     }
 
     /// Hosts the notification area in the dock while `enabled`, which
@@ -871,7 +1334,7 @@ impl Dock {
                 s.reveal();
             }
         } else if s.autohide
-            && !s.smart_hide
+            && !s.smart_clear()
             && s.revealed
             && !s.held
             && !s.flyout_open
@@ -881,6 +1344,7 @@ impl Dock {
             let slack = (12 * s.dpi / 96) as i32;
             let mut cursor = POINT::default();
             if unsafe { GetCursorPos(&mut cursor) }.is_ok()
+                && !s.over_bottom_strip(cursor)
                 && (cursor.x < s.left - slack || cursor.x >= s.left + s.width + slack || cursor.y < s.top - slack)
             {
                 s.hide_tip();
@@ -891,6 +1355,9 @@ impl Dock {
     }
 
     pub fn show(&mut self) {
+        if !self.state.borrow().data.dock_enabled.get() {
+            return;
+        }
         for dock in &mut self.secondary {
             dock.show();
         }
@@ -974,17 +1441,40 @@ impl Dock {
         }
     }
 
+    pub fn set_reveal_height(&mut self, physical_pixels: u32) {
+        for dock in &mut self.secondary {
+            dock.set_reveal_height(physical_pixels);
+        }
+        let mut state = self.state.borrow_mut();
+        let height = physical_pixels.clamp(1, 128);
+        if state.reveal_height != height {
+            state.reveal_height = height;
+            state.away = 0;
+        }
+    }
+
+    pub fn set_preview_current_monitor_only(&mut self, enabled: bool) {
+        for dock in &mut self.secondary {
+            dock.set_preview_current_monitor_only(enabled);
+        }
+        let mut s = self.state.borrow_mut();
+        if s.preview_current_monitor_only != enabled {
+            s.preview_current_monitor_only = enabled;
+            s.hide_windows();
+        }
+    }
+
     /// Whether the dock stays on screen instead of auto-hiding.
     pub fn stays_visible(&self) -> bool {
         !self.state.borrow().autohide
     }
 
     /// The room a dock that stays visible keeps at the bottom of the primary
-    /// screen, in DIPs: its height and the margins above and below it.
+    /// screen, in DIPs: its height plus external margins outside Remote mode.
     pub fn reserved_height(&self) -> f32 {
         let s = self.state.borrow();
         let scale = logic::layout_scale(s.app_icon_size);
-        logic::height(scale) + 2.0 * logic::margin(scale)
+        logic::reserved_height(scale, s.remote)
     }
 
     /// Hides the dock until `show`, such as while the launcher is open.
@@ -1010,6 +1500,8 @@ impl Dock {
 
 impl Drop for Dock {
     fn drop(&mut self) {
+        self.topbar_space = None;
+        self.topbars.clear();
         self.secondary.clear();
         DOCK_WINDOWS.with_borrow_mut(|docks| docks.retain(|&hwnd| hwnd != self.hwnd));
         {
@@ -1030,11 +1522,14 @@ impl Drop for Dock {
             let _ = KillTimer(Some(self.hwnd), DESKTOP_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
+            let _ = KillTimer(Some(self.hwnd), PREVIEW_ZOOM_TIMER);
             // Remove the pointer before synchronous destruction can reenter the wndproc.
             let mut s = self.state.borrow_mut();
+            s.alive = false;
             s.close_sound();
             s.clear_preview();
-            for hwnd in [s.flyout, s.tip, s.windows, self.hwnd] {
+            s.hide_zoom();
+            for hwnd in [s.flyout, s.tip, s.windows, s.zoom, self.hwnd] {
                 if !hwnd.is_invalid() {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
@@ -1045,6 +1540,7 @@ impl Drop for Dock {
                 let _ = DestroyWindow(self.state.borrow().flyout);
                 let _ = DestroyWindow(self.state.borrow().tip);
                 let _ = DestroyWindow(self.state.borrow().windows);
+                let _ = DestroyWindow(self.state.borrow().zoom);
             } else {
                 let _ = DestroyWindow(self.hwnd);
             }
@@ -1104,16 +1600,26 @@ impl State {
         }
     }
 
-    fn apply_material(&mut self, dark: bool, backdrop: Backdrop, color: &str) {
+    fn apply_material(&mut self, dark: bool, backdrop: Backdrop, color: &str, options: crate::theme::MaterialOptions) {
+        self.material_version = self.material_version.wrapping_add(1);
+        self.flyout_prepared = false;
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_SURFACE_MATERIAL, WPARAM(0), LPARAM(0)) };
+        self.material_options = options;
         self.backdrop = backdrop;
         self.backdrop_color = color.to_owned();
         self.dark = dark;
-        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true, color);
-        if self.sound_open() {
-            sound::apply_theme(self.sound, dark, backdrop, color);
-        }
-        for hwnd in [self.flyout, self.tip, self.windows] {
-            crate::theme::apply_backdrop(hwnd, dark, backdrop, true, color);
+        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true, color, options);
+        for (hwnd, palette) in [
+            (self.flyout, &mut self.flyout_palette),
+            (self.tip, &mut self.tip_palette),
+            (self.windows, &mut self.windows_palette),
+            (self.zoom, &mut self.zoom_palette),
+        ] {
+            *palette = if hwnd == self.flyout && self.remote {
+                crate::theme::apply_layered_surface(hwnd, dark, backdrop, color, options)
+            } else {
+                crate::theme::apply_backdrop(hwnd, dark, backdrop, true, color, options)
+            };
             unsafe {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
@@ -1121,12 +1627,12 @@ impl State {
     }
 
     fn refresh(&mut self) {
-        if self.suspended {
+        if self.suspended || !self.data.dock_enabled.get() {
             return;
         }
-        // Edge auto-hide can catch up on reveal. Smart auto-hide needs a
-        // current resting rectangle to know when the dock fits again.
-        if self.visible && !self.revealed && self.slide.is_none() && !self.held && !self.smart_hide {
+        // Pointer auto-hide can catch up on reveal. Smart mode also uses this
+        // path while the focused app is maximized on this display.
+        if self.visible && !self.revealed && self.slide.is_none() && !self.held && !self.smart_clear() {
             unsafe {
                 if IsWindowVisible(self.hwnd).as_bool() {
                     let _ = ShowWindow(self.hwnd, SW_HIDE);
@@ -1143,6 +1649,7 @@ impl State {
                 .unwrap_or_else(|| {
                     let id = aumid.filter(|s| !s.is_empty()).unwrap_or_else(|| window.exe.clone());
                     AppEntry {
+                        desktop: None,
                         name: open_windows::program_name(&window.exe).into(),
                         id,
                         path: (!window.exe.is_empty()).then(|| window.exe.clone()),
@@ -1191,7 +1698,7 @@ impl State {
         let previous = self
             .windows_slot
             .and_then(|slot| self.item_at(slot))
-            .map(|item| (item.app.id.clone(), item.windows.clone()));
+            .map(|item| item.app.id.clone());
         pinned.extend(logic::stable_order(
             std::mem::take(&mut self.items),
             items,
@@ -1200,17 +1707,20 @@ impl State {
         self.items = pinned;
         let mut previews_changed = false;
         if let Some(slot) = self.windows_slot {
-            let same_app = self.item_at(slot).zip(previous.as_ref()).filter(|(item, (id, _))| {
+            let same_app = self.item_at(slot).zip(previous.as_ref()).filter(|(item, id)| {
+                let count = self.preview_windows(item).len();
                 id.eq_ignore_ascii_case(&item.app.id)
-                    && !item.windows.is_empty()
-                    && (self.windows_clicked || logic::show_window_list(self.window_list_mode, item.windows.len()))
+                    && count > 0
+                    && (self.windows_clicked || logic::show_window_list(self.window_list_mode, count))
             });
-            if let Some((item, (_, windows))) = same_app {
+            if let Some((item, _)) = same_app {
+                let candidates = self.preview_windows(item);
                 previews_changed = !self.windows_rows.is_empty()
-                    && (windows.len() != item.windows.len()
-                        || windows
+                    && (self.windows_order.len() != candidates.len()
+                        || self
+                            .windows_order
                             .iter()
-                            .any(|old| !item.windows.iter().any(|new| old.hwnd == new.hwnd)));
+                            .any(|old| !candidates.iter().any(|new| *old == new.hwnd)));
             } else {
                 self.hide_windows();
             }
@@ -1261,7 +1771,17 @@ impl State {
     }
 
     fn poll(&mut self) {
+        if !self.data.dock_enabled.get() || !self.visible || self.suspended {
+            return;
+        }
         let _span = crate::util::perf::Span::new("dock_poll");
+        if let Some((source, expected_pid)) = self.zoom_source {
+            let mut pid = 0;
+            unsafe { GetWindowThreadProcessId(HWND(source as _), Some(&mut pid)) };
+            if pid != expected_pid || !unsafe { IsWindowVisible(HWND(source as _)) }.as_bool() {
+                self.hide_zoom();
+            }
+        }
         let mut cursor = POINT::default();
         if unsafe { GetCursorPos(&mut cursor) }.is_err() {
             return;
@@ -1270,18 +1790,22 @@ impl State {
         if !tray_busy && self.tray_interaction.take().is_some() {
             self.restore_tray_order();
         }
-        if self.sample_fullscreen() {
+        let focused = focused_surface();
+        if self.sample_fullscreen_for(focused.as_ref()) {
             if self.revealed || self.slide.is_some() {
                 self.hide_for_fullscreen();
             }
             return;
         }
-        let smart_clear = self.smart_hide && !self.smart_overlap();
+        // Actual fullscreen keeps its hard suppression above. Maximized apps
+        // instead use pointer auto-hide, including the normal bottom reveal.
+        let smart_clear = self.smart_hide && !focused_maximized_on(focused.as_ref(), self.monitor);
+        let (in_reveal_strip, in_bottom_strip) = self.bottom_strips(cursor);
         if !self.revealed {
-            let at_edge = self.autohide
-                && at_bottom_edge(cursor, self.monitor)
-                && unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) >= 0 && GetAsyncKeyState(VK_RBUTTON.0 as i32) >= 0 };
-            if !self.autohide || smart_clear || at_edge {
+            let mouse_held =
+                unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 || GetAsyncKeyState(VK_RBUTTON.0 as i32) < 0 };
+            let reveal_from_strip = self.autohide && logic::reveal_from_hover_strip(in_reveal_strip, mouse_held);
+            if !self.autohide || smart_clear || reveal_from_strip {
                 self.reveal();
             }
             return;
@@ -1306,42 +1830,57 @@ impl State {
             let inside =
                 |r: &RECT| cursor.x >= r.left && cursor.x < r.right && cursor.y >= r.top && cursor.y < r.bottom;
             if pressed && !inside(&flyout) && !inside(&rect) {
-                self.close_flyout();
+                self.dismiss_flyout();
             }
         }
         let slack = (12 * self.dpi / 96) as i32;
         // The gap below the dock counts as on it, so the pointer can rest on the edge.
         // The dock stays while its flyout is open.
         let over_windows = self.over_preview(cursor);
-        let near = !self.autohide
-            || smart_clear
-            || self.start_open
+        let interacting = self.start_open
+            || self.native_menu_open
             || tray_busy
             || self.sound_open()
             || self.held
             || self.flyout_open
             || self.app_press.is_some()
-            || over_windows
-            || cursor.x >= rect.left - slack
-                && cursor.x < rect.right + slack
-                && cursor.y >= rect.top - slack
-                && cursor.y < rect.bottom + slack;
-        if near {
-            self.away = 0;
-        } else {
-            self.away += 1;
-            if self.away >= HIDE_AFTER {
-                self.hide_tip();
-                self.hide_windows();
-                self.revealed = false;
-                self.start_slide(1.0);
-                return;
-            }
+            || over_windows;
+        let pointer_near = cursor.x >= rect.left - slack
+            && cursor.x < rect.right + slack
+            && cursor.y >= rect.top - slack
+            && cursor.y < rect.bottom + slack;
+        let near = hover_keeps_dock_visible(!self.autohide, smart_clear, in_bottom_strip, interacting, pointer_near);
+        self.away = logic::hover_away_polls(self.away, near);
+        if self.away >= HIDE_AFTER {
+            self.hide_tip();
+            self.hide_windows();
+            self.revealed = false;
+            self.start_slide(1.0);
+            return;
         }
         // Polling also catches volume changes from keys and other apps.
         if self.status_read_at.elapsed() >= Duration::from_millis(750) {
             self.update_status();
         }
+    }
+
+    fn over_bottom_strip(&self, cursor: POINT) -> bool {
+        self.bottom_strips(cursor).1
+    }
+
+    fn bottom_strips(&self, cursor: POINT) -> (bool, bool) {
+        monitor_info(self.monitor).map_or((false, false), |info| {
+            let monitor = info.rcMonitor;
+            let bounds = (monitor.left, monitor.top, monitor.right, monitor.bottom);
+            logic::bottom_hover_zones(
+                (cursor.x, cursor.y),
+                bounds,
+                self.dpi,
+                self.app_icon_size,
+                self.reveal_height,
+                self.remote,
+            )
+        })
     }
 
     /// Shows the dock, or reverses an outgoing slide at its current position.
@@ -1356,13 +1895,17 @@ impl State {
         self.refresh();
     }
 
+    fn sampled_slide(&self) -> crate::animation::Motion {
+        let mut motion = self.slide_motion;
+        if let Some(start) = self.slide {
+            motion.tick(start.elapsed().as_secs_f32() / crate::util::perf::slowdown());
+        } else {
+            motion = crate::animation::Motion::at(1. - self.slide_to);
+        }
+        motion
+    }
     fn slide_value(&self) -> f32 {
-        let Some(start) = self.slide else { return self.slide_to };
-        logic::slide_value(
-            self.slide_from,
-            self.slide_to,
-            start.elapsed().as_secs_f32() * 1000.0 / crate::util::perf::slowdown() / self.slide_ms as f32,
-        )
+        1. - self.sampled_slide().value
     }
 
     fn start_slide(&mut self, to: f32) {
@@ -1370,10 +1913,13 @@ impl State {
             self.hide_windows();
         }
         crate::util::perf::event("slide_begin");
-        self.slide_from = self.slide_value();
+        self.slide_motion = self.sampled_slide();
         self.slide_to = to;
         self.slide_ms = if to > 0.5 { self.close_ms } else { self.open_ms };
-        self.slide = (self.slide_ms > 0 && client_animations_enabled()).then(Instant::now);
+        let animate = self.slide_ms > 0 && client_animations_enabled();
+        self.slide_motion
+            .retarget_duration(to < 0.5, if animate { self.slide_ms } else { 0 });
+        self.slide = self.slide_motion.active().then(Instant::now);
         if self.slide.is_none() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
@@ -1387,14 +1933,27 @@ impl State {
         self.apply_slide();
         if !self.frame_paced {
             unsafe {
-                SetTimer(Some(self.hwnd), SLIDE_TIMER, 10, None);
+                if SetTimer(
+                    Some(self.hwnd),
+                    SLIDE_TIMER,
+                    crate::animation::interval(self.remote),
+                    None,
+                ) == 0
+                {
+                    self.slide_motion.settle();
+                    self.slide = None;
+                    self.apply_slide();
+                    if !self.revealed {
+                        let _ = ShowWindow(self.hwnd, SW_HIDE);
+                    }
+                }
             }
         }
     }
 
     fn stop_slide(&mut self) {
         self.slide = None;
-        self.slide_from = 0.0;
+        self.slide_motion = crate::animation::Motion::at(1.);
         self.slide_to = 0.0;
         self.set_slide_alpha(255);
         unsafe {
@@ -1406,7 +1965,8 @@ impl State {
         let distance = match self.animation {
             DockAnimation::Slide => {
                 height
-                    + (logic::margin(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32
+                    + (logic::margin(logic::layout_scale(self.app_icon_size), self.remote) * self.dpi as f32 / 96.0)
+                        .round() as i32
             }
             DockAnimation::RiseFade => (12.0 * self.dpi as f32 / 96.0).round() as i32,
             DockAnimation::Fade | DockAnimation::ScaleFade => 0,
@@ -1483,7 +2043,8 @@ impl State {
         crate::util::perf::event("slide_frame");
         let tick = Instant::now();
         let elapsed = self.slide.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
-        let finished = elapsed / f64::from(crate::util::perf::slowdown()) >= f64::from(self.slide_ms);
+        let sampled = self.sampled_slide();
+        let finished = !sampled.active();
         if finished {
             self.slide = None;
         }
@@ -1498,7 +2059,7 @@ impl State {
             }
         }
         if crate::util::perf::hook_on("WISP_FRAME_TIMING") {
-            eprintln!(
+            std::eprintln!(
                 "slide frame timestamp_ms={elapsed:.3} work_ms={:.3}",
                 tick.elapsed().as_secs_f64() * 1000.0
             );
@@ -1561,23 +2122,14 @@ impl State {
         }
     }
 
-    fn smart_overlap(&self) -> bool {
-        let rect = RECT {
-            left: self.left,
-            top: self.top,
-            right: self.left + self.width,
-            bottom: self.top
-                + (logic::height(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.).round() as i32,
-        };
-        self.data
-            .surfaces()
-            .iter()
-            .any(|window| window.has_title && overlaps(window.bounds, rect))
+    fn sample_fullscreen(&mut self) -> bool {
+        let focused = focused_surface();
+        self.sample_fullscreen_for(focused.as_ref())
     }
 
-    fn sample_fullscreen(&mut self) -> bool {
-        let fullscreen = monitor_info(self.monitor)
-            .is_some_and(|info| fullscreen_on(&self.data.surfaces(), info.rcMonitor, info.rcWork));
+    fn sample_fullscreen_for(&mut self, focused: Option<&SurfaceWindow>) -> bool {
+        let fullscreen =
+            monitor_info(self.monitor).is_some_and(|info| focused_fullscreen_on(focused, info.rcMonitor, info.rcWork));
         if fullscreen {
             self.fullscreen = true;
             self.fullscreen_clear_since = None;
@@ -1589,6 +2141,10 @@ impl State {
             }
         }
         self.fullscreen
+    }
+
+    fn smart_clear(&self) -> bool {
+        self.smart_hide && !focused_maximized_on(focused_surface().as_ref(), self.monitor)
     }
 
     fn move_tray_anchor_after_hide(&self) {
@@ -1634,12 +2190,8 @@ impl State {
             if !GetMonitorInfoW(monitor, &mut info).as_bool() {
                 return;
             }
-            // A tray callback may open a menu while the dock is relaid out.
-            let order = if self.tray_interaction.is_some() {
-                SWP_NOZORDER
-            } else {
-                SET_WINDOW_POS_FLAGS(0)
-            };
+            // Modal menu loops keep delivering periodic layout/status updates.
+            let order = dock_menu_order(self.native_menu_open, self.tray_interaction.is_some());
             // Move first, then query the window's new monitor DPI. Skipped on the
             // same monitor, where the jump would show.
             if MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) != monitor {
@@ -1694,7 +2246,7 @@ impl State {
             let width = (logic::total_width_scaled(running, &parts, layout_scale) * scale).ceil() as i32;
             let height = (logic::height(layout_scale) * scale).round() as i32;
             let x = info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width) / 2;
-            self.top = info.rcMonitor.bottom - height - (logic::margin(layout_scale) * scale).round() as i32;
+            self.top = logic::resting_top(info.rcMonitor.bottom, self.dpi, self.app_icon_size, self.remote);
             self.left = x;
             self.width = width;
             let factor = self.animation_scale();
@@ -1722,6 +2274,13 @@ impl State {
                 self.hide_windows();
             }
         }
+        if let Some(id) = self.sound_identity {
+            if let Some(anchor) = self.part_rect(logic::Part::Volume) {
+                sound::update_opener(id, anchor);
+            } else {
+                self.close_sound();
+            }
+        }
         // The chevron and icons move whenever the dock's width changes.
         if self.flyout_open {
             self.layout_flyout();
@@ -1734,8 +2293,13 @@ impl State {
 
     /// The status parts, with the notification area while the dock hosts it.
     fn parts(&self) -> Vec<logic::Part> {
-        self.status
-            .parts(self.data.tray.borrow().as_ref().map(|_| self.inline.len()))
+        if self.data.topbar_status.get() {
+            return Vec::new();
+        }
+        let parts = self
+            .status
+            .parts(self.data.tray.borrow().as_ref().map(|_| self.inline.len()));
+        if self.remote { logic::remote_parts(parts) } else { parts }
     }
 
     /// A part's rectangle on screen where the dock rests, in physical pixels.
@@ -1886,8 +2450,8 @@ impl State {
     }
 
     fn toggle_flyout(&mut self) {
-        if self.flyout_open {
-            self.close_flyout();
+        if self.flyout_open && self.flyout_exit.is_none() {
+            self.dismiss_flyout();
         } else {
             self.open_flyout();
         }
@@ -1900,11 +2464,50 @@ impl State {
         }
         self.hide_tip();
         self.hide_windows();
+        let reverse = self.flyout_exit.take().map(PopupFade::sample);
         self.flyout_open = true;
+        self.flyout_prepared = false;
         self.flyout_hover = None;
         self.layout_flyout();
-        if !self.held {
+        if self.remote {
+            self.remote_flyout_fade = RemotePopupFade::new(self.open_ms, !self.held && client_animations_enabled());
+            if let Some(motion) = reverse
+                && self.remote_flyout_fade.is_some()
+            {
+                self.remote_flyout_fade = Some(PopupFade::from_motion(motion, true, self.open_ms.min(120)));
+            }
+            unsafe {
+                let style = GetWindowLongPtrW(self.flyout, GWL_EXSTYLE);
+                if style & WS_EX_LAYERED.0 as isize == 0 {
+                    SetWindowLongPtrW(self.flyout, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+                }
+            }
+            if let Err(error) = self.present_remote_flyout(false) {
+                crate::logging::event("tray.remote.prepare.failed", format_args!("error={error}"));
+                self.close_flyout();
+                return;
+            }
+            if self.remote_flyout_fade.is_some()
+                && unsafe { SetTimer(Some(self.flyout), POPUP_FADE_TIMER, RemotePopupFade::INTERVAL, None) } == 0
+            {
+                self.remote_flyout_fade = None;
+                if let Err(error) = self.present_remote_flyout(true) {
+                    crate::logging::event("tray.remote.present.failed", format_args!("error={error}"));
+                    self.close_flyout();
+                    return;
+                }
+            }
+        } else if !self.held {
             self.flyout_fade = start_popup_fade(self.flyout, self.open_ms);
+            if let Some(motion) = reverse
+                && self.flyout_fade.is_some()
+            {
+                let fade = PopupFade::from_motion(motion, true, self.open_ms);
+                unsafe {
+                    let _ = SetLayeredWindowAttributes(self.flyout, COLORREF(0), fade.alpha(), LWA_ALPHA);
+                }
+                self.flyout_fade = Some(fade);
+            }
         }
         unsafe {
             let _ = ShowWindow(self.flyout, SW_SHOWNA);
@@ -1918,8 +2521,41 @@ impl State {
         self.publish_rects();
     }
 
+    fn present_remote_flyout(&mut self, cached: bool) -> Result<()> {
+        self.flyout_prepared = false;
+        let alpha = self
+            .flyout_exit
+            .or(self.remote_flyout_fade)
+            .map_or(255, PopupFade::alpha);
+        if cached
+            && self.flyout_renderer.cached_popup_matches(self.flyout, self.dpi)?
+            && !unsafe { GetUpdateRect(self.flyout, None, false) }.as_bool()
+        {
+            let result = self.flyout_renderer.present_cached_popup(self.flyout, self.dpi, alpha);
+            self.flyout_prepared = result.is_ok();
+            return result;
+        }
+        self.flyout_renderer.draw_remote_flyout(
+            self.flyout,
+            &render::FlyoutFrame {
+                dpi: self.dpi,
+                palette: &self.flyout_palette,
+                tray: &self.tray,
+                hover: self.flyout_hover,
+            },
+            alpha,
+        )?;
+        // This complete frame includes any pending invalidation on the UI thread.
+        unsafe {
+            let _ = ValidateRect(Some(self.flyout), None);
+        }
+        self.flyout_prepared = true;
+        Ok(())
+    }
+
     /// Sizes the flyout to its icons and centers it above the chevron.
     fn layout_flyout(&mut self) {
+        self.flyout_prepared = false;
         let scale = self.dpi as f32 / 96.0;
         let (width, height) = logic::flyout_size(self.tray.len());
         let (width, height) = ((width * scale).round() as i32, (height * scale).round() as i32);
@@ -1945,12 +2581,60 @@ impl State {
         }
     }
 
+    fn dismiss_flyout(&mut self) {
+        if !self.flyout_open || self.flyout_exit.is_some() {
+            return;
+        }
+        let ms = if self.remote {
+            self.close_ms.min(100)
+        } else {
+            self.close_ms
+        };
+        if ms == 0 || self.held || !client_animations_enabled() {
+            self.close_flyout();
+            return;
+        }
+        let motion = self
+            .remote_flyout_fade
+            .or(self.flyout_fade)
+            .map_or(crate::animation::Motion::at(1.), PopupFade::sample);
+        let exit = PopupFade::from_motion(motion, false, ms);
+        self.flyout_fade = None;
+        self.remote_flyout_fade = None;
+        self.flyout_exit = Some(exit);
+        self.flyout_hover = None;
+        self.hide_tip();
+        unsafe {
+            let style = GetWindowLongPtrW(self.flyout, GWL_EXSTYLE);
+            if !self.remote {
+                SetWindowLongPtrW(self.flyout, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+            }
+            if SetTimer(
+                Some(self.flyout),
+                POPUP_FADE_TIMER,
+                crate::animation::interval(self.remote),
+                None,
+            ) == 0
+            {
+                self.close_flyout();
+            }
+        }
+    }
+
     fn close_flyout(&mut self) {
         if !self.flyout_open {
             return;
         }
         self.flyout_open = false;
+        let was_closing = self.flyout_exit.take().is_some();
+        self.flyout_prepared = false;
         self.flyout_hover = None;
+        if self.remote {
+            self.remote_flyout_fade = None;
+            unsafe {
+                let _ = KillTimer(Some(self.flyout), POPUP_FADE_TIMER);
+            }
+        }
         if matches!(self.tip_target, Some(tray::Tip::Flyout(_))) {
             self.hide_tip();
         }
@@ -1958,7 +2642,7 @@ impl State {
             let _ = ShowWindow(self.flyout, SW_HIDE);
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
-        if self.flyout_fade.take().is_some() {
+        if self.flyout_fade.take().is_some() || was_closing && !self.remote {
             finish_popup_fade(self.flyout);
         }
         self.publish_rects();
@@ -1989,6 +2673,18 @@ impl State {
         };
         self.hide_tip();
         let menu = matches!(action, Action::Menu);
+        if self.flyout_exit.is_some() {
+            return;
+        }
+        if menu && self.remote_flyout_fade.take().is_some() {
+            unsafe {
+                let _ = KillTimer(Some(self.flyout), POPUP_FADE_TIMER);
+            }
+            if let Err(error) = self.present_remote_flyout(true) {
+                crate::logging::event("tray.remote.present.failed", format_args!("error={error}"));
+                self.close_flyout();
+            }
+        }
         if menu && self.flyout_fade.take().is_some() {
             finish_popup_fade(self.flyout);
         }
@@ -2025,6 +2721,9 @@ impl State {
     }
 
     fn restore_tray_order(&self) {
+        if dock_menu_order(self.native_menu_open, self.tray_interaction.is_some()) == SWP_NOZORDER {
+            return;
+        }
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -2082,9 +2781,9 @@ impl State {
         }
         let slot = slot.filter(|&slot| {
             self.window_list_mode != WindowListMode::Off
-                && self
-                    .item_at(slot)
-                    .is_some_and(|item| logic::show_window_list(self.window_list_mode, item.windows.len()))
+                && self.item_at(slot).is_some_and(|item| {
+                    logic::show_window_list(self.window_list_mode, self.preview_windows(item).len())
+                })
         });
         if self.windows_slot == slot {
             return;
@@ -2103,6 +2802,12 @@ impl State {
     /// The item in a visible slot.
     fn item_at(&self, slot: usize) -> Option<&Item> {
         slot.checked_sub(1).and_then(|i| self.items.get(i + self.scroll))
+    }
+
+    fn preview_windows<'a>(&self, item: &'a Item) -> Vec<&'a Window> {
+        logic::preview_candidates(&item.windows, self.preview_current_monitor_only, |window| {
+            monitor_for_window(window.hwnd) == self.monitor
+        })
     }
 
     /// Hides the window list and forgets its windows.
@@ -2166,6 +2871,11 @@ impl State {
     }
 
     fn hide_windows(&mut self) {
+        self.hide_zoom();
+        self.windows_press = None;
+        if unsafe { GetCapture() } == self.windows {
+            let _ = unsafe { ReleaseCapture() };
+        }
         self.clear_preview();
         self.windows_slot = None;
         self.windows_clicked = false;
@@ -2174,10 +2884,148 @@ impl State {
         self.windows_rows.clear();
         self.windows_monitors.clear();
         self.windows_targets.clear();
+        self.windows_order.clear();
         unsafe {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
             let _ = KillTimer(Some(self.hwnd), WINDOWS_HIDE_TIMER);
             let _ = ShowWindow(self.windows, SW_HIDE);
+        }
+    }
+
+    fn preview_press(&self, lp: LPARAM, middle: bool) -> Option<logic::PreviewPress> {
+        let (row, close) = self.windows_hit(lp)?;
+        let hwnd = *self.windows_targets.get(row)?;
+        if self.preview_current_monitor_only && monitor_for_window(hwnd) != self.monitor {
+            return None;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(HWND(hwnd as _), Some(&mut pid)) };
+        (pid != 0).then_some(logic::PreviewPress {
+            hwnd,
+            pid,
+            close,
+            middle,
+        })
+    }
+
+    fn hide_zoom(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), PREVIEW_ZOOM_TIMER);
+            if let Some(thumbnail) = self.zoom_thumbnail.take() {
+                let _ = windows::Win32::Graphics::Dwm::DwmUnregisterThumbnail(thumbnail);
+            }
+            let _ = ShowWindow(self.zoom, SW_HIDE);
+        }
+        self.zoom_source = None;
+    }
+
+    /// A public DWM thumbnail, never a foreground/visibility change to the app.
+    fn show_zoom(&mut self) {
+        use windows::Win32::Graphics::Dwm::*;
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), PREVIEW_ZOOM_TIMER);
+        }
+        // Layered + transparent is the documented cross-process click-through
+        // contract. Use redirected painting; this window never calls ULW.
+        if unsafe { SetLayeredWindowAttributes(self.zoom, COLORREF(0), 255, LWA_ALPHA) }.is_err() {
+            self.hide_zoom();
+            return;
+        }
+        let Some((row, false)) = self.windows_hover else { return };
+        let Some(&source) = self.windows_targets.get(row) else {
+            return;
+        };
+        if self.preview_current_monitor_only && monitor_for_window(source) != self.monitor {
+            self.hide_zoom();
+            return;
+        }
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(HWND(source as _), Some(&mut pid)) };
+        if pid == 0 || self.fullscreen || self.suspended || !self.visible {
+            self.hide_zoom();
+            return;
+        }
+        self.hide_zoom();
+        let mut popup = RECT::default();
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            if GetWindowRect(self.windows, &mut popup).is_err() || !GetMonitorInfoW(self.monitor, &mut info).as_bool() {
+                return;
+            }
+        }
+        let scale = self.dpi as f32 / 96.;
+        let gap = (8. * scale).round() as i32;
+        let width = (560. * scale)
+            .round()
+            .min((info.rcWork.right - info.rcWork.left - 2 * gap) as f32) as i32;
+        let height = (340. * scale)
+            .round()
+            .min((popup.top - info.rcWork.top - 2 * gap) as f32) as i32;
+        if width < (120. * scale) as i32 || height < (100. * scale) as i32 {
+            return;
+        }
+        let x = ((popup.left + popup.right - width) / 2).clamp(info.rcWork.left + gap, info.rcWork.right - gap - width);
+        let Ok(thumbnail) = (unsafe { DwmRegisterThumbnail(self.zoom, HWND(source as _)) }) else {
+            return;
+        };
+        self.zoom_thumbnail = Some(thumbnail);
+        self.zoom_source = Some((source, pid));
+        self.zoom_title = self.windows_rows.get(row).cloned().unwrap_or_default();
+        unsafe {
+            let _ = SetWindowPos(
+                self.zoom,
+                Some(HWND_TOPMOST),
+                x,
+                popup.top - gap - height,
+                width,
+                height,
+                SWP_NOACTIVATE,
+            );
+            crate::theme::shape(self.zoom, width, height, 8., self.dpi);
+        }
+        let result = (|| -> Result<()> {
+            let size = unsafe { DwmQueryThumbnailSourceSize(thumbnail)? };
+            if size.cx <= 0 || size.cy <= 0 {
+                return Err(Error::from_thread());
+            }
+            let pad = (8. * scale).round() as i32;
+            let top = (36. * scale).round() as i32;
+            let factor = ((width - 2 * pad) as f32 / size.cx as f32).min((height - top - pad) as f32 / size.cy as f32);
+            let w = (size.cx as f32 * factor).round() as i32;
+            let h = (size.cy as f32 * factor).round() as i32;
+            let left = (width - w) / 2;
+            let top = top + (height - top - pad - h) / 2;
+            unsafe {
+                DwmUpdateThumbnailProperties(
+                    thumbnail,
+                    &DWM_THUMBNAIL_PROPERTIES {
+                        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY,
+                        rcDestination: RECT {
+                            left,
+                            top,
+                            right: left + w,
+                            bottom: top + h,
+                        },
+                        opacity: 255,
+                        fVisible: BOOL(1),
+                        ..Default::default()
+                    },
+                )?;
+            }
+            self.zoom_renderer
+                .draw_window_zoom(self.zoom, self.dpi, &self.zoom_palette, &self.zoom_title)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            self.hide_zoom();
+            return;
+        }
+        unsafe {
+            let _ = ShowWindow(self.zoom, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(self.zoom), None, false);
         }
     }
 
@@ -2219,7 +3067,13 @@ impl State {
         unsafe {
             let _ = KillTimer(Some(self.hwnd), WINDOWS_TIMER);
         }
-        if !self.visible || self.suspended || self.fullscreen || !self.revealed || self.slide_to > 0.5 {
+        if self.native_menu_open
+            || !self.visible
+            || self.suspended
+            || self.fullscreen
+            || !self.revealed
+            || self.slide_to > 0.5
+        {
             self.hide_windows();
             return;
         }
@@ -2228,22 +3082,21 @@ impl State {
             self.hide_windows();
             return;
         };
-        if !self.windows_clicked && !logic::show_window_list(self.window_list_mode, item.windows.len()) {
+        if !self.windows_clicked && !logic::show_window_list(self.window_list_mode, self.preview_windows(item).len()) {
             self.hide_windows();
             return;
         }
-        let mut windows: Vec<_> = item.windows.iter().collect();
+        let mut windows = self.preview_windows(item);
         if windows.len() > 1 {
             windows.sort_by_cached_key(|window| monitor_for_window(window.hwnd) != self.monitor);
         }
-        let rows: Vec<String> = windows
+        let current: Vec<_> = windows.iter().map(|window| window.hwnd).collect();
+        let targets = logic::preview_order(&self.windows_order, &current);
+        let rows: Vec<String> = targets
             .iter()
-            .map(|window| match window.title.trim() {
-                "" => item.app.name.clone(),
-                title => title.to_string(),
-            })
+            .filter_map(|target| windows.iter().find(|window| window.hwnd == *target))
+            .map(|window| logic::preview_title(&window.title, &window.exe, &item.app.name))
             .collect();
-        let targets: Vec<isize> = windows.iter().map(|window| window.hwnd).collect();
         if rows.is_empty() {
             self.hide_windows();
             return;
@@ -2265,10 +3118,7 @@ impl State {
                 self.hide_windows();
                 return;
             };
-            *row = match window.title.trim() {
-                "" => item.app.name.clone(),
-                title => title.to_string(),
-            };
+            *row = logic::preview_title(&window.title, &window.exe, &item.app.name);
         }
         let monitors: Vec<_> = self
             .windows_targets
@@ -2286,6 +3136,9 @@ impl State {
 
     /// Shows one page of thumbnails, keeping each card tied to its window handle.
     fn layout_windows(&mut self, slot: usize, rows: Vec<String>, targets: Vec<isize>) {
+        self.hide_zoom();
+        self.windows_press = None;
+        self.windows_order = targets.clone();
         let scale = self.dpi as f32 / 96.;
         let mut info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -2373,19 +3226,13 @@ impl State {
     /// Returns the card and whether its close button was hit.
     fn windows_hit(&self, lp: LPARAM) -> Option<(usize, bool)> {
         let scale = self.dpi as f32 / 96.;
-        let x = (lp.0 as i16) as f32 / scale - logic::PREVIEW_PAD;
-        let y = ((lp.0 >> 16) as i16) as f32 / scale - logic::PREVIEW_PAD;
-        if x < 0.
-            || !(0. ..logic::PREVIEW_HEADER + self.preview_height + self.monitor_caption_height()).contains(&y)
-            || self.preview_width <= 0.
-        {
-            return None;
-        }
-        let index = (x / self.preview_width) as usize;
-        (index < self.windows_targets.len()).then_some((
-            index,
-            y < logic::PREVIEW_HEADER && x % self.preview_width >= self.preview_width - 27.,
-        ))
+        logic::preview_hit(
+            (lp.0 as i16) as f32 / scale,
+            ((lp.0 >> 16) as i16) as f32 / scale,
+            self.preview_width,
+            self.preview_height + self.monitor_caption_height(),
+            self.windows_targets.len(),
+        )
     }
 
     fn hide_tip(&mut self) {
@@ -2400,6 +3247,9 @@ impl State {
 
     /// Shows the tooltip above what the pointer rests on.
     fn show_tip(&mut self) {
+        if self.native_menu_open {
+            return;
+        }
         unsafe {
             let _ = KillTimer(Some(self.hwnd), TIP_TIMER);
         }
@@ -2453,46 +3303,6 @@ impl State {
         }
     }
 
-    /// Offers the taskbar for icons the dock lacks, and Windows' settings
-    /// for which icons show in the dock.
-    fn chevron_menu(&mut self) {
-        self.close_flyout();
-        self.hide_tip();
-        self.hide_windows();
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-            let _ = AppendMenuW(menu, MF_STRING, 1, w!("Show taskbar"));
-            let _ = AppendMenuW(menu, MF_STRING, 2, w!("Taskbar settings"));
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            let _ = SetForegroundWindow(self.hwnd);
-            let command = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                None,
-                self.hwnd,
-                None,
-            )
-            .0;
-            let _ = DestroyMenu(menu);
-            match command {
-                1 => {
-                    let _ = PostMessageW(Some(self.owner), WM_DOCK_SHOW_TASKBAR, WPARAM(0), LPARAM(0));
-                }
-                2 => {
-                    if let Err(error) = crate::launch::open("ms-settings:taskbar") {
-                        eprintln!("Dock taskbar settings: {error}");
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
     fn hit(&self, lp: LPARAM) -> Option<usize> {
         let scale = self.dpi as f32 / 96.0 * self.animation_scale();
         let running = self.count();
@@ -2517,70 +3327,73 @@ impl State {
     }
 
     fn sound_open(&self) -> bool {
-        unsafe { IsWindowVisible(self.sound) }.as_bool()
+        self.sound_identity.is_some_and(sound::is_current)
     }
 
     fn close_sound(&mut self) {
-        if self.sound_open() {
-            let _ = unsafe { DestroyWindow(self.sound) };
+        self.sound_epoch = self.sound_epoch.wrapping_add(1);
+        if let Some(id) = self.sound_identity.take() {
+            sound::defer_destroy(id);
         }
         self.sound = HWND::default();
     }
 
-    fn open_sound(&mut self) {
-        if self.sound_open() {
-            self.close_sound();
-            return;
+    fn prepare_sound(&mut self) -> Option<(u64, sound::OpenRequest)> {
+        let was_open = self.sound_open();
+        self.close_sound();
+        if was_open {
+            return None;
         }
-        let Some(anchor) = self.part_rect(logic::Part::Volume) else {
-            return;
-        };
+        let anchor = self.part_rect(logic::Part::Volume)?;
         self.close_flyout();
         self.hide_tip();
         self.hide_windows();
-        match sound::open(
-            self.hwnd,
-            self.owner,
-            anchor,
-            self.dpi,
-            self.sound_state.clone(),
-            self.sound_hardware.clone(),
-            self.flyout_renderer.for_window(),
-            (self.dark, self.backdrop, &self.backdrop_color),
-            self.open_ms,
-        ) {
-            Ok(hwnd) => {
-                self.sound = hwnd;
-                let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
-                self.away = 0;
-            }
-            Err(error) => eprintln!("Dock Sound: {error}"),
-        }
+        Some((
+            self.sound_epoch,
+            sound::OpenRequest {
+                placement: sound::Placement {
+                    owner: self.hwnd,
+                    launcher: self.owner,
+                    anchor,
+                    dpi: self.dpi,
+                    entry: sound::Entry::Home,
+                    below: false,
+                },
+                state: self.sound_state.clone(),
+                hardware: self.sound_hardware.clone(),
+                renderer: self.flyout_renderer.for_window(),
+                material: (
+                    self.dark,
+                    self.backdrop,
+                    self.backdrop_color.clone(),
+                    self.material_options,
+                ),
+                open_ms: self.open_ms,
+                remote: self.remote,
+            },
+        ))
     }
 
     /// The speaker opens Sound; the clock opens the calendar and notifications;
     /// the battery opens its settings. The chevron toggles the flyout, and
     /// notification icons get the click.
-    fn click_part(&mut self, part: logic::Part) {
+    fn click_part(&mut self, part: logic::Part) -> DockEffect {
         let target = match part {
             logic::Part::Chevron => {
                 self.toggle_flyout();
-                return;
+                return DockEffect::None;
             }
             logic::Part::Tray(position) => {
                 self.click_inline(position, Action::Click);
-                return;
+                return DockEffect::None;
             }
             logic::Part::Volume => {
-                self.open_sound();
-                return;
+                return DockEffect::Controls;
             }
             logic::Part::Clock => "ms-actioncenter:",
             logic::Part::Battery => "ms-settings:batterysaver",
         };
-        if let Err(error) = crate::launch::open(target) {
-            eprintln!("Dock status: {error}");
-        }
+        DockEffect::Open(target)
     }
 
     /// Wheel `delta` over the dock switches desktops a notch at a time,
@@ -2721,12 +3534,19 @@ impl State {
         }
     }
 
-    fn click(&mut self, index: usize, new_instance: bool) {
+    fn click(&mut self, index: usize, new_instance: bool) -> DockEffect {
+        if !self.alive || !self.data.dock_enabled.get() || self.suspended {
+            return DockEffect::None;
+        }
         if index == 0 {
             unsafe {
                 let _ = PostMessageW(Some(self.owner), WM_SHOW_LAUNCHER, WPARAM(0), LPARAM(0));
             }
-        } else if !new_instance && self.item_at(index).is_some_and(|item| item.windows.len() > 1) {
+        } else if !new_instance
+            && self
+                .item_at(index)
+                .is_some_and(|item| self.preview_windows(item).len() > 1)
+        {
             if self.windows_slot == Some(index) && self.windows_clicked {
                 self.hide_windows();
             } else {
@@ -2740,103 +3560,513 @@ impl State {
                 }
             }
         } else if let Some(item) = self.items.get(index - 1 + self.scroll) {
-            if !new_instance && let Some(window) = item.windows.first() {
-                // Clicking the app already in front minimizes it, as its
-                // taskbar button does; any other click brings it forward.
-                if item.windows.iter().any(|w| open_windows::is_foreground(w.hwnd)) {
-                    for window in &item.windows {
-                        if let Err(error) = open_windows::minimize(window.hwnd) {
-                            eprintln!("Dock minimize: {error}");
-                        }
-                    }
-                } else if let Err(error) = open_windows::focus(window.hwnd) {
-                    eprintln!("Dock activation: {error}");
-                }
+            let local = self.preview_windows(item);
+            let windows: Vec<_> = if local.is_empty() {
+                item.windows.iter().collect()
             } else {
-                self.launch_app(&item.app);
+                local
+            };
+            if !new_instance && let Some(window) = windows.first() {
+                if windows.iter().any(|window| open_windows::is_foreground(window.hwnd)) {
+                    return DockEffect::Minimize(
+                        windows
+                            .iter()
+                            .filter_map(|window| window_identity(window.hwnd))
+                            .collect(),
+                    );
+                }
+                return window_identity(window.hwnd).map_or(DockEffect::None, DockEffect::Focus);
             }
+            return DockEffect::Launch {
+                app: item.app.clone(),
+                indexed: self
+                    .apps
+                    .iter()
+                    .any(|indexed| indexed.id.eq_ignore_ascii_case(&item.app.id)),
+            };
         }
+        DockEffect::None
     }
 
-    fn launch_app(&self, app: &AppEntry) {
-        let result = if self.apps.iter().any(|indexed| indexed.id.eq_ignore_ascii_case(&app.id)) {
-            crate::launch::app(&app.id, app.path.as_deref(), false)
-        } else if let Some(path) = &app.path {
-            if std::path::Path::new(path).is_absolute() {
-                crate::launch::open(path)
-            } else {
-                return;
+    fn prepare_menu(&mut self, index: Option<usize>) -> Option<DockMenu> {
+        if self.native_menu_open {
+            return None;
+        }
+        let snapshot = if let Some(index) = index {
+            let item = self.item_at(index)?;
+            DockMenu::App {
+                hwnd: self.hwnd,
+                app: item.app.clone(),
+                pinned: self.data.pins.borrow().position(&item.app.id).is_some(),
+                windows: item
+                    .windows
+                    .iter()
+                    .filter_map(|window| {
+                        let mut pid = 0;
+                        unsafe { GetWindowThreadProcessId(HWND(window.hwnd as _), Some(&mut pid)) };
+                        (pid != 0).then_some((window.hwnd, pid))
+                    })
+                    .collect(),
             }
         } else {
-            crate::launch::app(&app.id, None, false)
+            DockMenu::Chevron {
+                hwnd: self.hwnd,
+                owner: self.owner,
+            }
         };
-        if let Err(error) = result {
-            eprintln!("Dock launch: {error}");
-        }
+        self.native_menu_open = true;
+        self.hide_tip();
+        self.hide_windows();
+        Some(snapshot)
     }
 
-    fn menu(&mut self, index: usize) {
-        let Some(item) = self.item_at(index) else { return };
-        let app = item.app.clone();
-        let windows: Vec<_> = item.windows.iter().map(|window| window.hwnd).collect();
-        let pinned = self.data.pins.borrow().position(&app.id).is_some();
-        unsafe {
-            let Ok(menu) = CreatePopupMenu() else {
-                return;
-            };
-            let _ = AppendMenuW(menu, MF_STRING, 1, w!("New window"));
-            let _ = AppendMenuW(
-                menu,
-                MF_STRING,
-                2,
-                if pinned {
-                    w!("Unpin from dock")
-                } else {
-                    w!("Pin to dock")
-                },
-            );
-            if !windows.is_empty() {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-                let label = if windows.len() == 1 {
-                    w!("Close window")
-                } else {
-                    w!("Close all windows")
-                };
-                let _ = AppendMenuW(menu, MF_STRING, 3, label);
+    fn apply_menu(&mut self, snapshot: DockMenu, command: u32) -> DockEffect {
+        self.native_menu_open = false;
+        self.away = 0;
+        if !self.alive
+            || !self.data.dock_enabled.get()
+            || self.suspended
+            || !unsafe { IsWindow(Some(self.hwnd)) }.as_bool()
+        {
+            return DockEffect::None;
+        }
+        let effect = match snapshot {
+            DockMenu::Chevron { owner, .. } => match command {
+                1 => DockEffect::Taskbar(owner),
+                2 => DockEffect::Open("ms-settings:taskbar"),
+                _ => DockEffect::None,
+            },
+            DockMenu::App {
+                app, pinned, windows, ..
+            } => {
+                // Reentrant updates can reorder the dock or replace a row.
+                // Resolve by stable app ID, never by the original menu slot.
+                let app = self
+                    .items
+                    .iter()
+                    .find(|item| item.app.id.eq_ignore_ascii_case(&app.id))
+                    .map_or(app.clone(), |item| item.app.clone());
+                match command {
+                    1 => DockEffect::Launch {
+                        indexed: self.apps.iter().any(|entry| entry.id.eq_ignore_ascii_case(&app.id)),
+                        app,
+                    },
+                    2 => {
+                        if let Err(error) = self.data.pins.borrow_mut().set_pinned(app, !pinned) {
+                            eprintln!("Dock pins: {error}");
+                        } else {
+                            post_to_docks(WM_REFRESH, Some(self.hwnd));
+                        }
+                        DockEffect::None
+                    }
+                    3 => DockEffect::Close(windows),
+                    _ => DockEffect::None,
+                }
             }
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            // Use the dock as menu owner. Its wndproc rejects RefCell reentrancy.
-            let _ = SetForegroundWindow(self.hwnd);
-            let command = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON,
-                point.x,
-                point.y,
-                None,
-                self.hwnd,
-                None,
-            )
-            .0;
-            let _ = DestroyMenu(menu);
-            match command {
-                1 => self.launch_app(&app),
-                2 => {
-                    if let Err(error) = self.data.pins.borrow_mut().toggle(app) {
-                        eprintln!("Dock pins: {error}");
+        };
+        let _ = unsafe { PostMessageW(Some(self.hwnd), WM_REFRESH, WPARAM(0), LPARAM(0)) };
+        effect
+    }
+}
+
+/// GWLP_USERDATA points into this Rc allocation. Retain it before entering a
+/// modal loop, because a reentrant config update may remove the owning Dock.
+unsafe fn retain_dock_state(pointer: *const RefCell<State>) -> Rc<RefCell<State>> {
+    unsafe {
+        Rc::increment_strong_count(pointer);
+        Rc::from_raw(pointer)
+    }
+}
+
+/// Preserve stacking while either our native menu or a tray menu owns it.
+fn dock_menu_order(native_menu_open: bool, tray_interaction: bool) -> SET_WINDOW_POS_FLAGS {
+    if native_menu_open || tray_interaction {
+        SWP_NOZORDER
+    } else {
+        SET_WINDOW_POS_FLAGS(0)
+    }
+}
+
+fn display_dock_menu(snapshot: &DockMenu) -> u32 {
+    let kind = match snapshot {
+        DockMenu::App { .. } => "app",
+        DockMenu::Chevron { .. } => "tray",
+    };
+    crate::logging::event("dock.menu.open", format_args!("kind={kind}"));
+    unsafe {
+        let Ok(menu) = CreatePopupMenu() else { return 0 };
+        let hwnd = match snapshot {
+            DockMenu::Chevron { hwnd, .. } => {
+                let _ = AppendMenuW(menu, MF_STRING, 1, w!("Show taskbar"));
+                let _ = AppendMenuW(menu, MF_STRING, 2, w!("Taskbar settings"));
+                *hwnd
+            }
+            DockMenu::App {
+                hwnd, pinned, windows, ..
+            } => {
+                let _ = AppendMenuW(menu, MF_STRING, 1, w!("New window"));
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    2,
+                    if *pinned {
+                        w!("Unpin from dock")
                     } else {
-                        post_to_docks(WM_REFRESH, Some(self.hwnd));
+                        w!("Pin to dock")
+                    },
+                );
+                if !windows.is_empty() {
+                    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+                    let _ = AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        3,
+                        if windows.len() == 1 {
+                            w!("Close window")
+                        } else {
+                            w!("Close all windows")
+                        },
+                    );
+                }
+                *hwnd
+            }
+        };
+        let mut point = POINT::default();
+        let _ = GetCursorPos(&mut point);
+        // Open upwards from the dock edge, so every row clears the dock.
+        let mut dock = RECT::default();
+        let menu_bottom = match GetWindowRect(hwnd, &mut dock) {
+            Ok(()) => dock.top,
+            Err(error) => {
+                eprintln!("Dock context menu position: {error}");
+                point.y
+            }
+        };
+        let _ = SetForegroundWindow(hwnd);
+        let command = TrackPopupMenu(
+            menu,
+            TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN,
+            point.x,
+            menu_bottom,
+            None,
+            hwnd,
+            None,
+        )
+        .0 as u32;
+        let _ = DestroyMenu(menu);
+        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+        crate::logging::event("dock.menu.close", format_args!("kind={kind} selected={}", command != 0));
+        command
+    }
+}
+
+fn run_dock_menu(cell: &RefCell<State>, index: Option<usize>) {
+    let effect = modal_action(
+        cell,
+        |state| state.prepare_menu(index),
+        display_dock_menu,
+        |state, snapshot, command| state.apply_menu(snapshot, command),
+    );
+    run_dock_effect(cell, effect.unwrap_or(DockEffect::None));
+}
+
+fn window_identity(target: isize) -> Option<(isize, u32)> {
+    let mut pid = 0;
+    unsafe { GetWindowThreadProcessId(HWND(target as _), Some(&mut pid)) };
+    (pid != 0).then_some((target, pid))
+}
+
+fn unborrowed_action<S, T, R>(cell: &RefCell<S>, prepare: impl FnOnce(&mut S) -> T, execute: impl FnOnce(T) -> R) -> R {
+    let action = { prepare(&mut cell.borrow_mut()) };
+    execute(action)
+}
+
+fn run_dock_click(cell: &RefCell<State>, index: usize, new_instance: bool) {
+    unborrowed_action(
+        cell,
+        |state| state.click(index, new_instance),
+        |effect| run_dock_effect(cell, effect),
+    );
+}
+
+fn dock_effect_allowed(cell: &RefCell<State>) -> bool {
+    let state = cell.borrow();
+    state.alive && state.data.dock_enabled.get() && !state.suspended && unsafe { IsWindow(Some(state.hwnd)) }.as_bool()
+}
+
+fn run_dock_effect(cell: &RefCell<State>, effect: DockEffect) {
+    if !dock_effect_allowed(cell) {
+        return;
+    }
+    match effect {
+        DockEffect::Controls => {
+            unborrowed_action(cell, State::prepare_sound, |request| {
+                let Some((epoch, request)) = request else { return };
+                // Native creation, presentation and focus may dispatch status
+                // updates or remove this owner. No owner borrow crosses them.
+                match request.open() {
+                    Ok(hwnd) => {
+                        let id = sound::identity(hwnd);
+                        let allowed = dock_effect_allowed(cell);
+                        let mut state = cell.borrow_mut();
+                        if allowed && state.sound_epoch == epoch {
+                            state.sound = hwnd;
+                            state.sound_identity = id;
+                            if let (Some(id), Some(anchor)) = (id, state.part_rect(logic::Part::Volume)) {
+                                sound::update_opener(id, anchor);
+                            }
+                            state.away = 0;
+                            let _ = unsafe { InvalidateRect(Some(state.hwnd), None, false) };
+                        } else if let Some(id) = id {
+                            drop(state);
+                            sound::destroy(id);
+                        }
+                    }
+                    Err(error) => {
+                        crate::logging::event("controls.open.failed", format_args!("owner=dock error={error}"))
                     }
                 }
-                3 => {
-                    for hwnd in windows {
-                        let _ = open_windows::close(hwnd);
-                    }
-                }
-                _ => {}
+            });
+        }
+
+        DockEffect::Focus((target, pid)) => {
+            if window_identity(target) == Some((target, pid))
+                && let Err(error) = open_windows::focus(target)
+            {
+                eprintln!("Dock activation: {error}");
             }
         }
-        self.refresh();
+        DockEffect::Minimize(windows) => {
+            for (target, pid) in windows {
+                if !dock_effect_allowed(cell) {
+                    break;
+                }
+                if window_identity(target) == Some((target, pid))
+                    && let Err(error) = open_windows::minimize(target)
+                {
+                    eprintln!("Dock minimize: {error}");
+                }
+            }
+        }
+        DockEffect::None => {}
+        DockEffect::Launch { app, indexed } => launch_dock_app(&app, indexed),
+        DockEffect::Close(windows) => {
+            for (target, expected_pid) in windows {
+                if !dock_effect_allowed(cell) {
+                    break;
+                }
+                let mut pid = 0;
+                unsafe { GetWindowThreadProcessId(HWND(target as _), Some(&mut pid)) };
+                if pid == expected_pid
+                    && let Err(error) = open_windows::close(target)
+                {
+                    eprintln!("Dock close: {error}");
+                }
+            }
+        }
+        DockEffect::Taskbar(owner) => {
+            let _ = unsafe { PostMessageW(Some(owner), WM_DOCK_SHOW_TASKBAR, WPARAM(0), LPARAM(0)) };
+        }
+        DockEffect::Open(target) => {
+            if let Err(error) = crate::launch::open(target) {
+                eprintln!("Dock status: {error}");
+            }
+        }
+    }
+}
+
+fn launch_dock_app(app: &AppEntry, indexed: bool) {
+    let result = if indexed {
+        crate::launch::app(&app.id, app.path.as_deref(), false)
+    } else if let Some(path) = &app.path {
+        if !std::path::Path::new(path).is_absolute() {
+            return;
+        }
+        crate::launch::open(path)
+    } else {
+        crate::launch::app(&app.id, None, false)
+    };
+    if let Err(error) = result {
+        eprintln!("Dock launch: {error}");
+    }
+}
+
+#[cfg(test)]
+mod dock_modal_tests {
+    use super::{dock_menu_order, modal_action, unborrowed_action};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER;
+
+    #[derive(Default)]
+    struct Model {
+        apps: Vec<&'static str>,
+        wifi: bool,
+        sound_version: u32,
+        applied: Option<&'static str>,
+        alive: bool,
+    }
+
+    #[test]
+    fn native_menu_preserves_z_order_across_updates_and_tray_completion() {
+        // A tray interaction may expire during our nested native menu loop.
+        assert_eq!(dock_menu_order(true, true), SWP_NOZORDER);
+        assert_eq!(dock_menu_order(true, false), SWP_NOZORDER);
+        assert_eq!(dock_menu_order(false, true), SWP_NOZORDER);
+        assert_eq!(dock_menu_order(false, false).0, 0);
+        let cell = RefCell::new(false);
+        modal_action(
+            &cell,
+            |open| {
+                *open = true;
+                Some(())
+            },
+            |()| {
+                // The real modal boundary permits periodic placement updates.
+                assert_eq!(dock_menu_order(*cell.borrow(), false), SWP_NOZORDER);
+                0
+            },
+            |open, (), _| *open = false,
+        );
+        assert_eq!(dock_menu_order(*cell.borrow(), false).0, 0);
+    }
+
+    #[test]
+    fn controls_open_boundary_accepts_status_updates_and_owner_removal() {
+        let owner = RefCell::new(Some(Rc::new(RefCell::new(Model {
+            alive: true,
+            sound_version: 3,
+            ..Default::default()
+        }))));
+        let retained = owner.borrow().as_ref().unwrap().clone();
+        let weak = Rc::downgrade(&retained);
+        let prepared_version = unborrowed_action(
+            &retained,
+            |state| state.sound_version,
+            |version| {
+                // Inject the native open/focus boundary: status callbacks and
+                // monitor/Remote-mode owner removal must both be possible here.
+                retained.borrow_mut().wifi = true;
+                owner.borrow_mut().take();
+                retained.borrow_mut().alive = false;
+                version
+            },
+        );
+        assert_eq!(prepared_version, 3);
+        assert!(retained.borrow().wifi);
+        assert!(!retained.borrow().alive);
+        assert!(weak.upgrade().is_some());
+        drop(retained);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn ordinary_launch_executes_without_state_borrow_and_keeps_reentrant_status_updates() {
+        let cell = RefCell::new(Model {
+            apps: vec!["Editor", "Browser"],
+            alive: true,
+            ..Default::default()
+        });
+        let launched = unborrowed_action(
+            &cell,
+            |state| state.apps[0],
+            |app| {
+                // ShellExecute's native loop may deliver the same status/index
+                // updates as TrackPopupMenu. The production effect boundary must
+                // have released the click preparation borrow before this callback.
+                let mut state = cell.borrow_mut();
+                state.wifi = true;
+                state.sound_version = 11;
+                state.apps.reverse();
+                app
+            },
+        );
+        assert_eq!(launched, "Editor");
+        assert!(cell.borrow().wifi);
+        assert_eq!(cell.borrow().sound_version, 11);
+        assert_eq!(cell.borrow().apps[0], "Browser");
+    }
+
+    #[test]
+    fn modal_dispatch_accepts_reentrant_wifi_sound_and_index_updates_without_losing_them() {
+        let cell = RefCell::new(Model {
+            apps: vec!["Editor", "Browser"],
+            alive: true,
+            ..Default::default()
+        });
+        modal_action(
+            &cell,
+            |state| Some(state.apps[0]),
+            |snapshot| {
+                // This is the production modal helper's display boundary, where
+                // TrackPopupMenu pumps confirm_wifi, sound and index events.
+                let mut updated = cell.borrow_mut();
+                updated.wifi = true;
+                updated.sound_version = 7;
+                updated.apps = vec!["Browser", "Editor", "New app"];
+                assert_eq!(*snapshot, "Editor");
+                1
+            },
+            |state, app_id, command| {
+                if command != 0 {
+                    state.applied = state.apps.iter().copied().find(|id| id.eq_ignore_ascii_case(app_id));
+                }
+            },
+        );
+        let current = cell.borrow();
+        assert!(current.wifi);
+        assert_eq!(current.sound_version, 7);
+        assert_eq!(current.apps.len(), 3);
+        assert_eq!(
+            current.applied,
+            Some("Editor"),
+            "the reordered first slot must not receive the result"
+        );
+    }
+
+    #[test]
+    fn canceled_menu_preserves_nested_updates_and_removed_owner_stays_alive_until_return() {
+        let owner = RefCell::new(Some(Rc::new(RefCell::new(Model {
+            alive: true,
+            ..Default::default()
+        }))));
+        let retained = owner.borrow().as_ref().unwrap().clone();
+        let weak = Rc::downgrade(&retained);
+        modal_action(
+            &retained,
+            |_| Some(()),
+            |_| {
+                owner.borrow_mut().take();
+                let mut state = retained.borrow_mut();
+                state.wifi = true;
+                state.alive = false;
+                1
+            },
+            |state, (), command| {
+                if state.alive && command != 0 {
+                    state.applied = Some("wrong");
+                }
+            },
+        );
+        assert!(retained.borrow().wifi);
+        assert_eq!(retained.borrow().applied, None);
+        modal_action(
+            &retained,
+            |_| Some(()),
+            |_| {
+                retained.borrow_mut().sound_version = 9;
+                0
+            },
+            |state, (), command| {
+                if command != 0 {
+                    state.applied = Some("wrong");
+                }
+            },
+        );
+        assert_eq!(retained.borrow().sound_version, 9);
+        assert_eq!(retained.borrow().applied, None);
+        drop(retained);
+        assert!(weak.upgrade().is_none());
     }
 }
 
@@ -2934,19 +4164,8 @@ unsafe extern "system" fn collect_monitor(monitor: HMONITOR, _: HDC, _: *mut REC
     true.into()
 }
 
-fn at_bottom_edge(cursor: POINT, monitor: HMONITOR) -> bool {
-    monitor_info(monitor).is_some_and(|info| {
-        (info.rcMonitor.bottom - 2..info.rcMonitor.bottom).contains(&cursor.y)
-            && (info.rcMonitor.left..info.rcMonitor.right).contains(&cursor.x)
-    })
-}
-
 fn monitor_for_window(hwnd: isize) -> HMONITOR {
     unsafe { MonitorFromWindow(HWND(hwnd as _), MONITOR_DEFAULTTONEAREST) }
-}
-
-fn overlaps(a: RECT, b: RECT) -> bool {
-    a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top
 }
 
 fn covers(outer: RECT, inner: RECT) -> bool {
@@ -2957,12 +4176,63 @@ struct SurfaceWindow {
     bounds: RECT,
     raw: RECT,
     maximized: bool,
-    has_title: bool,
+    borderless: bool,
+    monitor: HMONITOR,
+}
+
+fn focused_fullscreen_on(window: Option<&SurfaceWindow>, monitor: RECT, work: RECT) -> bool {
+    window.is_some_and(|window| fullscreen_on(std::slice::from_ref(window), monitor, work))
+}
+
+/// Soft auto-hide policy for local Smart mode, independent of hard fullscreen
+/// suppression shared with the top bar, notch and fixed Remote layout.
+fn focused_maximized_on(window: Option<&SurfaceWindow>, monitor: HMONITOR) -> bool {
+    !monitor.is_invalid() && window.is_some_and(|window| window.maximized && window.monitor == monitor)
+}
+
+fn hover_keeps_dock_visible(
+    fixed: bool,
+    smart_clear: bool,
+    bottom_strip: bool,
+    interacting: bool,
+    pointer_near: bool,
+) -> bool {
+    fixed || smart_clear || bottom_strip || interacting || pointer_near
+}
+
+fn borderless_surface(style: u32) -> bool {
+    style & (WS_CAPTION.0 | WS_THICKFRAME.0) == 0
+}
+
+fn focused_surface() -> Option<SurfaceWindow> {
+    // Read the current root afresh instead of consulting the shared 150 ms
+    // z-order cache: background fullscreen windows must never block this dock.
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_invalid() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    if root.is_invalid() {
+        return None;
+    }
+    unsafe { read_surface(root) }
+}
+
+fn excluded_surface(pid: u32, own_pid: u32, class: &[u16]) -> bool {
+    pid == own_pid
+        || ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"]
+            .iter()
+            .any(|name| class.iter().copied().eq(name.encode_utf16()))
 }
 
 fn fullscreen_on(windows: &[SurfaceWindow], monitor: RECT, work: RECT) -> bool {
     for window in windows {
-        if covers(window.bounds, monitor) && (!window.maximized || (window.raw == monitor && work != monitor)) {
+        // RDP/display reconfiguration can temporarily leave no reserved work
+        // area. A genuinely borderless full-monitor window remains fullscreen
+        // there; a captioned/resizable maximized window still does not qualify.
+        if covers(window.bounds, monitor)
+            && (!window.maximized || (window.raw == monitor && (work != monitor || window.borderless)))
+        {
             return true;
         }
         // A maximized foreground window can cover a fullscreen window lower in z-order.
@@ -2976,6 +4246,287 @@ fn fullscreen_on(windows: &[SurfaceWindow], monitor: RECT, work: RECT) -> bool {
 #[cfg(test)]
 mod visibility_tests {
     use super::*;
+
+    fn surface(bounds: RECT, maximized: bool) -> SurfaceWindow {
+        SurfaceWindow {
+            bounds,
+            raw: bounds,
+            maximized,
+            borderless: false,
+            monitor: HMONITOR::default(),
+        }
+    }
+
+    #[test]
+    fn focused_maximized_uses_its_assigned_monitor_after_work_area_and_dpi_changes() {
+        let left = HMONITOR(1 as _);
+        let right = HMONITOR(2 as _);
+        // Old 150%-scaled work area, negative coordinates and a one-pixel
+        // inset must not defeat the authoritative maximized/monitor state.
+        let bounds = RECT {
+            left: -2879,
+            top: -119,
+            right: -1,
+            bottom: 1480,
+        };
+        let mut focused = SurfaceWindow {
+            monitor: left,
+            ..surface(bounds, true)
+        };
+        assert!(focused_maximized_on(Some(&focused), left));
+        assert!(!focused_maximized_on(Some(&focused), right));
+        assert!(!focused_maximized_on(Some(&focused), HMONITOR::default()));
+        focused.bounds.bottom = 1400;
+        assert!(focused_maximized_on(Some(&focused), left));
+        focused.monitor = right;
+        assert!(!focused_maximized_on(Some(&focused), left));
+        assert!(focused_maximized_on(Some(&focused), right));
+    }
+
+    #[test]
+    fn restored_foreground_and_excluded_foreground_do_not_inherit_background_maximized_state() {
+        let monitor = HMONITOR(1 as _);
+        let bounds = RECT {
+            right: 1920,
+            bottom: 1040,
+            ..Default::default()
+        };
+        let background = SurfaceWindow {
+            monitor,
+            ..surface(bounds, true)
+        };
+        let foreground = SurfaceWindow {
+            monitor,
+            ..surface(bounds, false)
+        };
+        assert!(focused_maximized_on(Some(&background), monitor));
+        assert!(!focused_maximized_on(Some(&foreground), monitor));
+        assert!(!focused_maximized_on(None, monitor));
+    }
+
+    #[test]
+    fn maximized_smart_mode_retains_bottom_reveal_delay_holds_and_remote_fixed_policy() {
+        let monitor = HMONITOR(1 as _);
+        let bounds = RECT {
+            left: -1920,
+            top: -120,
+            right: 0,
+            bottom: 960,
+        };
+        let focused = SurfaceWindow {
+            monitor,
+            ..surface(RECT { bottom: 920, ..bounds }, true)
+        };
+        let saved = crate::config::Config {
+            dock_autohide: true,
+            dock_smart_hide: true,
+            ..Default::default()
+        };
+        let local = saved.for_remote(false);
+        let smart_clear = local.dock_smart_hide && !focused_maximized_on(Some(&focused), monitor);
+        assert!(!smart_clear);
+        assert!(!focused_fullscreen_on(Some(&focused), bounds, focused.bounds));
+        for dpi in [96, 144, 192] {
+            let area = (bounds.left, bounds.top, bounds.right, bounds.bottom);
+            let (reveal, bottom) = logic::bottom_hover_zones((-1900, 959), area, dpi, 24., 15, false);
+            assert!(logic::reveal_from_hover_strip(reveal, false));
+            assert!(!logic::reveal_from_hover_strip(reveal, true));
+            assert!(hover_keeps_dock_visible(false, smart_clear, bottom, false, false));
+            let mut away = 0;
+            for _ in 0..HIDE_AFTER {
+                away = logic::hover_away_polls(away, hover_keeps_dock_visible(false, smart_clear, false, false, false));
+            }
+            assert_eq!(away, HIDE_AFTER);
+            // Any active menu, preview, Start, held dock or drag resets the
+            // existing away delay even with the pointer outside the dock.
+            assert_eq!(
+                logic::hover_away_polls(away, hover_keeps_dock_visible(false, smart_clear, false, true, false)),
+                0
+            );
+            assert!(hover_keeps_dock_visible(false, smart_clear, false, false, true));
+        }
+        let remote = saved.for_remote(true);
+        assert!(!remote.dock_autohide && !remote.dock_smart_hide);
+        assert!(hover_keeps_dock_visible(
+            !remote.dock_autohide,
+            false,
+            false,
+            false,
+            false
+        ));
+        let restored = saved.for_remote(false);
+        assert!(restored.dock_autohide && restored.dock_smart_hide);
+        assert!(!hover_keeps_dock_visible(
+            !restored.dock_autohide,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn dock_ignores_background_fullscreen_when_foreground_is_not_fullscreen() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work = RECT {
+            bottom: 1040,
+            ..monitor
+        };
+        let background = surface(monitor, false);
+        let foreground = surface(
+            RECT {
+                left: 200,
+                top: 100,
+                right: 1200,
+                bottom: 800,
+            },
+            false,
+        );
+        // The existing topbar/notch policy still observes the background window.
+        assert!(fullscreen_on(&[background], monitor, work));
+        assert!(!focused_fullscreen_on(Some(&foreground), monitor, work));
+        assert!(!focused_fullscreen_on(None, monitor, work));
+    }
+
+    #[test]
+    fn focused_fullscreen_blocks_its_monitor_and_not_the_other_display() {
+        let left = RECT {
+            left: -1920,
+            top: -120,
+            right: 0,
+            bottom: 960,
+        };
+        let right = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let left_work = RECT { bottom: 920, ..left };
+        let right_work = RECT { bottom: 1400, ..right };
+        let focused_left = surface(left, false);
+        assert!(focused_fullscreen_on(Some(&focused_left), left, left_work));
+        assert!(!focused_fullscreen_on(Some(&focused_left), right, right_work));
+        let focused_right = surface(right, false);
+        assert!(!focused_fullscreen_on(Some(&focused_right), left, left_work));
+        assert!(focused_fullscreen_on(Some(&focused_right), right, right_work));
+        let crossing = surface(
+            RECT {
+                left: -500,
+                top: 100,
+                right: 500,
+                bottom: 900,
+            },
+            false,
+        );
+        assert!(!focused_fullscreen_on(Some(&crossing), left, left_work));
+        assert!(!focused_fullscreen_on(Some(&crossing), right, right_work));
+    }
+
+    #[test]
+    fn normal_maximized_work_area_does_not_count_as_focused_fullscreen() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let work = RECT {
+            bottom: 1040,
+            ..monitor
+        };
+        assert!(!focused_fullscreen_on(Some(&surface(work, true)), monitor, work));
+        assert!(!focused_fullscreen_on(Some(&surface(monitor, true)), monitor, monitor));
+        let framed = SurfaceWindow {
+            bounds: monitor,
+            raw: RECT {
+                left: -8,
+                top: -8,
+                right: 1928,
+                bottom: 1088,
+            },
+            maximized: true,
+            borderless: false,
+            monitor: HMONITOR::default(),
+        };
+        assert!(!focused_fullscreen_on(Some(&framed), monitor, work));
+        assert!(focused_fullscreen_on(Some(&surface(monitor, false)), monitor, work));
+    }
+
+    #[test]
+    fn borderless_fullscreen_survives_work_area_reset_on_its_own_display() {
+        let monitor = RECT {
+            left: -1920,
+            top: -120,
+            right: 0,
+            bottom: 960,
+        };
+        let work = RECT {
+            top: -96,
+            bottom: 920,
+            ..monitor
+        };
+        let other = RECT {
+            left: 0,
+            top: 0,
+            right: 2560,
+            bottom: 1440,
+        };
+        let fullscreen = SurfaceWindow {
+            borderless: true,
+            ..surface(monitor, true)
+        };
+        for current_work in [work, monitor, work] {
+            assert!(focused_fullscreen_on(Some(&fullscreen), monitor, current_work));
+            assert!(!focused_fullscreen_on(Some(&fullscreen), other, other));
+        }
+        assert!(!focused_fullscreen_on(None, monitor, monitor));
+        assert!(!focused_fullscreen_on(Some(&surface(monitor, true)), monitor, monitor));
+        let ordinary = SurfaceWindow {
+            borderless: true,
+            ..surface(work, true)
+        };
+        assert!(!focused_fullscreen_on(Some(&ordinary), monitor, monitor));
+        let framed_raw = SurfaceWindow {
+            raw: RECT {
+                left: monitor.left - 8,
+                right: monitor.right + 8,
+                ..monitor
+            },
+            ..fullscreen
+        };
+        assert!(!focused_fullscreen_on(Some(&framed_raw), monitor, monitor));
+    }
+
+    #[test]
+    fn captioned_or_resizable_custom_chrome_is_not_borderless_fullscreen() {
+        assert!(borderless_surface(WS_POPUP.0 | WS_VISIBLE.0));
+        for frame in [WS_CAPTION.0, WS_BORDER.0, WS_DLGFRAME.0, WS_THICKFRAME.0] {
+            assert!(!borderless_surface(WS_POPUP.0 | WS_VISIBLE.0 | frame));
+        }
+    }
+
+    #[test]
+    fn desktop_shell_and_own_windows_are_excluded_before_fullscreen_selection() {
+        for class in ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+            assert!(excluded_surface(101, 202, &class.encode_utf16().collect::<Vec<_>>()));
+        }
+        assert!(excluded_surface(
+            202,
+            202,
+            &"Wisp.TopBar".encode_utf16().collect::<Vec<_>>()
+        ));
+        assert!(!excluded_surface(
+            101,
+            202,
+            &"ApplicationFrameWindow".encode_utf16().collect::<Vec<_>>()
+        ));
+    }
 
     #[test]
     fn fullscreen_blocks_only_its_monitor_even_if_another_monitor_has_focus() {
@@ -2997,13 +4548,15 @@ mod visibility_tests {
                 bounds: right_work,
                 raw: right_work,
                 maximized: true,
-                has_title: true,
+                borderless: false,
+                monitor: HMONITOR::default(),
             },
             SurfaceWindow {
                 bounds: left,
                 raw: left,
                 maximized: false,
-                has_title: true,
+                borderless: true,
+                monitor: HMONITOR::default(),
             },
         ];
         assert!(fullscreen_on(&windows, left, left));
@@ -3013,35 +4566,39 @@ mod visibility_tests {
 
 /// Shares a z-ordered snapshot of visible windows across the docks.
 unsafe extern "system" fn collect_surface(hwnd: HWND, param: LPARAM) -> BOOL {
+    if let Some(window) = unsafe { read_surface(hwnd) } {
+        unsafe {
+            (*(param.0 as *mut Vec<SurfaceWindow>)).push(window);
+        }
+    }
+    true.into()
+}
+
+/// Existing surface eligibility and bounds, shared with the fresh focused read.
+unsafe fn read_surface(hwnd: HWND) -> Option<SurfaceWindow> {
     use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
     unsafe {
         if !IsWindowVisible(hwnd).as_bool()
             || IsIconic(hwnd).as_bool()
             || GetWindowLongW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0
         {
-            return true.into();
+            return None;
         }
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        if pid == std::process::id() {
-            return true.into();
-        }
         let mut class = [0u16; 64];
         let len = GetClassNameW(hwnd, &mut class) as usize;
-        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"]
-            .iter()
-            .any(|name| class[..len].iter().copied().eq(name.encode_utf16()))
-        {
-            return true.into();
+        if excluded_surface(pid, std::process::id(), &class[..len]) {
+            return None;
         }
         let mut raw = RECT::default();
         if GetWindowRect(hwnd, &mut raw).is_err() {
-            return true.into();
+            return None;
         }
         let mut cloaked = 0u32;
         let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&raw mut cloaked).cast(), 4);
         if cloaked != 0 {
-            return true.into();
+            return None;
         }
         let mut bounds = RECT::default();
         if DwmGetWindowAttribute(
@@ -3054,13 +4611,13 @@ unsafe extern "system" fn collect_surface(hwnd: HWND, param: LPARAM) -> BOOL {
         {
             bounds = raw;
         }
-        (*(param.0 as *mut Vec<SurfaceWindow>)).push(SurfaceWindow {
+        Some(SurfaceWindow {
             bounds,
             raw,
             maximized: IsZoomed(hwnd).as_bool(),
-            has_title: GetWindowTextLengthW(hwnd) > 0,
-        });
-        true.into()
+            borderless: borderless_surface(GetWindowLongW(hwnd, GWL_STYLE) as u32),
+            monitor: MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL),
+        })
     }
 }
 
@@ -3097,7 +4654,223 @@ unsafe extern "system" fn window_event(
     post_to_docks(WM_REFRESH, None);
 }
 
+fn hide_popup_host_before_message(message: u32, timer: usize) -> bool {
+    (message == WM_TIMER && matches!(timer, REFRESH_TIMER | SLIDE_TIMER))
+        || matches!(
+            message,
+            WM_DPICHANGED
+                | WM_DISPLAYCHANGE
+                | WM_SETTINGCHANGE
+                | WM_THEMECHANGED
+                | WM_POWERBROADCAST
+                | WM_SHOWWINDOW
+                | WM_WINDOWPOSCHANGING
+                | WM_DESTROY
+                | WM_NCDESTROY
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | WM_RBUTTONUP
+                | WM_CLOSE_FLYOUT
+                | WM_SURFACE_MATERIAL
+        )
+}
+#[cfg(test)]
+mod material_message_tests {
+    use super::*;
+    #[test]
+    fn panel_update_boundary_keeps_reentrant_status_and_owner_removal() {
+        struct Owner {
+            alive: bool,
+            epoch: u64,
+            material: u64,
+            status: u32,
+        }
+        let owner = RefCell::new(Owner {
+            alive: true,
+            epoch: 7,
+            material: 2,
+            status: 1,
+        });
+        unborrowed_action(
+            &owner,
+            |state| (state.epoch, state.material),
+            |snapshot| {
+                // Models host preparation/geometry pumping a fresh status callback
+                // and removing its owning Dock or Bar while this effect is active.
+                let mut state = owner.borrow_mut();
+                state.status = 9;
+                state.alive = false;
+                assert!(!panel_generation_current(
+                    snapshot,
+                    (state.epoch, state.material),
+                    true,
+                    state.alive
+                ));
+            },
+        );
+        assert_eq!(owner.borrow().status, 9);
+        assert!(!panel_generation_current((7, 2), (8, 2), true, true));
+        assert!(!panel_generation_current((7, 2), (7, 3), true, true));
+        assert!(!panel_generation_current((7, 2), (7, 2), false, true));
+    }
+
+    #[test]
+    fn polling_and_cached_fades_keep_the_retained_host_visible() {
+        assert!(!hide_popup_host_before_message(WM_TIMER, POLL_TIMER));
+        assert!(!hide_popup_host_before_message(WM_TIMER, POPUP_FADE_TIMER));
+        assert!(!hide_popup_host_before_message(WM_MOUSEMOVE, 0));
+        assert!(hide_popup_host_before_message(WM_TIMER, SLIDE_TIMER));
+        assert!(hide_popup_host_before_message(WM_CLOSE_FLYOUT, 0));
+        assert!(hide_popup_host_before_message(WM_SURFACE_MATERIAL, 0));
+    }
+}
+
+// Companion effects run after the foreground procedure has released State.
+unsafe fn surface_proc(
+    hwnd: HWND,
+    msg: u32,
+    wp: WPARAM,
+    lp: LPARAM,
+    inner: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+) -> LRESULT {
+    unsafe {
+        let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<State>;
+        if pointer.is_null() {
+            return inner(hwnd, msg, wp, lp);
+        }
+        Rc::increment_strong_count(pointer);
+        let state = Rc::from_raw(pointer);
+        let snapshot = state
+            .try_borrow_mut()
+            .ok()
+            .map(|mut s| (s.material_version, s.flyout_material.take()));
+        let Some((version, mut material)) = snapshot else {
+            return inner(hwnd, msg, wp, lp);
+        };
+        if hide_popup_host_before_message(msg, wp.0)
+            && let Some(host) = &material
+        {
+            host.hide();
+        }
+        let result = inner(hwnd, msg, wp, lp);
+        let current = {
+            let s = state.borrow();
+            crate::theme::material_is_current(
+                version,
+                s.material_version,
+                s.alive,
+                GetWindowLongPtrW(hwnd, GWLP_USERDATA) == pointer as isize,
+            )
+        };
+        if msg == WM_NCDESTROY || !current {
+            return result;
+        }
+        if msg == WM_SURFACE_MATERIAL {
+            drop(material.take());
+            let (owner, flyout, dark, backdrop, color, remote, options) = {
+                let s = state.borrow();
+                (
+                    s.owner,
+                    s.flyout,
+                    s.dark,
+                    s.backdrop,
+                    s.backdrop_color.clone(),
+                    s.remote,
+                    s.material_options,
+                )
+            };
+            if remote {
+                material = Some(crate::theme::SurfaceMaterial::prepare(
+                    Some(owner),
+                    flyout,
+                    dark,
+                    backdrop,
+                    &color,
+                    options,
+                ));
+            }
+            if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize
+                || GetWindowLongPtrW(flyout, GWLP_USERDATA) != pointer as isize
+            {
+                return result;
+            }
+            let mut s = state.borrow_mut();
+            if !s.alive || s.material_version != version {
+                return result;
+            }
+            if let Some(material) = &material {
+                s.flyout_palette = material.palette.clone();
+            }
+            s.flyout_prepared = false;
+            s.flyout_renderer.discard_popup_surface();
+            let _ = InvalidateRect(Some(flyout), None, false);
+            let panel = s.sound_identity.map(|id| PanelTarget {
+                id,
+                epoch: s.sound_epoch,
+                material_version: s.material_version,
+            });
+            drop(s);
+            if let Some(target) = panel.filter(|target| dock_panel_current(&state, *target)) {
+                sound::apply_theme(target.id.hwnd, dark, backdrop, &color, options);
+            }
+        }
+        let (current, alive, flyout, ready, dpi, alpha) = {
+            let s = state.borrow();
+            (
+                s.material_version,
+                s.alive,
+                s.flyout,
+                s.remote && s.flyout_open && s.flyout_prepared,
+                s.dpi,
+                s.flyout_exit.or(s.remote_flyout_fade).map_or(255, PopupFade::alpha),
+            )
+        };
+        if !crate::theme::material_is_current(
+            version,
+            current,
+            alive,
+            GetWindowLongPtrW(hwnd, GWLP_USERDATA) == pointer as isize
+                && GetWindowLongPtrW(flyout, GWLP_USERDATA) == pointer as isize,
+        ) {
+            return result;
+        }
+        let mut repaint = false;
+        if let Some(host) = &mut material {
+            let mut bounds = RECT::default();
+            if ready && IsWindowVisible(flyout).as_bool() && GetWindowRect(flyout, &mut bounds).is_ok() {
+                repaint = !host.present(bounds, dpi, 8., alpha as f32 / 255.);
+            } else {
+                host.hide();
+            }
+        }
+        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize
+            || GetWindowLongPtrW(flyout, GWLP_USERDATA) != pointer as isize
+        {
+            return result;
+        }
+        let mut s = state.borrow_mut();
+        if s.alive && s.material_version == version {
+            if let Some(host) = &material {
+                s.flyout_palette = host.palette.clone();
+            }
+            s.flyout_material = material;
+            if repaint {
+                s.flyout_prepared = false;
+                s.flyout_renderer.discard_popup_surface();
+                let _ = InvalidateRect(Some(flyout), None, false);
+            }
+        }
+        result
+    }
+}
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe { surface_proc(hwnd, msg, wp, lp, wndproc_inner) }
+}
+unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    unsafe { surface_proc(hwnd, msg, wp, lp, popup_wndproc_inner) }
+}
+
+unsafe extern "system" fn wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
             let create = &*(lp.0 as *const CREATESTRUCTW);
@@ -3127,7 +4900,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let dark = s.palette.text.r > 0.5;
                     let backdrop = s.backdrop;
                     let color = s.backdrop_color.clone();
-                    s.apply_material(dark, backdrop, &color);
+                    let options = s.material_options;
+                    s.apply_material(dark, backdrop, &color, options);
                 }
                 WM_REFRESH => {
                     if !s.scheduled {
@@ -3162,6 +4936,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     s.show_windows();
                     return LRESULT(0);
                 }
+                WM_TIMER if wp.0 == PREVIEW_ZOOM_TIMER => {
+                    s.show_zoom();
+                    return LRESULT(0);
+                }
                 WM_TIMER if wp.0 == WINDOWS_HIDE_TIMER => {
                     let _ = KillTimer(Some(hwnd), WINDOWS_HIDE_TIMER);
                     let mut cursor = POINT::default();
@@ -3188,7 +4966,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 WM_DPICHANGED | WM_DISPLAYCHANGE => {
                     s.hide_windows();
-                    *s.data.surfaces.borrow_mut() = None;
+                    SURFACE_CACHE.with_borrow_mut(|cache| *cache = None);
                     if !s.revealed {
                         s.place();
                     }
@@ -3295,15 +5073,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         s.close_flyout();
                     }
                     if let Some(index) = s.hit(lp) {
-                        if msg == WM_MBUTTONUP || !s.item_at(index).is_some_and(|item| item.windows.len() > 1) {
+                        if msg == WM_MBUTTONUP
+                            || !s.item_at(index).is_some_and(|item| s.preview_windows(item).len() > 1)
+                        {
                             s.hide_windows();
                         }
-                        s.click(index, msg == WM_MBUTTONUP);
+                        let owned = retain_dock_state(pointer);
+                        drop(s);
+                        run_dock_click(&owned, index, msg == WM_MBUTTONUP);
+                        return LRESULT(0);
                     } else if let Some(part) = s.hit_part(lp)
                         && msg == WM_LBUTTONUP
                     {
                         s.hide_windows();
-                        s.click_part(part);
+                        let effect = s.click_part(part);
+                        let owned = retain_dock_state(pointer);
+                        drop(s);
+                        run_dock_effect(&owned, effect);
+                        return LRESULT(0);
                     } else {
                         s.hide_windows();
                     }
@@ -3313,11 +5100,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     s.close_flyout();
                     s.hide_windows();
                     if let Some(index) = s.hit(lp) {
-                        s.menu(index);
+                        let owned = retain_dock_state(pointer);
+                        drop(s);
+                        run_dock_menu(&owned, Some(index));
                     } else {
                         match s.hit_part(lp) {
-                            Some(logic::Part::Volume) => s.open_sound(),
-                            Some(logic::Part::Chevron) => s.chevron_menu(),
+                            Some(logic::Part::Volume) => {
+                                let owned = retain_dock_state(pointer);
+                                drop(s);
+                                run_dock_effect(&owned, DockEffect::Controls);
+                            }
+                            Some(logic::Part::Chevron) => {
+                                let owned = retain_dock_state(pointer);
+                                drop(s);
+                                run_dock_menu(&owned, None);
+                            }
                             Some(logic::Part::Tray(position)) => s.click_inline(position, Action::Menu),
                             _ => {}
                         }
@@ -3374,6 +5171,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return LRESULT(0);
                 }
                 WM_NCDESTROY => {
+                    s.alive = false;
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
                 _ => {}
@@ -3384,7 +5182,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// The flyout and the tooltip, which share the dock's state.
-unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+unsafe extern "system" fn popup_wndproc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
         if msg == WM_NCCREATE {
             let create = &*(lp.0 as *const CREATESTRUCTW);
@@ -3400,6 +5198,30 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         let Some(cell) = pointer.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
+        let zoom = cell.try_borrow().is_ok_and(|s| s.zoom == hwnd);
+        if zoom {
+            match msg {
+                WM_NCHITTEST => return LRESULT(HTTRANSPARENT as isize),
+                WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+                WM_PAINT => {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        let mut paint = PAINTSTRUCT::default();
+                        let _ = BeginPaint(hwnd, &mut paint);
+                        let State {
+                            zoom_renderer,
+                            dpi,
+                            zoom_palette: palette,
+                            zoom_title,
+                            ..
+                        } = &mut *s;
+                        let _ = zoom_renderer.draw_window_zoom(hwnd, *dpi, palette, zoom_title);
+                        let _ = EndPaint(hwnd, &paint);
+                    }
+                    return LRESULT(0);
+                }
+                _ => return DefWindowProcW(hwnd, msg, wp, lp),
+            }
+        }
         let tip = cell.try_borrow().is_ok_and(|s| s.tip == hwnd);
         if tip {
             // The tooltip never takes the pointer or the focus.
@@ -3424,7 +5246,11 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let _ = KillTimer(Some(s.hwnd), WINDOWS_HIDE_TIMER);
                     let hover = s.windows_hit(lp);
                     if s.windows_hover != hover {
+                        s.hide_zoom();
                         s.windows_hover = hover;
+                        if hover.is_some_and(|(_, close)| !close) {
+                            let _ = SetTimer(Some(s.hwnd), PREVIEW_ZOOM_TIMER, 180, None);
+                        }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     let _ = TrackMouseEvent(&mut TRACKMOUSEEVENT {
@@ -3439,6 +5265,8 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let Ok(mut s) = cell.try_borrow_mut() else {
                         return DefWindowProcW(hwnd, msg, wp, lp);
                     };
+                    s.hide_zoom();
+                    s.windows_hover = None;
                     s.leave_windows();
                     return LRESULT(0);
                 }
@@ -3448,10 +5276,28 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     }
                     return LRESULT(0);
                 }
+                WM_LBUTTONDOWN | WM_MBUTTONDOWN => {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.hide_zoom();
+                        s.windows_press = s.preview_press(lp, msg == WM_MBUTTONDOWN);
+                        let _ = SetCapture(hwnd);
+                    }
+                    return LRESULT(0);
+                }
+                WM_CANCELMODE | WM_CAPTURECHANGED => {
+                    if let Ok(mut s) = cell.try_borrow_mut() {
+                        s.windows_press = None;
+                    }
+                    return LRESULT(0);
+                }
                 WM_LBUTTONUP | WM_MBUTTONUP => {
                     let Ok(mut s) = cell.try_borrow_mut() else {
                         return DefWindowProcW(hwnd, msg, wp, lp);
                     };
+                    let pressed = s.windows_press.take();
+                    if GetCapture() == hwnd {
+                        let _ = ReleaseCapture();
+                    }
                     let scale = s.dpi as f32 / 96.;
                     let y = ((lp.0 >> 16) as i16) as f32 / scale;
                     if msg == WM_LBUTTONUP
@@ -3471,18 +5317,22 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         }
                         return LRESULT(0);
                     }
-                    if let Some((row, close)) = s.windows_hit(lp)
-                        && let Some(&target) = s.windows_targets.get(row)
+                    if let Some(pressed) = pressed
+                        && let Some(current) = s.preview_press(lp, msg == WM_MBUTTONUP)
+                        && let Some((target, close)) = pressed.release(current)
                     {
-                        let result = if msg == WM_MBUTTONUP || close {
-                            open_windows::close(target)
-                        } else {
+                        if !close {
                             s.hide_windows();
-                            open_windows::focus(target)
-                        };
-                        if let Err(error) = result {
-                            eprintln!("Dock window: {error}");
                         }
+                        let effect = if close {
+                            DockEffect::Close(vec![(target, pressed.pid)])
+                        } else {
+                            DockEffect::Focus((target, pressed.pid))
+                        };
+                        let owned = retain_dock_state(pointer);
+                        drop(s);
+                        run_dock_effect(&owned, effect);
+                        return LRESULT(0);
                     }
                     return LRESULT(0);
                 }
@@ -3495,7 +5345,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     let monitor_height = s.monitor_caption_height();
                     let State {
                         windows_renderer,
-                        palette,
+                        windows_palette: palette,
                         dpi,
                         windows_rows,
                         windows_monitors,
@@ -3541,9 +5391,18 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             WM_PAINT => {
                 let mut paint = PAINTSTRUCT::default();
                 let _ = BeginPaint(hwnd, &mut paint);
+                if s.remote && !tip {
+                    if let Err(error) = s.present_remote_flyout(false) {
+                        crate::logging::event("tray.remote.paint.failed", format_args!("error={error}"));
+                        s.close_flyout();
+                    }
+                    let _ = EndPaint(hwnd, &paint);
+                    return LRESULT(0);
+                }
                 let State {
                     tray,
-                    palette,
+                    flyout_palette,
+                    tip_palette,
                     dpi,
                     flyout_hover,
                     flyout_renderer,
@@ -3552,6 +5411,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     desktop_pill,
                     ..
                 } = &mut *s;
+                let palette = if tip { tip_palette } else { flyout_palette };
                 let result = if let Some(pill) = desktop_pill.as_ref().filter(|_| tip) {
                     tip_renderer.draw_desktops(
                         hwnd,
@@ -3581,7 +5441,33 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             _ if tip => {}
             WM_TIMER if wp.0 == POPUP_FADE_TIMER => {
-                tick_popup_fade(hwnd, &mut s.flyout_fade);
+                if let Some(exit) = s.flyout_exit {
+                    if exit.finished() {
+                        s.close_flyout();
+                    } else if s.remote {
+                        if let Err(error) = s.present_remote_flyout(true) {
+                            crate::logging::event("tray.remote.close.failed", format_args!("error={error}"));
+                            s.close_flyout();
+                        }
+                    } else if SetLayeredWindowAttributes(hwnd, COLORREF(0), exit.alpha(), LWA_ALPHA).is_err() {
+                        s.close_flyout();
+                    }
+                    return LRESULT(0);
+                }
+                if s.remote {
+                    if s.remote_flyout_fade.is_some_and(RemotePopupFade::finished) {
+                        s.remote_flyout_fade = None;
+                        let _ = KillTimer(Some(hwnd), POPUP_FADE_TIMER);
+                    }
+                    if s.flyout_open
+                        && let Err(error) = s.present_remote_flyout(true)
+                    {
+                        crate::logging::event("tray.remote.present.failed", format_args!("error={error}"));
+                        s.close_flyout();
+                    }
+                } else {
+                    tick_popup_fade(hwnd, &mut s.flyout_fade);
+                }
                 return LRESULT(0);
             }
             WM_MOUSEMOVE => {
@@ -3623,7 +5509,7 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 return LRESULT(0);
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => {
-                s.close_flyout();
+                s.dismiss_flyout();
                 return LRESULT(0);
             }
             // Closing within activation changes can reenter; close afterwards.
@@ -3633,12 +5519,12 @@ unsafe extern "system" fn popup_wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             WM_CLOSE_FLYOUT => {
                 // A held demo flyout stays for its screenshot.
                 if !s.held && !s.tray_menu_active() && GetForegroundWindow() != hwnd {
-                    s.close_flyout();
+                    s.dismiss_flyout();
                 }
                 return LRESULT(0);
             }
             WM_CLOSE => {
-                s.close_flyout();
+                s.dismiss_flyout();
                 return LRESULT(0);
             }
             _ => {}

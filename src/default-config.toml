@@ -10,13 +10,20 @@ max_results = 8
 # "system", "dark" or "light"
 theme = "system"
 
-# Launcher backdrop: "acrylic", "mica" or "solid"
+# Shared material: "acrylic" (Frosted), "glass", "solid", or a legacy material
 backdrop = "acrylic"
+# Optional Transparent/Glass overrides: 0 = opaque, 100 = clear background
+# backdrop_transparency = 85
+# backdrop_blur = false
+# When absent: Transparent = 85% without blur; Glass = 36% with blur
 
 # Where the launcher opens: "bottom" for a search box at the bottom of the
 # screen with results above it, where the dock grows into the launcher; or
 # "center".
 position = "bottom"
+
+# Wisp Start placement, independent of the compact launcher: "bottom" or "center".
+start_position = "bottom"
 
 # Show recently launched apps when the search box is empty.
 show_recent = true
@@ -41,8 +48,14 @@ dock = true
 # false, the dock stays on the main screen and windows stop above it while the
 # taskbar is hidden.
 dock_autohide = true
+# Full-width bottom activation strip, in physical pixels (1–128).
+dock_reveal_height = 8
+# With auto-hide enabled, keep visible outside focused maximized/fullscreen apps.
+# Maximized apps allow bottom-strip reveal; fullscreen stays suppressed.
+# Restored/background windows do not hide it; false keeps pointer auto-hide.
 dock_smart_hide = false
 dock_current_monitor_only = false
+dock_preview_current_monitor_only = false
 # App window list shown when hovering a running app icon:
 # "multiple" (only when the app has multiple windows), "always", or "off".
 window_list = "always"
@@ -58,5 +71,18 @@ dock_animation = "slide"
 
 # Open Wisp Start with a bare Windows key tap.
 win_start = true
+music_notch = false
+# Hide media from complete source app IDs or display names (case insensitive).
+music_excluded_apps = []
+# Optional top bar. Heights use Windows-scaled pixels (DIP), 24 to 48.
+topbar = false
+topbar_height = 32
+# Background opacity, 0 to 100. Icons retain their contrast.
+topbar_opacity = 0
+topbar_island_opacity = 70
+# Optional Windows 11 native glass, only behind the island.
+topbar_island_blur = false
+# ["primary"], ["all"], or selected Windows display names such as \\.\DISPLAY2.
+topbar_monitors = ["primary"]
 # Used by the Color backdrop (RGB hex).
 backdrop_color = "#252833"

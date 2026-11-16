@@ -442,6 +442,7 @@ mod tests {
 
     fn app(name: &str) -> AppEntry {
         AppEntry {
+            desktop: None,
             name: name.into(),
             id: name.into(),
             path: None,

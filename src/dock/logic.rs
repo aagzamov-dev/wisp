@@ -12,12 +12,6 @@ pub const TILE_RADIUS: f32 = 8.0;
 pub const ICON_CENTER_Y: f32 = 26.0;
 pub const INDICATOR_TOP: f32 = 46.0;
 
-pub fn slide_value(from: f32, to: f32, progress: f32) -> f32 {
-    let t = progress.clamp(0.0, 1.0);
-    let ease = t * t * (3.0 - 2.0 * t);
-    from + (to - from) * ease
-}
-
 pub fn icon_pixels(dpi: u32, size: f32) -> i32 {
     (size * dpi as f32 / 96.0).round() as i32
 }
@@ -35,8 +29,63 @@ pub fn layout_scale(app_icon_size: f32) -> f32 {
 pub fn height(scale: f32) -> f32 {
     HEIGHT * scale
 }
-pub fn margin(scale: f32) -> f32 {
-    MARGIN * scale
+/// External spacing is removed only in the fixed Remote-mode layout.
+pub fn margin(scale: f32, remote: bool) -> f32 {
+    if remote { 0.0 } else { MARGIN * scale }
+}
+
+pub fn reserved_height(scale: f32, remote: bool) -> f32 {
+    height(scale) + 2.0 * margin(scale, remote)
+}
+
+pub fn resting_top(bottom: i32, dpi: u32, app_icon_size: f32, remote: bool) -> i32 {
+    let scale = dpi as f32 / 96.;
+    let layout = layout_scale(app_icon_size);
+    bottom - (height(layout) * scale).round() as i32 - (margin(layout, remote) * scale).round() as i32
+}
+
+/// Monitor-wide resting dock band, independent of any animated HWND rectangle.
+/// Physical height matches the configured dock and its bottom gap.
+pub fn bottom_hover_strip(
+    (x, y): (i32, i32),
+    (left, top, right, bottom): (i32, i32, i32, i32),
+    dpi: u32,
+    app_icon_size: f32,
+    remote: bool,
+) -> bool {
+    let band_top = resting_top(bottom, dpi, app_icon_size, remote).max(top);
+    (left..right).contains(&x) && (band_top..bottom).contains(&y)
+}
+
+/// Hidden-dock activation uses exact physical pixels, never DPI-scaled DIPs.
+pub fn bottom_reveal_strip(
+    (x, y): (i32, i32),
+    (left, top, right, bottom): (i32, i32, i32, i32),
+    physical_height: u32,
+) -> bool {
+    let band = physical_height.clamp(1, 128) as i32;
+    (left..right).contains(&x) && (bottom.saturating_sub(band).max(top)..bottom).contains(&y)
+}
+
+pub fn bottom_hover_zones(
+    cursor: (i32, i32),
+    monitor: (i32, i32, i32, i32),
+    dpi: u32,
+    app_icon_size: f32,
+    reveal_height: u32,
+    remote: bool,
+) -> (bool, bool) {
+    let reveal = bottom_reveal_strip(cursor, monitor, reveal_height);
+    let hold = bottom_hover_strip(cursor, monitor, dpi, app_icon_size, remote);
+    (reveal, reveal || hold)
+}
+
+pub fn hover_away_polls(previous: u8, near: bool) -> u8 {
+    if near { 0 } else { previous.saturating_add(1) }
+}
+
+pub fn reveal_from_hover_strip(inside: bool, mouse_held: bool) -> bool {
+    inside && !mouse_held
 }
 pub fn slot(scale: f32) -> f32 {
     SLOT * scale
@@ -87,6 +136,81 @@ pub const PREVIEW_HEIGHT: f32 = 100.;
 pub const PREVIEW_HEADER: f32 = 28.;
 pub const PREVIEW_MONITOR: f32 = 17.;
 pub const PREVIEW_FOOTER: f32 = 24.;
+
+/// Freeze existing cards for the lifetime of a chooser, across z-order refresh,
+/// paging and membership changes. Newly opened windows follow existing cards.
+pub fn preview_order(previous: &[isize], current: &[isize]) -> Vec<isize> {
+    stable_order(previous.to_vec(), current.to_vec(), |old, new| old == new)
+}
+
+pub fn preview_candidates<T>(windows: &[T], local_only: bool, local: impl Fn(&T) -> bool) -> Vec<&T> {
+    windows.iter().filter(|window| !local_only || local(window)).collect()
+}
+
+pub fn preview_hit(x: f32, y: f32, width: f32, height: f32, count: usize) -> Option<(usize, bool)> {
+    let x = x - PREVIEW_PAD;
+    let y = y - PREVIEW_PAD;
+    if x < 0. || !(0. ..PREVIEW_HEADER + height).contains(&y) || width <= 0. {
+        return None;
+    }
+    let index = (x / width) as usize;
+    (index < count).then_some((index, y < PREVIEW_HEADER && x % width >= width - 27.))
+}
+
+/// A chooser gesture belongs to the source window, never its changing row index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewPress {
+    pub hwnd: isize,
+    pub pid: u32,
+    pub close: bool,
+    pub middle: bool,
+}
+impl PreviewPress {
+    pub fn release(self, current: Self) -> Option<(isize, bool)> {
+        (self.pid != 0 && self == current).then_some((self.hwnd, self.close || self.middle))
+    }
+}
+
+/// Prefer a published workspace over the active document in VS Code's standard
+/// title format. Other applications retain their own title, including browsers.
+pub fn preview_title(title: &str, exe: &str, app: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return app.to_string();
+    }
+    let file = exe.rsplit(['\\', '/']).next().unwrap_or(exe);
+    if file.eq_ignore_ascii_case("Code.exe") || file.eq_ignore_ascii_case("Code - Insiders.exe") {
+        for app_name in ["Visual Studio Code - Insiders", "Visual Studio Code"] {
+            for separator in [" — ", " - ", " – "] {
+                let suffix = format!("{separator}{app_name}");
+                if let Some(content) = title.strip_suffix(&suffix) {
+                    let workspace = content
+                        .rsplit_once(separator)
+                        .map_or(content, |(_, workspace)| workspace);
+                    // A custom title or folder may itself contain the title
+                    // delimiter. Only a single boundary or a published absolute
+                    // workspace path identifies the folder without guessing.
+                    let absolute = workspace.starts_with('/')
+                        || workspace.starts_with("\\\\")
+                        || workspace.as_bytes().get(1) == Some(&b':');
+                    if content.matches(separator).count() > 1 && !absolute {
+                        continue;
+                    }
+                    let folder = workspace
+                        .trim()
+                        .trim_end_matches(['\\', '/'])
+                        .rsplit(['\\', '/'])
+                        .next()
+                        .unwrap_or_default();
+                    if !folder.is_empty() {
+                        return folder.to_string();
+                    }
+                }
+            }
+        }
+    }
+    title.to_string()
+}
 
 pub fn show_window_list(mode: WindowListMode, windows: usize) -> bool {
     windows > 0 && (mode == WindowListMode::Always || mode == WindowListMode::Multiple && windows > 1)
@@ -139,6 +263,15 @@ pub fn parts(tray: Option<usize>, volume: bool, battery: bool) -> Vec<Part> {
         .collect()
 }
 
+/// Remote uses this same list for drawing, size and hit testing, even without audio.
+pub fn remote_parts(mut parts: Vec<Part>) -> Vec<Part> {
+    parts.retain(|part| *part != Part::Clock);
+    if !parts.contains(&Part::Volume) {
+        parts.push(Part::Volume);
+    }
+    parts
+}
+
 /// The notification-area flyout: a grid of cells, as in Windows 11.
 pub const FLYOUT_CELL: f32 = 40.0;
 pub const FLYOUT_PAD: f32 = 8.0;
@@ -175,6 +308,9 @@ pub fn flyout_hit(x: f32, y: f32, count: usize) -> Option<usize> {
 
 /// The status parts follow the apps, after a separator.
 pub fn status_width(parts: &[Part]) -> f32 {
+    if parts.is_empty() {
+        return 0.;
+    }
     SEPARATOR + parts.iter().map(|part| part.width()).sum::<f32>()
 }
 
@@ -289,6 +425,314 @@ pub fn stable_order<T>(previous: Vec<T>, current: Vec<T>, same: impl Fn(&T, &T) 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn configured_reveal_strip_is_physical_and_keeps_its_entire_activation_area_open() {
+        use super::*;
+        let monitor = (-1920, -1080, 0, 0);
+        for reveal_height in [1, 8, 128] {
+            for dpi in [96, 120, 144, 192] {
+                for x in [-1920, -960, -1] {
+                    let top = -(reveal_height as i32);
+                    let (reveal, hold) = bottom_hover_zones((x, top), monitor, dpi, 24., reveal_height, false);
+                    assert!(reveal && hold);
+                    assert!(!bottom_hover_zones((x, top - 1), monitor, dpi, 24., reveal_height, false).0);
+                    assert!(!bottom_hover_zones((x, 0), monitor, dpi, 24., reveal_height, false).0);
+                    let mut away = 0;
+                    for _ in 0..20 {
+                        away = hover_away_polls(away, hold);
+                    }
+                    assert_eq!(away, 0);
+                }
+            }
+        }
+        assert!(!bottom_reveal_strip((0, -1), monitor, 8));
+        assert!(!bottom_reveal_strip((-1921, -1), monitor, 8));
+        // A point above the 8px trigger holds an already visible dock, but
+        // cannot reveal a hidden one, even at higher Windows scaling.
+        for dpi in [96, 192] {
+            assert_eq!(
+                bottom_hover_zones((-1000, -20), monitor, dpi, 24., 8, false),
+                (false, true)
+            );
+        }
+        // Tall activation areas must remain part of hold even above the dock.
+        assert!(!bottom_hover_strip((-1000, -100), monitor, 96, 24., false));
+        assert_eq!(
+            bottom_hover_zones((-1000, -100), monitor, 96, 24., 128, false),
+            (true, true)
+        );
+        assert!(!bottom_reveal_strip((0, 0), (0, 0, 0, 0), 8));
+    }
+    #[test]
+    fn preview_monitor_filter_runs_before_count_order_and_click_choice() {
+        use super::*;
+        let windows = [(11, 1), (22, 2), (33, 1)];
+        let local = preview_candidates(&windows, true, |window| window.1 == 1);
+        assert_eq!(local.iter().map(|window| window.0).collect::<Vec<_>>(), [11, 33]);
+        let one_local = preview_candidates(&windows, true, |window| window.1 == 2);
+        assert_eq!(one_local.len(), 1);
+        assert_eq!(
+            one_local[0].0, 22,
+            "one local window must be the direct target, even if remote windows precede it"
+        );
+        assert!(preview_candidates(&windows, true, |window| window.1 == 3).is_empty());
+        assert_eq!(preview_candidates(&windows, false, |_| false).len(), 3);
+        let moved = [(11, 2), (22, 2), (33, 1)];
+        let local_after_move = preview_candidates(&moved, true, |window| window.1 == 1);
+        let ids = local_after_move.iter().map(|window| window.0).collect::<Vec<_>>();
+        assert_eq!(preview_order(&[11, 33], &ids), [33]);
+    }
+    #[test]
+    fn monitor_wide_bottom_hover_does_not_oscillate_beside_dock() {
+        use super::*;
+        let monitor = (0, 0, 1920, 1080);
+        for x in [0, 120, 960, 1800, 1919] {
+            for y in [1040, 1079] {
+                let mut revealed = false;
+                let mut away = 0;
+                for _ in 0..20 {
+                    let inside = bottom_hover_strip((x, y), monitor, 96, 24., false);
+                    if !revealed {
+                        revealed = reveal_from_hover_strip(inside, false);
+                    } else {
+                        away = hover_away_polls(away, inside);
+                        assert!(away < 3, "a stationary bottom-strip pointer must keep the dock open");
+                    }
+                    assert!(revealed);
+                }
+            }
+        }
+        // The usual three outside polls still hide, and re-entering resets it.
+        let mut away = 0;
+        for expected in 1..=3 {
+            away = hover_away_polls(away, bottom_hover_strip((20, 900), monitor, 96, 24., false));
+            assert_eq!(away, expected);
+        }
+        assert_eq!(hover_away_polls(away, true), 0);
+        assert!(
+            !reveal_from_hover_strip(true, true),
+            "dragging near the bottom must not newly reveal it"
+        );
+        assert!(!reveal_from_hover_strip(false, false));
+        assert!(reveal_from_hover_strip(true, false));
+    }
+
+    #[test]
+    fn remote_removes_only_external_vertical_space_and_local_return_restores_it() {
+        use super::*;
+        for (icon_size, body, gap) in [(24., 42., 6.75), (32., 56., 9.), (40., 70., 11.25)] {
+            let layout = layout_scale(icon_size);
+            assert_eq!(height(layout), body);
+            assert_eq!(reserved_height(layout, true), body);
+            assert_eq!(reserved_height(layout, false), body + 2. * gap);
+            for dpi in [96, 120, 144, 192] {
+                let physical = dpi as f32 / 96.;
+                let pixels = (body * physical).round() as i32;
+                let gap_pixels = (gap * physical).round() as i32;
+                // Negative monitor coordinates cover displays above the primary.
+                let monitor = (-1920, -1080, 0, 0);
+                for remote in [false, true, false] {
+                    let top = resting_top(0, dpi, icon_size, remote);
+                    assert_eq!(top, -pixels - if remote { 0 } else { gap_pixels });
+                    assert!(bottom_hover_strip((-960, top), monitor, dpi, icon_size, remote));
+                    assert!(!bottom_hover_strip((-960, top - 1), monitor, dpi, icon_size, remote));
+                    assert!(bottom_hover_strip((-960, -1), monitor, dpi, icon_size, remote));
+                    assert!(!bottom_hover_strip((-960, 0), monitor, dpi, icon_size, remote));
+                    assert_eq!(
+                        bottom_hover_zones((-960, -127), monitor, dpi, icon_size, 128, remote),
+                        (true, true)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bottom_hover_band_matches_configured_height_gap_and_dpi() {
+        use super::*;
+        for dpi in [96, 120, 144, 192] {
+            for icon_size in [24., 32., 40.] {
+                let scale = dpi as f32 / 96.;
+                let layout = layout_scale(icon_size);
+                let expected = (height(layout) * scale).round() as i32 + (margin(layout, false) * scale).round() as i32;
+                let monitor = (-2560, -1440, 0, 0);
+                for x in [-2560, -1280, -1] {
+                    assert!(bottom_hover_strip((x, -expected), monitor, dpi, icon_size, false));
+                    assert!(bottom_hover_strip((x, -1), monitor, dpi, icon_size, false));
+                    assert!(!bottom_hover_strip((x, -expected - 1), monitor, dpi, icon_size, false));
+                    assert!(!bottom_hover_strip((x, 0), monitor, dpi, icon_size, false));
+                }
+                assert!(!bottom_hover_strip((-2561, -1), monitor, dpi, icon_size, false));
+                assert!(!bottom_hover_strip((0, -1), monitor, dpi, icon_size, false));
+            }
+        }
+        assert!(!bottom_hover_strip((0, 0), (0, 0, 0, 0), 96, 24., false));
+    }
+    #[test]
+    fn chooser_order_survives_vscode_z_order_refresh_and_second_card_stays_bound() {
+        use super::*;
+        let opened = preview_order(&[], &[11, 22]);
+        let refreshed = preview_order(&opened, &[22, 11]);
+        assert_eq!(refreshed, [11, 22]);
+        let (row, close) = preview_hit(
+            PREVIEW_PAD + PREVIEW_WIDTH * 1.5,
+            60.,
+            PREVIEW_WIDTH,
+            PREVIEW_HEIGHT,
+            refreshed.len(),
+        )
+        .unwrap();
+        let pressed = PreviewPress {
+            hwnd: opened[row],
+            pid: 9,
+            close,
+            middle: false,
+        };
+        let released = PreviewPress {
+            hwnd: refreshed[row],
+            ..pressed
+        };
+        assert_eq!(pressed.release(released), Some((22, false)));
+        // Rebuilding a page after a new window appears retains old positions.
+        let added = preview_order(&refreshed, &[33, 22, 11]);
+        assert_eq!(added, [11, 22, 33]);
+        assert_eq!(preview_order(&added, &[33, 22]), [22, 33]);
+    }
+
+    #[test]
+    fn vscode_folder_titles_handle_paths_insiders_and_document_separators() {
+        use super::preview_title;
+        assert_eq!(
+            preview_title(
+                "read - working tree - C:\\Projects\\Wisp - Visual Studio Code",
+                "Code.exe",
+                "Code"
+            ),
+            "Wisp"
+        );
+        assert_eq!(
+            preview_title("readme — /home/dev/Wisp/ — Visual Studio Code", "Code.exe", "Code"),
+            "Wisp"
+        );
+        assert_eq!(
+            preview_title(
+                "main.rs - C:\\Projects\\Wisp - Visual Studio Code - Insiders",
+                "Code - Insiders.exe",
+                "Code"
+            ),
+            "Wisp"
+        );
+        assert_eq!(preview_title("Custom title", "Code.exe", "Code"), "Custom title");
+        let ambiguous = "readme - my - folder - Visual Studio Code";
+        assert_eq!(preview_title(ambiguous, "Code.exe", "Code"), ambiguous);
+        let path_with_delimiter = "readme - C:\\Projects\\my - folder - Visual Studio Code";
+        assert_eq!(
+            preview_title(path_with_delimiter, "Code.exe", "Code"),
+            path_with_delimiter
+        );
+        assert_eq!(
+            preview_title("readme - Visual Studio Code", "Code.exe", "Code"),
+            "readme"
+        );
+        assert_eq!(
+            preview_title("my-project - Visual Studio Code", "Code.exe", "Code"),
+            "my-project"
+        );
+        assert_eq!(
+            preview_title("C:\\Projects\\Wisp - Visual Studio Code", "Code.exe", "Code"),
+            "Wisp"
+        );
+        assert_eq!(
+            preview_title("/home/dev/Wisp/ — Visual Studio Code", "Code.exe", "Code"),
+            "Wisp"
+        );
+        assert_eq!(
+            preview_title(
+                "C:\\Projects\\Wisp - Visual Studio Code - Insiders",
+                "Code - Insiders.exe",
+                "Code"
+            ),
+            "Wisp"
+        );
+    }
+    #[test]
+    fn second_thumbnail_hit_stays_second_at_supported_dpi() {
+        use super::*;
+        for dpi in [96., 120., 144., 192.] {
+            let scale = dpi / 96.;
+            let x = ((PREVIEW_PAD + PREVIEW_WIDTH * 1.5) * scale) as i32;
+            let y = ((PREVIEW_PAD + PREVIEW_HEADER + 40.) * scale) as i32;
+            assert_eq!(
+                preview_hit(x as f32 / scale, y as f32 / scale, PREVIEW_WIDTH, PREVIEW_HEIGHT, 2),
+                Some((1, false))
+            );
+        }
+        assert_eq!(preview_hit(0., 40., PREVIEW_WIDTH, PREVIEW_HEIGHT, 2), None);
+        assert_eq!(
+            preview_hit(PREVIEW_PAD + 2. * PREVIEW_WIDTH, 40., PREVIEW_WIDTH, PREVIEW_HEIGHT, 2),
+            None
+        );
+    }
+    #[test]
+    fn preview_gesture_preserves_window_identity_not_row_order() {
+        use super::PreviewPress;
+        let selected = PreviewPress {
+            hwnd: 22,
+            pid: 2,
+            close: false,
+            middle: false,
+        };
+        assert_eq!(selected.release(selected), Some((22, false)));
+        assert_eq!(selected.release(PreviewPress { hwnd: 11, ..selected }), None);
+        assert_eq!(selected.release(PreviewPress { pid: 3, ..selected }), None);
+        assert_eq!(
+            selected.release(PreviewPress {
+                close: true,
+                ..selected
+            }),
+            None
+        );
+        assert_eq!(
+            selected.release(PreviewPress {
+                middle: true,
+                ..selected
+            }),
+            None
+        );
+        assert_eq!(
+            PreviewPress { pid: 0, ..selected }.release(PreviewPress { pid: 0, ..selected }),
+            None
+        );
+        let close = PreviewPress {
+            close: true,
+            ..selected
+        };
+        assert_eq!(close.release(close), Some((22, true)));
+    }
+
+    #[test]
+    fn preview_names_use_published_workspace_without_guessing_accounts() {
+        use super::preview_title;
+        assert_eq!(
+            preview_title(
+                "appsettings.json - Messenger - Visual Studio Code",
+                "C:\\Code.exe",
+                "Code"
+            ),
+            "Messenger"
+        );
+        assert_eq!(
+            preview_title("readme — Wisp — Visual Studio Code", "Code.exe", "Code"),
+            "Wisp"
+        );
+        assert_eq!(
+            preview_title("Video - YouTube - Google Chrome", "chrome.exe", "Chrome"),
+            "Video - YouTube - Google Chrome"
+        );
+        assert_eq!(preview_title("Alice", "Telegram.exe", "Telegram"), "Alice");
+        assert_eq!(preview_title("Downloads", "explorer.exe", "Explorer"), "Downloads");
+        assert_eq!(preview_title("  ", "unknown.exe", "App"), "App");
+    }
     use super::*;
 
     #[test]
@@ -347,15 +791,6 @@ mod tests {
     }
 
     #[test]
-    fn slide_endpoints_and_reversal_are_continuous() {
-        assert_eq!(slide_value(1.0, 0.0, 0.0), 1.0);
-        assert_eq!(slide_value(1.0, 0.0, 1.0), 0.0);
-        let midway = slide_value(0.0, 1.0, 0.4);
-        assert_eq!(slide_value(midway, 0.0, 0.0), midway);
-        assert!(slide_value(midway, 0.0, 0.1) < midway);
-        assert_eq!(slide_value(0.0, 1.0, 2.0), 1.0);
-    }
-    #[test]
     fn stable_order_keeps_first_seen_positions() {
         let previous = vec!["a", "b", "c"];
         // Focusing c makes it first in z-order; it must stay third.
@@ -368,11 +803,13 @@ mod tests {
     fn matches_full_paths_and_store_ids() {
         let apps = vec![
             AppEntry {
+                desktop: None,
                 id: "{folder}\\a.exe".into(),
                 path: Some(r"C:\Apps\a.exe".into()),
                 name: "A".into(),
             },
             AppEntry {
+                desktop: None,
                 id: "Package!App".into(),
                 path: None,
                 name: "Store".into(),
@@ -492,5 +929,19 @@ mod tests {
         assert_eq!(flyout_hit(x + 1.0, y + 1.0, 6), None);
         assert_eq!(flyout_hit(FLYOUT_PAD - 1.0, 10.0, 3), None);
         assert_eq!(flyout_hit(FLYOUT_PAD + 5.0 * FLYOUT_CELL + 1.0, 10.0, 9), None);
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    #[test]
+    fn remote_controls_without_audio_share_clock_free_geometry() {
+        let remote = remote_parts(parts(Some(2), false, false));
+        assert_eq!(remote, [Part::Chevron, Part::Tray(0), Part::Tray(1), Part::Volume]);
+        assert_eq!(part_left(Part::Clock, 3, &remote), None);
+        let controls = part_left(Part::Volume, 3, &remote).unwrap();
+        assert_eq!(part_hit(controls + 1., 20., 3, &remote), Some(Part::Volume));
+        assert_eq!(remote_parts(parts(None, true, false)), [Part::Volume]);
     }
 }

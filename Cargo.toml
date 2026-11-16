@@ -35,6 +35,10 @@ features = [
     "Devices_Bluetooth",
     "Devices_Bluetooth_GenericAttributeProfile",
     "Storage_Streams",
+    "System",
+    "UI_Composition_Desktop",
+    "Win32_System_WinRT_Composition",
+    "Graphics_Imaging",
     "Devices_Enumeration",
     "Devices_Radios",
     "Foundation",
@@ -88,4 +92,5 @@ opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-strip = true
+debug = "line-tables-only"
+strip = "none"

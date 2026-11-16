@@ -122,7 +122,8 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
 
         let rows = match &index {
             Some(ix) => unsafe { ix.query(&request.query) }.unwrap_or_else(|e| {
-                eprintln!("file search query failed: {e}");
+                // COM error descriptions can echo SQL or the user's query.
+                eprintln!("file search query failed: code={:#010X}", e.code().0);
                 // Reopen on the next query; the index service may have restarted.
                 index = None;
                 Vec::new()

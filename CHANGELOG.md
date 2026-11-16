@@ -4,7 +4,63 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 ## Unreleased
 
+- Add a background transparency percentage and optional blur for Transparent and Glass under Appearance → Shared material. Glass now uses the same base recipe as Transparent with blur enabled by default. Missing settings retain Transparent at 85% and Glass at 36%; explicit settings are shared between the presets. Dock, Start, Controls, tray, previews and Wisp menus follow these settings, including Remote mode, while the top bar and island keep their independent settings. Rounded clear menus retain their input shape; accessibility and failed requested effects keep the opaque fallback. Native appearance and RDP behavior remain unverified under build/unit-only checks.
+
+
+- Make Start app tiles square, tighten Home row spacing and height, and give Profile the same square icon button as Settings and Power. Retain the current app artwork size, search/surface budget, app menus and keyboard actions; native appearance remains unverified.
+
+
+- Match the top-bar tray blur clip to its existing 12 DIP rounded foreground and border, sharing the radius so native blur cannot use a squarer outline. Retain tray actions, animation and Remote layout; native appearance still requires desktop verification.
+
+
+- Share bounded animation math across Start, dock, tray and menu surfaces. Prevent Start closing from painting a duplicate dock; fade its full native window and reuse prepared pixels. Keep menu entrance dimensions fixed, animate bottom-tray dismissal/reversal, and publish island pixels before matching blur. Keep the island material in its top-bar owner group and retain a readable Glass tint. Reduce Start pin artwork by 40% without shrinking hit targets. Native smoothness, glass appearance and the reported island tint still require desktop verification.
+
+
+- Keep island glass paired with its completed foreground frame and revalidate cached companion visibility/Z-order after activation. Reduce unrelated top-bar redraws, honor elapsed animation time and requested Controls duration, bound tray-menu motion, and retain faint Start content through native-glass transitions. Native desktop smoothness and the recorded blank-island cause remain unverified by live tests.
+
+- Make Start's app menu a compact Shared-material glass popup with cached short fades, keyboard navigation, scrolling on short displays, and menu-scoped UI Automation. Retain all eight actions, disabled reasons and snapshot validation; native screen-reader, desktop and RDP behavior remain unverified by live testing.
+
+- Open Start app menus through right-click or Menu/Shift+F10 without visible three-dot buttons. Retain Start/Dock pinning, Copy path, Windows Installed apps access, unavailable actions, glass transitions and keyboard accessibility. Resolve desktop shortcut metadata in the background for administrator/file-location actions, and compact searches with few results while retaining home and live surfaces.
+
+- Refine Start with a quiet 12-pin grid, selected-app actions, persistent utility controls and independent Center/Bottom placement; compact Controls retains its actions and subpages. Add a shared Glass/Frosted/Solid material preference across the dock, Start and Wisp-owned menus, including Remote mode, while retaining legacy values, cached fades and accessibility fallbacks. Start keeps local 220/180 ms motion with Remote 120/100 ms caps; native/RDP appearance and performance remain unverified.
+
+- Reduce Remote-mode tray and Controls opening work by preparing their first frame and reusing pixels during short fades; retain normal-mode presentation and disabled/reduced motion.
+
+- Remove the external gaps above and below the Remote-mode dock while retaining its centered width and icon layout; restore normal spacing when returning to local mode.
+- Keep native dock context menus above the dock, including during periodic status updates and tray-menu completion.
+
+- Prepare Control Center before showing it, keep Controls toggles bound to the current panel, and dismiss on outside clicks or Esc even when Windows denies keyboard focus.
+
+- Add Auto/On/Off Remote mode in Settings and Start Profile: a fixed bottom dock with tray and Controls during Remote Desktop, with normal settings restored on console return.
+
+- Smooth Start opening and closing with reversible native-window motion, and add Open, administrator, file-location and pin actions to app context menus.
+- In local Smart mode, auto-hide the dock for the focused maximized app on its own monitor while retaining bottom-strip reveal, leave delay and open-menu holds. Keep actual fullscreen suppression separate; restored/background apps and Remote mode's fixed dock retain their behavior.
+
+- Add a selectable active-media source list with exact-ID exclusions and an opt-in Firefox quick-add button that recognizes locally registered installations.
+
+- Release dock state before native context menus and app actions so periodic status updates cannot panic while pinning or launching. Preserve popup state across nested destruction and make layered-surface resize failures safe.
+- Add rotating production diagnostic files, panic backtraces and matching release symbols without opening a terminal.
+- Add a separate current-monitor preview switch, including direct activation when an app has one local window.
+
+- Keep the entire rounded activity island clickable at zero tint opacity, reduce its clock font, and add an optional Windows 11 native backdrop switch with the existing tint retained when unavailable.
+
+- Add a configurable monitor-wide bottom reveal strip (1–128 physical px, default 8) with exact one-pixel controls. Keep the visible dock's full-width hover area, extended to cover taller reveal strips, to prevent repeated show/hide beside its icons.
+
+- Keep calendar month browsing separate from date selection, reserve the blue marker for the real current date, and show a clear Back to today action when viewing another month.
+
+- Refine island and menu transitions, animate the top bar tray overflow, and use consistent playback controls. Show reported Bluetooth output battery levels in Sound. Add opt-in music app exclusions with source-bound player commands.
+- Keep window-card order stable and bind clicks to the pressed window and process. Show larger live thumbnails on hover without activating the source, and use main-folder labels for standard VS Code window titles.
+
+- Repair hidden-tray menu first presentation, tune the island to restrained rounded corners, and let fresh Wi-Fi discovery proceed when an initial cached read is transiently unavailable.
+
+- Repair island and menu corners using final per-pixel presentation without leaking native acrylic. Compact current Wi-Fi/sound rows, cap available networks at 15 with scrolling, and add fresh-scan Refresh/status and confirmed-radio-on refresh.
+
+
 ### New
+
+- Add a local month calendar to the top bar clock, with Windows locale/week-start settings, date selection and keyboard navigation. Give Wi-Fi and Sound dedicated menu layouts and paint the activity island as a rounded island.
+
+- Add an optional per-display top bar with a date/clock and music island, separate Wi-Fi and sound menus, independent transparency and height settings, and Ctrl-drag tray placement. The dock keeps Start and apps while the top bar is active.
 
 - Hover an app with several windows to see its windows. Click one to switch to it, or middle-click to close it. (#21, by @JulienMaille)
 - Set the app icon size in Settings. The dock layout, spacing and icons scale together. (#39, by @JulienMaille)

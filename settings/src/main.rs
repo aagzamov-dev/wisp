@@ -1,11 +1,22 @@
 #![windows_subsystem = "windows"]
 
+#[allow(dead_code)]
+#[path = "../../src/logging.rs"]
+mod logging;
 // Shared with the launcher; this app uses only some of the names.
 #[allow(dead_code)]
 #[path = "../../src/channel.rs"]
 mod channel;
 mod config;
+#[path = "../../src/remote_mode.rs"]
+#[allow(dead_code)]
+mod remote_mode;
+
 mod hotkey;
+#[path = "../../src/media_identity.rs"]
+#[allow(dead_code)]
+mod media_identity;
+mod media_sources;
 mod palette;
 mod system;
 mod ui;
@@ -13,6 +24,13 @@ mod ui;
 use gpui_kit::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
 fn main() {
+    if let Err(error) = logging::init("settings") {
+        #[cfg(debug_assertions)]
+        std::eprintln!("Wisp Settings file diagnostics unavailable: {error}");
+        #[cfg(not(debug_assertions))]
+        let _ = error;
+    }
+    logging::event("settings.start", format_args!("ui_thread=true"));
     let args: Vec<String> = std::env::args().collect();
     let welcome = args.iter().any(|a| a == "--welcome");
     // `--page search` opens a page directly, for screenshots and testing.
@@ -25,6 +43,7 @@ fn main() {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            logging::event("settings.runtime.ready", format_args!("gpui=true"));
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
@@ -53,6 +72,8 @@ fn main() {
                 cx.new(|cx| ui::Settings::new(welcome, page.as_deref(), window, cx))
             })
             .expect("failed to open Wisp Settings");
+            logging::event("settings.window.ready", format_args!("onboarding={welcome}"));
             cx.activate(true);
         });
+    logging::finish("clean-exit");
 }

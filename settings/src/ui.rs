@@ -26,7 +26,7 @@ const ICON_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
 /// Config values and the labels the dropdowns show for them.
 const THEMES: [(&str, &str); 3] = [("system", "System"), ("dark", "Dark"), ("light", "Light")];
 const BACKDROPS: [(&str, &str); 7] = [
-    ("acrylic", "Acrylic"),
+    ("acrylic", "Frosted"),
     ("mica", "Mica"),
     ("solid", "Solid"),
     ("transparent", "Transparent"),
@@ -34,6 +34,7 @@ const BACKDROPS: [(&str, &str); 7] = [
     ("liquid-glass", "Liquid Glass"),
     ("color", "Custom color"),
 ];
+const START_POSITIONS: [(&str, &str); 2] = [("bottom", "Bottom"), ("center", "Center")];
 const DOCK_ANIMATIONS: [(&str, &str); 4] = [
     ("slide", "Slide"),
     ("fade", "Fade"),
@@ -46,23 +47,28 @@ const WINDOW_LISTS: [(&str, &str); 3] = [
     ("off", "Off"),
 ];
 const ONBOARDING_STEPS: usize = 3;
+#[path = "ui/notch.rs"]
+mod notch;
+
 type Choices = SelectState<SearchableVec<&'static str>>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
     General,
     Appearance,
+    Notch,
     Search,
     About,
 }
 
 impl Page {
-    const ALL: [Self; 4] = [Self::General, Self::Appearance, Self::Search, Self::About];
+    const ALL: [Self; 5] = [Self::General, Self::Appearance, Self::Notch, Self::Search, Self::About];
 
     fn title(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Appearance => "Appearance",
+            Self::Notch => "Top bar",
             Self::Search => "Search",
             Self::About => "About",
         }
@@ -72,6 +78,7 @@ impl Page {
         match self {
             Self::General => IconName::Settings,
             Self::Appearance => IconName::Palette,
+            Self::Notch => IconName::Settings,
             Self::Search => IconName::Search,
             Self::About => IconName::Info,
         }
@@ -89,15 +96,30 @@ pub struct Settings {
     onboarding: Option<usize>,
     shortcut: Entity<InputState>,
     folder: Entity<InputState>,
+    media_app: Entity<InputState>,
+    media_sources: Vec<crate::media_identity::Source>,
+    media_firefox: Vec<String>,
+    media_loading: bool,
+    media_loaded: bool,
+    media_error: Option<String>,
     backdrop_color: Entity<ColorPickerState>,
+    remote_mode: crate::remote_mode::Mode,
+    remote_choice: Entity<Choices>,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
+    start_position: Entity<Choices>,
     dock_animation: Entity<Choices>,
     window_list: Entity<Choices>,
     results: Entity<SliderState>,
     app_icon_size: Entity<SliderState>,
+    dock_reveal: Entity<SliderState>,
     dock_open: Entity<SliderState>,
     dock_close: Entity<SliderState>,
+    topbar_height: Entity<SliderState>,
+    topbar_transparency: Entity<SliderState>,
+    material_transparency: Entity<SliderState>,
+    topbar_island_opacity: Entity<SliderState>,
+    topbar_displays: Vec<(String, String, bool)>,
     autostart: bool,
     powertoys: Result<bool, String>,
     recording: bool,
@@ -129,12 +151,42 @@ impl Settings {
                 }
                 match loaded {
                     Ok(config) => (Some(store), config, None),
-                    Err(error) => (Some(store), Config::default(), Some(error)),
+                    Err(error) => {
+                        crate::logging::error("settings.config", format_args!("stage=initial_load"));
+                        (Some(store), Config::default(), Some(error))
+                    }
                 }
             }
-            Err(error) => (None, Config::default(), Some(error)),
+            Err(error) => {
+                crate::logging::error("settings.config", format_args!("stage=locate"));
+                (None, Config::default(), Some(error))
+            }
         };
+        let mode_path = config::path().map(|path| path.with_file_name("remote-mode.txt"));
+        let loaded_mode = mode_path.and_then(|path| crate::remote_mode::load(&path).map_err(|error| error.to_string()));
+        let (remote_mode, mode_error) = match loaded_mode {
+            Ok(mode) => (mode, None),
+            Err(error) => {
+                crate::logging::error("settings.remote_mode", format_args!("stage=initial_load error={error}"));
+                (crate::remote_mode::Mode::Auto, Some(error))
+            }
+        };
+        let error = error.or(mode_error);
+        let remote_choice = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(vec!["Auto", "On", "Off"]),
+                Some(IndexPath::new(
+                    crate::remote_mode::Mode::ALL
+                        .iter()
+                        .position(|mode| *mode == remote_mode)
+                        .unwrap_or(0),
+                )),
+                window,
+                cx,
+            )
+        });
         let shortcut = cx.new(|cx| InputState::new(window, cx).default_value(config.hotkey.clone()));
+        let media_app = cx.new(|cx| InputState::new(window, cx).placeholder("App name or source ID"));
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let backdrop_color =
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(backdrop_swatch(&config.backdrop_color)));
@@ -150,6 +202,14 @@ impl Settings {
             SelectState::new(
                 SearchableVec::new(labels(&BACKDROPS)),
                 index_of(&BACKDROPS, &config.backdrop),
+                window,
+                cx,
+            )
+        });
+        let start_position = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(labels(&START_POSITIONS)),
+                index_of(&START_POSITIONS, &config.start_position),
                 window,
                 cx,
             )
@@ -184,6 +244,13 @@ impl Settings {
                 .step(1.)
                 .default_value(config.dock_icon_size as f32)
         });
+        let dock_reveal = cx.new(|_| {
+            SliderState::new()
+                .min(1.)
+                .max(128.)
+                .step(1.)
+                .default_value(config.dock_reveal_height as f32)
+        });
         let duration_slider = |value: i64| {
             SliderState::new()
                 .min(0.)
@@ -193,6 +260,66 @@ impl Settings {
         };
         let dock_open = cx.new(|_| duration_slider(config.dock_open_ms));
         let dock_close = cx.new(|_| duration_slider(config.dock_close_ms));
+        let topbar_height = cx.new(|_| {
+            SliderState::new()
+                .min(24.)
+                .max(48.)
+                .step(1.)
+                .default_value(config.topbar_height as f32)
+        });
+        let topbar_transparency = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(1.)
+                .default_value((100 - config.topbar_opacity) as f32)
+        });
+        let material_transparency = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(1.)
+                .default_value(config.material_transparency() as f32)
+        });
+        cx.subscribe_in(&material_transparency, window, |this, _, event, window, cx| {
+            if let SliderEvent::Change(value) = event {
+                let value = value.start().round() as i64;
+                if value != this.config.material_transparency() {
+                    this.save("backdrop_transparency", value.into(), window, cx);
+                }
+            }
+        })
+        .detach();
+        let topbar_island_opacity = cx.new(|_| {
+            SliderState::new()
+                .min(0.)
+                .max(100.)
+                .step(1.)
+                .default_value(config.topbar_island_opacity as f32)
+        });
+        for (slider, key) in [
+            (&topbar_height, "topbar_height"),
+            (&topbar_transparency, "topbar_opacity"),
+            (&topbar_island_opacity, "topbar_island_opacity"),
+        ] {
+            cx.subscribe_in(slider, window, move |this, _, event, window, cx| {
+                if let SliderEvent::Change(value) = event {
+                    let mut value = value.start().round() as i64;
+                    if key == "topbar_opacity" {
+                        value = 100 - value;
+                    }
+                    let current = match key {
+                        "topbar_height" => this.config.topbar_height,
+                        "topbar_opacity" => this.config.topbar_opacity,
+                        _ => this.config.topbar_island_opacity,
+                    };
+                    if current != value {
+                        this.save(key, value.into(), window, cx);
+                    }
+                }
+            })
+            .detach();
+        }
         let focus = cx.focus_handle();
 
         cx.subscribe_in(&shortcut, window, |this, input, event, window, cx| {
@@ -222,6 +349,30 @@ impl Settings {
             }
         })
         .detach();
+        cx.subscribe_in(&remote_choice, window, |this, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(label)) = event
+                && let Some(mode) = crate::remote_mode::Mode::parse(label)
+            {
+                let result = config::path().and_then(|path| {
+                    crate::remote_mode::save(&path.with_file_name("remote-mode.txt"), mode)
+                        .map_err(|error| error.to_string())
+                });
+                match result {
+                    Ok(()) => {
+                        this.remote_mode = mode;
+                        this.error = None;
+                        system::notify_launcher();
+                    }
+                    Err(error) => {
+                        crate::logging::error("settings.remote_mode", format_args!("stage=save error={error}"));
+                        this.error = Some(error);
+                        this.sync_remote_choice(window, cx);
+                    }
+                }
+                cx.notify();
+            }
+        })
+        .detach();
         cx.subscribe_in(&theme, window, |this, _, event, window, cx| {
             if let SelectEvent::Confirm(Some(label)) = event
                 && let Some(value) = value_of(&THEMES, label)
@@ -238,11 +389,22 @@ impl Settings {
             }
         })
         .detach();
+        cx.subscribe_in(&start_position, window, |this, _, event, window, cx| {
+            if let SelectEvent::Confirm(Some(label)) = event
+                && let Some(value) = value_of(&START_POSITIONS, label)
+            {
+                this.save("start_position", value.into(), window, cx);
+            }
+        })
+        .detach();
         cx.subscribe_in(&backdrop, window, |this, _, event, window, cx| {
             if let SelectEvent::Confirm(Some(label)) = event
                 && let Some(value) = value_of(&BACKDROPS, label)
+                && this.save("backdrop", value.into(), window, cx)
             {
-                this.save("backdrop", value.into(), window, cx);
+                let transparency = this.config.material_transparency() as f32;
+                this.material_transparency
+                    .update(cx, |state, cx| state.set_value(transparency, window, cx));
             }
         })
         .detach();
@@ -272,6 +434,15 @@ impl Settings {
             }
         })
         .detach();
+        cx.subscribe_in(&dock_reveal, window, |this, _, event, window, cx| {
+            if let SliderEvent::Change(value) = event {
+                let value = (value.start().round() as i64).clamp(1, 128);
+                if value != this.config.dock_reveal_height {
+                    this.save("dock_reveal_height", value.into(), window, cx);
+                }
+            }
+        })
+        .detach();
         for (slider, key) in [(&dock_open, "dock_open_ms"), (&dock_close, "dock_close_ms")] {
             cx.subscribe_in(slider, window, move |this, _, event, window, cx| {
                 if let SliderEvent::Change(value) = event {
@@ -290,13 +461,19 @@ impl Settings {
         }
         cx.observe_window_appearance(window, |this, window, cx| this.apply_theme(window, cx))
             .detach();
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.reload_remote_mode(window, cx);
+            }
+        })
+        .detach();
         cx.on_blur(&focus, window, |this, _, cx| {
             this.recording = false;
             cx.notify();
         })
         .detach();
 
-        let this = Self {
+        let mut this = Self {
             store,
             shortcut_error: hotkey::parse(&config.hotkey).err(),
             config,
@@ -304,28 +481,74 @@ impl Settings {
             folder_error: None,
             page: Page::ALL
                 .into_iter()
-                .find(|p| page.is_some_and(|name| p.title().eq_ignore_ascii_case(name)))
+                .find(|p| {
+                    page.is_some_and(|name| {
+                        p.title().eq_ignore_ascii_case(name) || *p == Page::Notch && name.eq_ignore_ascii_case("notch")
+                    })
+                })
                 .unwrap_or(Page::General),
             onboarding: welcome.then_some(0),
             shortcut,
             folder,
+            media_app,
+            media_sources: Vec::new(),
+            media_firefox: Vec::new(),
+            media_loading: false,
+            media_loaded: false,
+            media_error: None,
             backdrop_color,
+            remote_mode,
+            remote_choice,
             theme,
             backdrop,
+            start_position,
             dock_animation,
             window_list,
             results,
             app_icon_size,
+            dock_reveal,
             dock_open,
             dock_close,
+            topbar_height,
+            topbar_transparency,
+            material_transparency,
+            topbar_island_opacity,
+            topbar_displays: system::topbar_displays(),
             autostart: system::autostart_enabled(),
             powertoys: system::powertoys_run_enabled(),
             recording: false,
             focus,
             icon: Arc::new(Image::from_bytes(ImageFormat::Svg, ICON_SVG.to_vec())),
         };
+        if this.page == Page::Notch {
+            this.refresh_media_sources(cx);
+        }
         this.apply_theme(window, cx);
         this
+    }
+
+    fn refresh_media_sources(&mut self, cx: &mut Context<Self>) {
+        if self.media_loading {
+            return;
+        }
+        self.media_loading = true;
+        self.media_error = None;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let snapshot = executor.spawn(async { crate::media_sources::snapshot() }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.media_loading = false;
+                this.media_loaded = true;
+                this.media_firefox = snapshot.firefox;
+                this.media_error = snapshot.error;
+                if this.media_error.is_none() {
+                    this.media_sources = snapshot.sources;
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn apply_theme(&self, window: &mut Window, cx: &mut App) {
@@ -367,11 +590,37 @@ impl Settings {
                 true
             }
             Err(error) => {
+                crate::logging::error("settings.config", format_args!("stage=save key={key}"));
                 self.error = Some(error);
                 cx.notify();
                 false
             }
         }
+    }
+
+    fn sync_remote_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let index = crate::remote_mode::Mode::ALL
+            .iter()
+            .position(|mode| *mode == self.remote_mode)
+            .map(IndexPath::new);
+        self.remote_choice
+            .update(cx, |state, cx| state.set_selected_index(index, window, cx));
+    }
+
+    fn reload_remote_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match config::path().and_then(|path| {
+            crate::remote_mode::load(&path.with_file_name("remote-mode.txt")).map_err(|error| error.to_string())
+        }) {
+            Ok(mode) => {
+                self.remote_mode = mode;
+                self.sync_remote_choice(window, cx);
+            }
+            Err(error) => {
+                crate::logging::error("settings.remote_mode", format_args!("stage=reload error={error}"));
+                self.error = Some(error);
+            }
+        }
+        cx.notify();
     }
 
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -397,6 +646,9 @@ impl Settings {
                 let color = backdrop_swatch(&self.config.backdrop_color);
                 self.backdrop_color
                     .update(cx, |input, cx| input.set_value(color, window, cx));
+                self.start_position.update(cx, |state, cx| {
+                    state.set_selected_index(index_of(&START_POSITIONS, &self.config.start_position), window, cx)
+                });
                 let backdrop = index_of(&BACKDROPS, &self.config.backdrop);
                 self.backdrop
                     .update(cx, |state, cx| state.set_selected_index(backdrop, window, cx));
@@ -404,6 +656,16 @@ impl Settings {
                 self.window_list
                     .update(cx, |state, cx| state.set_selected_index(window_list, window, cx));
                 let results = self.config.max_results as f32;
+                self.topbar_displays = system::topbar_displays();
+                for (slider, value) in [
+                    (&self.topbar_height, self.config.topbar_height),
+                    (&self.material_transparency, self.config.material_transparency()),
+                    (&self.dock_reveal, self.config.dock_reveal_height),
+                    (&self.topbar_transparency, 100 - self.config.topbar_opacity),
+                    (&self.topbar_island_opacity, self.config.topbar_island_opacity),
+                ] {
+                    slider.update(cx, |state, cx| state.set_value(value as f32, window, cx));
+                }
                 self.results
                     .update(cx, |state, cx| state.set_value(results, window, cx));
                 let app_icon_size = self.config.dock_icon_size as f32;
@@ -417,8 +679,12 @@ impl Settings {
                 }
                 self.apply_theme(window, cx);
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => {
+                crate::logging::error("settings.config", format_args!("stage=reload"));
+                self.error = Some(error);
+            }
         }
+        self.reload_remote_mode(window, cx);
         cx.notify();
     }
 
@@ -568,6 +834,9 @@ impl Settings {
     fn general(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .gap_2()
+            .child(label("Remote mode", p))
+            .child(group(p).child(row("Remote mode", "Temporary layout for Remote Desktop", Select::new(&self.remote_choice).accessibility_label("Remote mode").w(px(160.)), p)))
+            .child(hint("Auto uses a fixed bottom dock during Remote Desktop, with apps, tray and Controls. On always uses it; Off keeps your normal layout. Your normal settings are restored on console return in Auto.", p))
             .child(label("Launcher", p))
             .child(
                 group(p).child(
@@ -617,27 +886,73 @@ impl Settings {
                     ))
                     .child(divider(p))
                     .child(row(
-                        "Smart auto-hide",
-                        "Keep the dock visible while its space is clear. Reveal it from the bottom edge when a window overlaps it.",
+                        "Hide for focused maximized apps",
+                        "Keep the dock visible outside focused maximized or fullscreen apps on this display. For maximized apps, move to the bottom reveal strip to show it again. Turn this off for normal pointer auto-hide.",
                         Switch::new("dock-smart-hide")
                             .checked(self.config.dock_smart_hide)
                             .disabled(!self.config.dock || !self.config.dock_autohide)
-                            .accessibility_label("Smart auto-hide")
+                            .accessibility_label("Hide for focused maximized or fullscreen apps")
                             .on_change(cx.listener(|this, enabled: &bool, window, cx| {
                                 this.save("dock_smart_hide", (*enabled).into(), window, cx);
                             })),
                         p,
                     ))
                     .child(divider(p))
+                    .child(
+                        item(
+                            "Reveal strip height",
+                            format!("{} physical px from the bottom of every screen. Range 1–128, default 8. Independent of Windows display scaling; the visible dock keeps its larger hover area.", self.config.dock_reveal_height),
+                            p,
+                        )
+                        .child(
+                            div().flex().items_center().gap_2()
+                                .child(Button::new("dock-reveal-minus").label("−")
+                                    .accessibility_label("Decrease reveal strip by one physical pixel")
+                                    .disabled(!self.config.dock || !self.config.dock_autohide || self.config.dock_reveal_height <= 1)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let value = (this.config.dock_reveal_height - 1).clamp(1, 128);
+                                        if this.save("dock_reveal_height", value.into(), window, cx) {
+                                            this.dock_reveal.update(cx, |state, cx| state.set_value(value as f32, window, cx));
+                                        }
+                                    })))
+                                .child(Slider::new(&self.dock_reveal)
+                                    .accessibility_label("Reveal strip height in physical pixels")
+                                    .disabled(!self.config.dock || !self.config.dock_autohide)
+                                    .flex_1())
+                                .child(Button::new("dock-reveal-plus").label("+")
+                                    .accessibility_label("Increase reveal strip by one physical pixel")
+                                    .disabled(!self.config.dock || !self.config.dock_autohide || self.config.dock_reveal_height >= 128)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        let value = (this.config.dock_reveal_height + 1).clamp(1, 128);
+                                        if this.save("dock_reveal_height", value.into(), window, cx) {
+                                            this.dock_reveal.update(cx, |state, cx| state.set_value(value as f32, window, cx));
+                                        }
+                                    })))
+                        )
+                    )
+                    .child(divider(p))
                     .child(row(
                         "Show apps from this monitor only",
-                        "Keep pinned apps. Previews still show windows from all monitors for each visible app.",
+                        "Keep pinned apps. Window previews have a separate monitor filter below.",
                         Switch::new("dock-current-monitor")
                             .checked(self.config.dock_current_monitor_only)
                             .disabled(!self.config.dock)
                             .accessibility_label("Show apps from this monitor only")
                             .on_change(cx.listener(|this, enabled: &bool, window, cx| {
                                 this.save("dock_current_monitor_only", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(row(
+                        "Preview windows from this monitor only",
+                        "Show local windows in previews. One local window opens directly. With none, clicking the app keeps its normal behavior and may switch monitors.",
+                        Switch::new("dock-preview-current-monitor")
+                            .checked(self.config.dock_preview_current_monitor_only)
+                            .disabled(!self.config.dock)
+                            .accessibility_label("Preview windows from this monitor only")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("dock_preview_current_monitor_only", (*enabled).into(), window, cx);
                             })),
                         p,
                     ))
@@ -676,6 +991,13 @@ impl Settings {
                     ))
                     .child(divider(p))
                     .child(row(
+                        "Start position",
+                        "Open Wisp Start at the bottom or center of the screen.",
+                        Select::new(&self.start_position).accessibility_label("Start position").w(px(160.)),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(row(
                         "Launcher at the bottom",
                         "Open the launcher at the bottom of the screen. With the dock, the dock grows into the launcher.",
                         Switch::new("position-bottom")
@@ -699,7 +1021,15 @@ impl Settings {
             .into_any_element()
     }
 
-    fn appearance(&self, p: Palette, _cx: &mut Context<Self>) -> AnyElement {
+    fn adjust_material_transparency(&mut self, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let value = (self.config.material_transparency() + delta).clamp(0, 100);
+        if self.save("backdrop_transparency", value.into(), window, cx) {
+            self.material_transparency
+                .update(cx, |state, cx| state.set_value(value as f32, window, cx));
+        }
+    }
+
+    fn appearance(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .gap_2()
             .child(label("Look", p))
@@ -713,11 +1043,39 @@ impl Settings {
                     ))
                     .child(divider(p))
                     .child(row(
-                        "Backdrop",
-                        "Shared by Start, the Wisp dock, and Control Center.",
-                        Select::new(&self.backdrop).accessibility_label("Backdrop").w(px(160.)),
+                        "Shared material",
+                        "Dock, Start, Controls, tray and Wisp popups follow this choice, including Remote mode. Windows may limit blur.",
+                        Select::new(&self.backdrop).accessibility_label("Shared material").w(px(160.)),
                         p,
                     ))
+                    .when(matches!(self.config.backdrop.as_str(), "transparent" | "glass"), |group| {
+                        group.child(divider(p)).child(
+                            item("Background transparency", format!("{}%: 0% opaque, 100% clear. Text and icons keep their opacity.", self.config.material_transparency()), p)
+                            .child(h_flex().items_center().gap_2()
+                                .child(Button::new("material-transparency-minus").label("−")
+                                    .accessibility_label("Decrease background transparency by one percent")
+                                    .disabled(self.config.material_transparency() == 0)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.adjust_material_transparency(-1, window, cx);
+                                    })))
+                                .child(Slider::new(&self.material_transparency)
+                                    .accessibility_label("Background transparency percent").flex_1())
+                                .child(Button::new("material-transparency-plus").label("+")
+                                    .accessibility_label("Increase background transparency by one percent")
+                                    .disabled(self.config.material_transparency() == 100)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.adjust_material_transparency(1, window, cx);
+                                    }))))
+                        ).child(divider(p)).child(row(
+                            "Blur behind background",
+                            "Soften the desktop behind the shared material. Windows may limit blur.",
+                            Switch::new("material-blur").checked(self.config.material_blur())
+                                .accessibility_label("Blur behind shared material")
+                                .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                    this.save("backdrop_blur", (*enabled).into(), window, cx);
+                                })), p,
+                        ))
+                    })
                     .when(self.config.backdrop == "color", |group| {
                         group.child(divider(p)).child(row(
                             "Custom color",
@@ -902,6 +1260,7 @@ impl Settings {
         let page = match self.page {
             Page::General => self.general(p, cx),
             Page::Appearance => self.appearance(p, cx),
+            Page::Notch => self.notch(p, cx),
             Page::Search => self.search(p, cx),
             Page::About => self.about(p, cx),
         };
@@ -1124,6 +1483,9 @@ fn nav_item(page: Page, active: bool, p: Palette, cx: &mut Context<Settings>) ->
         .child(page.title())
         .on_click(cx.listener(move |this, _, _, cx| {
             this.page = page;
+            if page == Page::Notch && !this.media_loaded {
+                this.refresh_media_sources(cx);
+            }
             this.recording = false;
             this.autostart = system::autostart_enabled();
             cx.notify();
@@ -1159,7 +1521,12 @@ fn item(title: &'static str, description: impl Into<SharedString>, p: Palette) -
 }
 
 /// A setting whose control sits at the right. The control keeps its own width.
-fn row(title: &'static str, description: impl Into<SharedString>, control: impl IntoElement, p: Palette) -> Div {
+fn row(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    control: impl IntoElement,
+    p: Palette,
+) -> Div {
     h_flex()
         .gap_4()
         .px_4()
@@ -1168,7 +1535,7 @@ fn row(title: &'static str, description: impl Into<SharedString>, control: impl 
             v_flex()
                 .flex_1()
                 .min_w_0()
-                .child(div().child(title))
+                .child(div().child(title.into()))
                 .child(hint(description, p)),
         )
         .child(div().flex_none().child(control))

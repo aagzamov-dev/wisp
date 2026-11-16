@@ -17,15 +17,28 @@ pub struct Config {
     pub theme: String,
     pub backdrop: String,
     pub backdrop_color: String,
+    pub backdrop_transparency: Option<i64>,
+    pub backdrop_blur: Option<bool>,
     pub win_start: bool,
+    pub music_notch: bool,
+    pub music_excluded_apps: Vec<String>,
+    pub topbar: bool,
+    pub topbar_island_blur: bool,
+    pub topbar_height: i64,
+    pub topbar_opacity: i64,
+    pub topbar_island_opacity: i64,
+    pub topbar_monitors: Vec<String>,
     pub show_recent: bool,
     pub file_search: bool,
     pub file_search_exclude: Vec<String>,
     pub position: String,
+    pub start_position: String,
     pub dock: bool,
     pub dock_autohide: bool,
+    pub dock_reveal_height: i64,
     pub dock_smart_hide: bool,
     pub dock_current_monitor_only: bool,
+    pub dock_preview_current_monitor_only: bool,
     pub dock_icon_size: i64,
     pub dock_open_ms: i64,
     pub dock_close_ms: i64,
@@ -41,6 +54,14 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn material_transparency(&self) -> i64 {
+        self.backdrop_transparency
+            .unwrap_or(if self.backdrop == "glass" { 36 } else { 85 })
+    }
+    pub fn material_blur(&self) -> bool {
+        self.backdrop_blur.unwrap_or(self.backdrop == "glass")
+    }
+
     fn from_document(doc: &DocumentMut) -> Result<Self, String> {
         let defaults: DocumentMut = DEFAULT_CONFIG.parse().expect("valid default config");
         let missing: DocumentMut = MISSING_KEYS.parse().expect("valid missing keys");
@@ -83,6 +104,8 @@ impl Config {
         }
         let position = string("position")?;
         choice(&position, &["center", "bottom"], "position")?;
+        let start_position = string("start_position")?;
+        choice(&start_position, &["center", "bottom"], "start_position")?;
         let window_list = string("window_list")?;
         choice(&window_list, &["always", "multiple", "off"], "window_list")?;
         let dock_icon_size = get("dock_icon_size")
@@ -119,14 +142,54 @@ impl Config {
             theme,
             backdrop,
             backdrop_color,
+            backdrop_transparency: doc
+                .get("backdrop_transparency")
+                .map(|item| bounded_integer(item, "backdrop_transparency", 0, 100))
+                .transpose()?,
+            backdrop_blur: doc
+                .get("backdrop_blur")
+                .map(|item| {
+                    item.as_bool()
+                        .ok_or_else(|| "backdrop_blur must be true or false.".to_string())
+                })
+                .transpose()?,
             win_start: boolean("win_start")?,
+            music_notch: boolean("music_notch")?,
+            music_excluded_apps: get("music_excluded_apps")
+                .as_array()
+                .ok_or("Excluded media apps must be a list.")?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "Excluded media apps must be text.".to_string())
+                })
+                .collect::<Result<_, _>>()?,
+            topbar: boolean("topbar")?,
+            topbar_island_blur: boolean("topbar_island_blur")?,
+            topbar_height: bounded_integer(get("topbar_height"), "topbar_height", 24, 48)?,
+            topbar_opacity: bounded_integer(get("topbar_opacity"), "topbar_opacity", 0, 100)?,
+            topbar_island_opacity: bounded_integer(get("topbar_island_opacity"), "topbar_island_opacity", 0, 100)?,
+            topbar_monitors: get("topbar_monitors")
+                .as_array()
+                .ok_or("Choose displays for the top bar.")?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| "Display names must be text.".to_string())
+                })
+                .collect::<Result<_, _>>()?,
             show_recent: boolean("show_recent")?,
             file_search: boolean("file_search")?,
             file_search_exclude,
             position,
+            start_position,
             dock: boolean("dock")?,
             dock_autohide: boolean("dock_autohide")?,
+            dock_reveal_height: bounded_integer(get("dock_reveal_height"), "dock_reveal_height", 1, 128)?,
             dock_current_monitor_only: boolean("dock_current_monitor_only")?,
+            dock_preview_current_monitor_only: boolean("dock_preview_current_monitor_only")?,
             dock_smart_hide: boolean("dock_smart_hide")?,
             dock_icon_size,
             dock_open_ms: duration("dock_open_ms")?,
@@ -142,6 +205,13 @@ fn valid_color(color: &str) -> bool {
     color
         .strip_prefix('#')
         .is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn bounded_integer(item: &Item, key: &str, min: i64, max: i64) -> Result<i64, String> {
+    item.as_integer()
+        .filter(|n| *n >= 0)
+        .map(|n| n.clamp(min, max))
+        .ok_or_else(|| format!("{key} must be a non-negative whole number."))
 }
 
 fn choice(value: &str, choices: &[&str], key: &str) -> Result<(), String> {
@@ -246,24 +316,48 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         "dock_icon_size" if !value.as_integer().is_some_and(|size| (24..=40).contains(&size)) => {
             return Err("Choose an app icon size between 24 and 40 DIP.".into());
         }
+        "dock_reveal_height" if !value.as_integer().is_some_and(|height| (1..=128).contains(&height)) => {
+            return Err("Choose a reveal strip height between 1 and 128 physical pixels.".into());
+        }
         "dock_open_ms" | "dock_close_ms" if !value.as_integer().is_some_and(|ms| (0..=500).contains(&ms)) => {
             return Err("Choose an animation time between 0 and 500 ms.".into());
         }
         "backdrop_color" if !value.as_str().is_some_and(valid_color) => {
             return Err("Enter a color as #RRGGBB.".into());
         }
+        "topbar_height" if !value.as_integer().is_some_and(|height| (24..=48).contains(&height)) => {
+            return Err("Choose a top bar height between 24 and 48 px.".into());
+        }
+        "backdrop_transparency" | "topbar_opacity" | "topbar_island_opacity"
+            if !value.as_integer().is_some_and(|opacity| (0..=100).contains(&opacity)) =>
+        {
+            return Err("Choose an opacity between 0 and 100%.".into());
+        }
         "theme"
+        | "topbar"
+        | "topbar_island_blur"
+        | "topbar_height"
+        | "topbar_opacity"
+        | "topbar_island_opacity"
+        | "topbar_monitors"
         | "backdrop_color"
+        | "backdrop_transparency"
+        | "backdrop_blur"
         | "win_start"
+        | "music_notch"
+        | "music_excluded_apps"
         | "backdrop"
         | "max_results"
         | "show_recent"
         | "file_search"
         | "file_search_exclude"
         | "position"
+        | "start_position"
         | "dock"
         | "dock_autohide"
+        | "dock_reveal_height"
         | "dock_current_monitor_only"
+        | "dock_preview_current_monitor_only"
         | "dock_smart_hide"
         | "dock_icon_size"
         | "dock_open_ms"
@@ -281,7 +375,179 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shared_material_roundtrip_preserves_missing_defaults_comments_and_unknown_fields() {
+        for mode in ["transparent", "glass"] {
+            let old = Config::from_document(&format!("backdrop='{mode}'").parse().unwrap()).unwrap();
+            assert_eq!(old.backdrop_transparency, None);
+            assert_eq!(old.backdrop_blur, None);
+            assert_eq!(old.material_transparency(), if mode == "glass" { 36 } else { 85 });
+            assert_eq!(old.material_blur(), mode == "glass");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.toml"));
+        std::fs::write(&store.path, "# Keep note\nbackdrop='transparent'\nfuture_key=42\n").unwrap();
+        for value in [0, 85, 100] {
+            let edited = store.set("backdrop_transparency", value.into()).unwrap();
+            assert_eq!(edited.backdrop_transparency, Some(value));
+            assert_eq!(store.load().unwrap(), edited);
+        }
+        for blur in [true, false] {
+            let edited = store.set("backdrop_blur", blur.into()).unwrap();
+            assert_eq!(edited.backdrop_blur, Some(blur));
+            assert_eq!(store.load().unwrap(), edited);
+        }
+        // Changing the preset keeps explicit overrides and its exact saved percent.
+        let glass = store.set("backdrop", "glass".into()).unwrap();
+        assert_eq!(glass.material_transparency(), 100);
+        assert!(!glass.material_blur());
+        let saved = std::fs::read_to_string(&store.path).unwrap();
+        assert!(saved.contains("# Keep note") && saved.contains("future_key=42"));
+        for invalid in [(-1).into(), 101.into(), "85".into(), 0.5.into()] {
+            assert!(store.set("backdrop_transparency", invalid).is_err());
+        }
+        assert!(store.set("backdrop_blur", "true".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&store.path).unwrap(), saved);
+        for (value, expected) in [
+            (0i64, 0),
+            (85, 85),
+            (100, 100),
+            (999, 100),
+            (u32::MAX as i64 + 1, 100),
+            (i64::MAX, 100),
+        ] {
+            let read = Config::from_document(&format!("backdrop_transparency={value}").parse().unwrap()).unwrap();
+            assert_eq!(read.backdrop_transparency, Some(expected));
+        }
+        for invalid in [
+            "backdrop_transparency=-1",
+            "backdrop_transparency=3.5",
+            "backdrop_transparency='85'",
+            "backdrop_blur='false'",
+            "backdrop_blur=0",
+        ] {
+            assert!(Config::from_document(&invalid.parse().unwrap()).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn start_position_is_separate_and_all_saved_materials_remain_valid() {
+        let config = Config::from_document(&"position='bottom'\nstart_position='center'".parse().unwrap()).unwrap();
+        assert_eq!(config.start_position, "center");
+        assert_eq!(config.position, "bottom");
+        for invalid in ["top", "invalid"] {
+            assert!(Config::from_document(&format!("start_position='{invalid}'").parse().unwrap()).is_err());
+        }
+        for value in [
+            "acrylic",
+            "mica",
+            "solid",
+            "transparent",
+            "glass",
+            "liquid-glass",
+            "color",
+        ] {
+            assert_eq!(
+                Config::from_document(&format!("backdrop='{value}'").parse().unwrap())
+                    .unwrap()
+                    .backdrop,
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn dock_reveal_height_roundtrips_exact_pixels_and_preserves_legacy_defaults() {
+        assert_eq!(
+            Config::from_document(&"hotkey='Alt+Space'".parse().unwrap())
+                .unwrap()
+                .dock_reveal_height,
+            8
+        );
+        for (value, expected) in [(0, 1), (1, 1), (8, 8), (128, 128), (999, 128)] {
+            let doc = format!("dock_reveal_height={value}").parse().unwrap();
+            assert_eq!(Config::from_document(&doc).unwrap().dock_reveal_height, expected);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.toml"));
+        std::fs::write(&store.path, "# Keep note\ndock_autohide=true\ncustom=42\n").unwrap();
+        for value in [1, 9, 128] {
+            assert_eq!(
+                store
+                    .set("dock_reveal_height", value.into())
+                    .unwrap()
+                    .dock_reveal_height,
+                value
+            );
+        }
+        for value in [(-1).into(), 0.into(), 129.into(), "8".into()] {
+            assert!(store.set("dock_reveal_height", value).is_err());
+        }
+        let saved = std::fs::read_to_string(&store.path).unwrap();
+        assert!(saved.contains("# Keep note") && saved.contains("custom=42"));
+        assert_eq!(store.load().unwrap().dock_reveal_height, 128);
+    }
+    #[test]
+    fn preview_monitor_switch_defaults_off_and_preserves_icon_switch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.toml"));
+        assert!(!store.load().unwrap().dock_preview_current_monitor_only);
+        let config = store.set("dock_preview_current_monitor_only", true.into()).unwrap();
+        assert!(config.dock_preview_current_monitor_only);
+        assert!(!config.dock_current_monitor_only);
+        assert!(store.set("dock_preview_current_monitor_only", "yes".into()).is_err());
+        assert!(store.load().unwrap().dock_preview_current_monitor_only);
+    }
+    #[test]
+    fn island_blur_roundtrip_preserves_legacy_values_and_comments() {
+        let mut doc: toml_edit::DocumentMut = "# user notes\nhotkey='Ctrl+Space' # keep shortcut\n".parse().unwrap();
+        assert!(!Config::from_document(&doc).unwrap().topbar_island_blur);
+        validate_edit("topbar_island_blur", &true.into()).unwrap();
+        doc["topbar_island_blur"] = toml_edit::value(true);
+        let text = doc.to_string();
+        assert!(text.contains("# user notes"));
+        assert!(text.contains("# keep shortcut"));
+        let read = Config::from_document(&text.parse().unwrap()).unwrap();
+        assert!(read.topbar_island_blur);
+        assert_eq!(read.hotkey, "Ctrl+Space");
+        doc["topbar_island_blur"] = toml_edit::value(false);
+        assert!(!Config::from_document(&doc).unwrap().topbar_island_blur);
+        assert!(Config::from_document(&"topbar_island_blur=42".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn media_exclusion_config_roundtrip_and_removal() {
+        let mut doc: toml_edit::DocumentMut = "hotkey='Alt+Space'".parse().unwrap();
+        assert!(Config::from_document(&doc).unwrap().music_excluded_apps.is_empty());
+        let list: toml_edit::Array = ["Google Chrome", "Spotify.exe"].into_iter().collect();
+        let value = toml_edit::Value::Array(list);
+        validate_edit("music_excluded_apps", &value).unwrap();
+        doc["music_excluded_apps"] = toml_edit::value(value);
+        let reloaded = Config::from_document(&doc.to_string().parse().unwrap()).unwrap();
+        assert_eq!(reloaded.music_excluded_apps, ["Google Chrome", "Spotify.exe"]);
+        doc["music_excluded_apps"] = toml_edit::value(toml_edit::Array::new());
+        assert!(Config::from_document(&doc).unwrap().music_excluded_apps.is_empty());
+        assert!(Config::from_document(&"music_excluded_apps=[42]".parse().unwrap()).is_err());
+    }
     use super::*;
+    #[test]
+    fn topbar_defaults_preserve_old_configs_and_validate_edits() {
+        let old = Config::from_document(&"hotkey='Alt+Space'".parse().unwrap()).unwrap();
+        assert!(!old.topbar);
+        assert_eq!(
+            (old.topbar_height, old.topbar_opacity, old.topbar_island_opacity),
+            (32, 0, 70)
+        );
+        assert_eq!(old.topbar_monitors, ["primary"]);
+        let doc = "topbar=true\ntopbar_height=999\ntopbar_opacity=999\ntopbar_monitors=['\\\\.\\DISPLAY2']"
+            .parse()
+            .unwrap();
+        let clamped = Config::from_document(&doc).unwrap();
+        assert_eq!((clamped.topbar_height, clamped.topbar_opacity), (48, 100));
+        assert!(validate_edit("topbar_height", &23.into()).is_err());
+        assert!(validate_edit("topbar_opacity", &101.into()).is_err());
+        assert!(Config::from_document(&"topbar_height=-1".parse().unwrap()).is_err());
+        assert!(Config::from_document(&"topbar_monitors=[42]".parse().unwrap()).is_err());
+    }
 
     #[test]
     fn defaults_match_launcher() {
@@ -293,6 +559,7 @@ mod tests {
         assert!(config.show_recent && config.file_search);
         assert_eq!(config.file_search_exclude.len(), 14);
         assert_eq!(config.position, "bottom");
+        assert_eq!(config.start_position, "bottom");
         assert!(config.dock && config.dock_autohide && config.hide_taskbar);
         assert_eq!(config.dock_icon_size, 24);
         assert_eq!(
@@ -307,6 +574,7 @@ mod tests {
         let old = Config::from_document(&"hotkey = 'Alt+Space'".parse().unwrap()).unwrap();
         assert!(!old.dock && !old.hide_taskbar);
         assert_eq!(old.position, "center");
+        assert_eq!(old.start_position, "bottom");
         assert_eq!(old.max_results, config.max_results);
         assert_eq!(config.window_list, "always");
         assert_eq!(Config::from_document(&DEFAULT_CONFIG.parse().unwrap()).unwrap(), config);

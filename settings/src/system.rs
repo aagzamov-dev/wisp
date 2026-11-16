@@ -14,6 +14,53 @@ use windows::{
 const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
 const RUN_VALUE: PCWSTR = crate::channel::RUN_VALUE;
 
+/// Device names survive monitor rearrangement and match the launcher's selector.
+pub fn topbar_displays() -> Vec<(String, String, bool)> {
+    use windows::Win32::Foundation::RECT;
+    #[repr(C)]
+    struct Info {
+        size: u32,
+        monitor: RECT,
+        work: RECT,
+        flags: u32,
+        device: [u16; 32],
+    }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn EnumDisplayMonitors(
+            dc: isize,
+            clip: *const RECT,
+            callback: Option<unsafe extern "system" fn(isize, isize, *mut RECT, isize) -> i32>,
+            data: isize,
+        ) -> i32;
+        fn GetMonitorInfoW(monitor: isize, info: *mut Info) -> i32;
+    }
+    unsafe extern "system" fn collect(monitor: isize, _: isize, _: *mut RECT, data: isize) -> i32 {
+        unsafe {
+            let mut info: Info = std::mem::zeroed();
+            info.size = std::mem::size_of::<Info>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                let id =
+                    String::from_utf16_lossy(&info.device[..info.device.iter().position(|c| *c == 0).unwrap_or(32)]);
+                let number = id.trim_start_matches(r"\\.\DISPLAY");
+                let label = format!(
+                    "Display {number} · {} × {}{}",
+                    info.monitor.right - info.monitor.left,
+                    info.monitor.bottom - info.monitor.top,
+                    if info.flags & 1 != 0 { " · Main" } else { "" }
+                );
+                (*(data as *mut Vec<(String, String, bool)>)).push((id, label, info.flags & 1 != 0));
+            }
+            1
+        }
+    }
+    let mut displays = Vec::new();
+    unsafe {
+        EnumDisplayMonitors(0, std::ptr::null(), Some(collect), &raw mut displays as isize);
+    }
+    displays
+}
+
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value.as_ref().encode_wide().chain(Some(0)).collect()

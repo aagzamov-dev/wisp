@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+#[path = "../src/animation.rs"]
+mod animation;
 #[path = "../src/app.rs"]
 mod app;
 #[path = "../src/calc.rs"]
@@ -7,6 +9,11 @@ mod calc;
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/remote_mode.rs"]
+mod remote_mode;
+#[path = "../src/remote_session.rs"]
+mod remote_session;
+
 #[path = "../src/dock.rs"]
 mod dock;
 #[path = "../src/drag.rs"]
@@ -25,6 +32,8 @@ mod indexer;
 mod launch;
 #[path = "../src/morph.rs"]
 mod morph;
+#[path = "../src/notch.rs"]
+mod notch;
 #[path = "../src/render.rs"]
 mod render;
 #[path = "../src/search.rs"]
@@ -57,3 +66,5 @@ fn main() {
         eprintln!("{e}");
     }
 }
+#[path = "../src/logging.rs"]
+mod logging;

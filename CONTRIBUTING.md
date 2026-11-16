@@ -42,6 +42,9 @@ Changes made end to end by an agent with no verifiable check, no real testing an
 - **One logical change per commit.** Squash fixups such as "fix typo" or "address review" before the pull request is merged.
 - **Honest authorship.** The author is the person who owns the change. Credit an AI that helped with a `Co-Authored-By:` line.
 
+For dock, Start, tray, activity island or Controls changes, read and follow [ANIMATION.md](ANIMATION.md).
+For shared background appearance, also follow [MATERIALS.md](MATERIALS.md). The optional `wisp-materials` Codex skill points to these project rules.
+
 ## Testing your change
 
 1. Install your build with `scripts\install-nightly.ps1`. It installs **Wisp Nightly** beside your normal Wisp, with its own folder, config and shortcut (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Space</kbd>). Any build of your branch works, as long as you test the code you submit.

@@ -33,6 +33,13 @@ pub struct Battery {
 }
 
 pub fn read() -> Status {
+    let mut status = read_clock();
+    status.volume = crate::commands::audio::level().map(|(percent, muted)| Volume { percent, muted });
+    status
+}
+
+/// Clock and power only; top bars get audio from the shared command worker.
+pub fn read_clock() -> Status {
     let now = unsafe { GetLocalTime() };
     let mut buffer = [0u16; 64];
     let text = |len: i32, buffer: &[u16]| String::from_utf16_lossy(&buffer[..(len.max(1) - 1) as usize]);
@@ -61,7 +68,7 @@ pub fn read() -> Status {
         time,
         date,
         battery: battery(),
-        volume: crate::commands::audio::level().map(|(percent, muted)| Volume { percent, muted }),
+        volume: None,
         minute: now.wMinute,
     }
 }

@@ -96,6 +96,293 @@ pub fn transparency_available() -> bool {
     }
 }
 
+/// Glass is optional and must never override accessibility or system policy.
+/// The native host-brush API additionally enforces Windows power policy.
+pub fn island_blur_available() -> bool {
+    use windows::Win32::UI::{Accessibility::*, WindowsAndMessaging::*};
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let known = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            Some((&raw mut contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok();
+    known && contrast.dwFlags & HCF_HIGHCONTRASTON == HIGHCONTRASTW_FLAGS(0) && transparency_available()
+}
+
+/// Independent top-bar materials: tint the bar without blurring the desktop;
+/// acrylic belongs only to the separately clipped island window.
+pub fn apply_topbar(hwnd: windows::Win32::Foundation::HWND, opacity: u32, _island: bool) -> Palette {
+    use windows::Win32::{
+        Graphics::Gdi::{COLOR_WINDOW, COLOR_WINDOWTEXT, GetSysColor},
+        UI::{Accessibility::*, WindowsAndMessaging::*},
+    };
+    let mut contrast = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let high_contrast = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            contrast.cbSize,
+            Some((&raw mut contrast).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok()
+        && contrast.dwFlags & HCF_HIGHCONTRASTON != HIGHCONTRASTW_FLAGS(0);
+    let available = transparency_available() && !high_contrast;
+    let mut palette = Palette::new(true, available);
+    palette.background.a = if available { opacity.min(100) as f32 / 100. } else { 1. };
+    if high_contrast {
+        let system = |index| {
+            let color = unsafe { GetSysColor(index) };
+            rgba((color & 255) << 16 | (color & 0xFF00) | (color >> 16) & 255, 1.)
+        };
+        palette.background = system(COLOR_WINDOW);
+        palette.background_solid = palette.background;
+        palette.text = system(COLOR_WINDOWTEXT);
+        palette.subtext = palette.text;
+    }
+    prepare_layered(hwnd);
+    palette
+}
+
+/// ULW owns the complete visible shape. Native materials, frame, corners and
+/// shadows must not draw a second rectangular surface behind its ARGB pixels.
+fn prepare_layered(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::{Graphics::Dwm::*, Graphics::Gdi::SetWindowRgn, UI::Controls::MARGINS};
+    let policy = layered_policy();
+    unsafe {
+        let set = |attr, value: i32| DwmSetWindowAttribute(hwnd, attr, (&value as *const i32).cast(), 4);
+        let _ = set(DWMWA_SYSTEMBACKDROP_TYPE, policy.system_backdrop);
+        let _ = set(DWMWA_NCRENDERING_POLICY, policy.nonclient);
+        let _ = set(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND.0);
+        let _ = set(DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE as i32);
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &MARGINS::default());
+        let _ = SetWindowRgn(hwnd, None, false);
+    }
+    composition_material(hwnd, policy.accent, 0, 0, &Palette::new(true, false));
+}
+struct LayeredPolicy {
+    system_backdrop: i32,
+    nonclient: i32,
+    accent: u32,
+}
+fn layered_policy() -> LayeredPolicy {
+    use windows::Win32::Graphics::Dwm::*;
+    LayeredPolicy {
+        system_backdrop: DWMSBT_NONE.0,
+        nonclient: DWMNCRP_DISABLED.0,
+        accent: 0,
+    }
+}
+
+/// Background-only overrides for Transparent and its Glass preset.
+/// Missing values preserve each existing material's tint and choose its blur preset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaterialOptions {
+    pub transparency: Option<u32>,
+    pub blur: Option<bool>,
+}
+impl MaterialOptions {
+    pub fn transparency(self, backdrop: crate::config::Backdrop) -> u32 {
+        self.transparency
+            .unwrap_or(if backdrop == crate::config::Backdrop::Glass {
+                36
+            } else {
+                85
+            })
+            .min(100)
+    }
+    pub fn blur(self, backdrop: crate::config::Backdrop) -> bool {
+        use crate::config::Backdrop;
+        match backdrop {
+            Backdrop::Transparent | Backdrop::Glass => self.blur.unwrap_or(backdrop == Backdrop::Glass),
+            Backdrop::Solid | Backdrop::Color => false,
+            _ => true,
+        }
+    }
+}
+
+/// A pure recipe shared by native and per-pixel surfaces. `blur_ready` must
+/// mean a real native material/host is available, never just transparent paint.
+fn material_palette(
+    dark: bool,
+    backdrop: crate::config::Backdrop,
+    color: &str,
+    effects: bool,
+    blur_ready: bool,
+    options: MaterialOptions,
+) -> Palette {
+    use crate::config::Backdrop;
+    let translucent =
+        effects && (!options.blur(backdrop) || blur_ready) && !matches!(backdrop, Backdrop::Solid | Backdrop::Color);
+    let mut palette = Palette::new(dark, translucent);
+    if backdrop == Backdrop::Color {
+        if let Some(rgb) = color
+            .strip_prefix('#')
+            .filter(|s| s.len() == 6)
+            .and_then(|s| u32::from_str_radix(s, 16).ok())
+        {
+            let fill = rgba(rgb, 1.);
+            palette = Palette::new(0.2126 * fill.r + 0.7152 * fill.g + 0.0722 * fill.b < 0.49, false);
+            palette.background = fill;
+            palette.background_solid = fill;
+        }
+    } else if translucent {
+        palette.background.a = match backdrop {
+            Backdrop::Glass | Backdrop::Transparent => (100 - options.transparency(backdrop)) as f32 / 100.,
+            Backdrop::LiquidGlass => 0.09,
+            Backdrop::Acrylic => 0.84,
+            _ => {
+                if dark {
+                    0.3
+                } else {
+                    0.4
+                }
+            }
+        };
+        palette.glass_rim = backdrop == Backdrop::LiquidGlass;
+    }
+    palette
+}
+
+/// ULW alone has no desktop blur. Use a retained SurfaceMaterial to enable it.
+pub fn apply_layered_surface(
+    hwnd: windows::Win32::Foundation::HWND,
+    dark: bool,
+    backdrop: crate::config::Backdrop,
+    color: &str,
+    options: MaterialOptions,
+) -> Palette {
+    let accessible = apply_topbar(hwnd, 100, false);
+    if high_contrast() {
+        return accessible;
+    }
+    material_palette(dark, backdrop, color, island_blur_available(), false, options)
+}
+
+fn high_contrast() -> bool {
+    use windows::Win32::UI::{Accessibility::*, WindowsAndMessaging::*};
+    let mut value = HIGHCONTRASTW {
+        cbSize: size_of::<HIGHCONTRASTW>() as u32,
+        ..Default::default()
+    };
+    let known = unsafe {
+        SystemParametersInfoW(
+            SPI_GETHIGHCONTRAST,
+            value.cbSize,
+            Some((&raw mut value).cast()),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        )
+    }
+    .is_ok();
+    !known || value.dwFlags & HCF_HIGHCONTRASTON != HIGHCONTRASTW_FLAGS(0)
+}
+
+/// Shared installation gate after any native operation that can dispatch a
+/// nested callback. HWND identity and material generation must both survive.
+pub(crate) fn material_is_current(expected: u64, current: u64, alive: bool, same_window: bool) -> bool {
+    alive && same_window && expected == current
+}
+
+type MaterialPresentation = (i32, i32, i32, i32, u32, u32, u32);
+
+/// One retained host per layered foreground. No desktop capture or per-frame
+/// resource creation; caller owns installation/revalidation and foreground draw.
+pub struct SurfaceMaterial {
+    pub palette: Palette,
+    fallback: Palette,
+    foreground: windows::Win32::Foundation::HWND,
+    host: Option<crate::dock::topbar_blur::BlurHost>,
+    presented: std::cell::Cell<Option<MaterialPresentation>>,
+}
+impl SurfaceMaterial {
+    pub fn prepare(
+        owner: Option<windows::Win32::Foundation::HWND>,
+        foreground: windows::Win32::Foundation::HWND,
+        dark: bool,
+        backdrop: crate::config::Backdrop,
+        color: &str,
+        options: MaterialOptions,
+    ) -> Self {
+        let fallback = apply_layered_surface(foreground, dark, backdrop, color, options);
+        let effects = island_blur_available();
+        let host = if effects && options.blur(backdrop) {
+            match crate::dock::topbar_blur::BlurHost::new(owner.filter(|owner| *owner != foreground)) {
+                Ok(host) => Some(host),
+                Err(error) => {
+                    crate::logging::event("material.prepare.failed", format_args!("error={error}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let palette = if host.is_some() {
+            material_palette(dark, backdrop, color, effects, true, options)
+        } else {
+            fallback.clone()
+        };
+        Self {
+            palette,
+            fallback,
+            foreground,
+            host,
+            presented: std::cell::Cell::new(None),
+        }
+    }
+    /// False means the caller must repaint with the now-opaque palette.
+    pub fn present(
+        &mut self,
+        bounds: windows::Win32::Foundation::RECT,
+        dpi: u32,
+        radius_dip: f32,
+        opacity: f32,
+    ) -> bool {
+        let presentation = (
+            bounds.left,
+            bounds.top,
+            bounds.right,
+            bounds.bottom,
+            dpi,
+            radius_dip.to_bits(),
+            opacity.to_bits(),
+        );
+        if self.presented.get() == Some(presentation)
+            && self
+                .host
+                .as_ref()
+                .is_none_or(|host| host.placement_current(self.foreground))
+        {
+            return true;
+        }
+        if let Some(host) = &mut self.host
+            && let Err(error) = host.sync(self.foreground, bounds, dpi, radius_dip, opacity)
+        {
+            crate::logging::event("material.present.failed", format_args!("error={error}"));
+            self.host.take();
+            self.palette = self.fallback.clone();
+            return false;
+        }
+        self.presented.set(Some(presentation));
+        true
+    }
+    pub fn hide(&self) {
+        self.presented.set(None);
+        if let Some(host) = &self.host {
+            host.hide();
+        }
+    }
+}
+
 /// Nonactivating surfaces need the composition acrylic policy as well as DWM's backdrop.
 fn composition_material(
     hwnd: windows::Win32::Foundation::HWND,
@@ -146,6 +433,51 @@ fn composition_material(
     }
 }
 
+/// Whole-window opacity for HWND-rendered content and its native backdrop.
+/// Retain the layered style through the whole transition; clearing it midway
+/// can invalidate the compositor's window surface and cause a visible flash.
+#[derive(Default)]
+pub struct WindowOpacity {
+    alpha: Option<u8>,
+}
+impl WindowOpacity {
+    pub fn present(&mut self, hwnd: windows::Win32::Foundation::HWND, progress: f32) -> windows::core::Result<()> {
+        use windows::Win32::{Foundation::COLORREF, UI::WindowsAndMessaging::*};
+        let alpha = (progress.clamp(0., 1.) * 255.).round() as u8;
+        if self.alpha == Some(alpha) {
+            return Ok(());
+        }
+        unsafe {
+            if self.alpha.is_none() {
+                let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED.0 as isize);
+            }
+            // Mark ownership before this fallible call so callers can always
+            // restore the non-layered launcher if Windows rejects opacity.
+            self.alpha = Some(alpha);
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA)?;
+        }
+        Ok(())
+    }
+    pub fn clear(&mut self, hwnd: windows::Win32::Foundation::HWND) {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        if self.alpha.take().is_none() {
+            return;
+        }
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED.0 as isize));
+        }
+    }
+}
+
+// Reuse the existing transparent accent and optional acrylic blur primitive.
+// Acrylic requires a nonzero native tint; keep only the minimum activation
+// alpha here so the percentage remains owned by the foreground background.
+fn clear_accent(backdrop: crate::config::Backdrop, options: MaterialOptions) -> (u32, u32) {
+    if options.blur(backdrop) { (4, 1) } else { (2, 0) }
+}
+
 /// One material policy for launcher, dock and its owned popups. Persistent
 /// acrylic uses composition blur because DWM's system material falls back
 /// to solid when the nonactivating dock is inactive.
@@ -155,35 +487,16 @@ pub fn apply_backdrop(
     backdrop: crate::config::Backdrop,
     persistent: bool,
     color: &str,
+    options: MaterialOptions,
 ) -> Palette {
     use crate::config::Backdrop;
     use windows::Win32::Graphics::Dwm::*;
     use windows::Win32::UI::Controls::MARGINS;
-    let translucent = !matches!(backdrop, Backdrop::Solid | Backdrop::Color) && transparency_available();
-    let glass = matches!(backdrop, Backdrop::Glass | Backdrop::LiquidGlass);
-    let mut palette = Palette::new(dark, translucent);
-    if backdrop == Backdrop::Color
-        && let Some(rgb) = color
-            .strip_prefix('#')
-            .filter(|color| color.len() == 6)
-            .and_then(|color| u32::from_str_radix(color, 16).ok())
-    {
-        let fill = rgba(rgb, 1.);
-        let luminance = 0.2126 * fill.r + 0.7152 * fill.g + 0.0722 * fill.b;
-        palette = Palette::new(luminance < 0.49, false);
-        palette.background = fill;
-        palette.background_solid = fill;
-    }
-    if translucent {
-        match backdrop {
-            Backdrop::Transparent => palette.background.a = 0.15,
-            Backdrop::Glass => palette.background.a = 0.12,
-            Backdrop::LiquidGlass => {
-                palette.background.a = 0.09;
-                palette.glass_rim = true;
-            }
-            _ => {}
-        }
+    let translucent = !matches!(backdrop, Backdrop::Solid | Backdrop::Color) && island_blur_available();
+    let glass = backdrop == Backdrop::LiquidGlass;
+    let mut palette = material_palette(dark, backdrop, color, translucent, true, options);
+    if high_contrast() {
+        palette = apply_topbar(hwnd, 100, false);
     }
     unsafe {
         let set = |attr, value: i32| DwmSetWindowAttribute(hwnd, attr, (&value as *const i32).cast(), 4);
@@ -193,8 +506,7 @@ pub fn apply_backdrop(
         let (accent, tint) = if translucent {
             match backdrop {
                 Backdrop::Acrylic if persistent => (4, 0x70),
-                Backdrop::Transparent => (2, 0x38),
-                Backdrop::Glass => (4, 0x24),
+                Backdrop::Transparent | Backdrop::Glass => clear_accent(backdrop, options),
                 Backdrop::LiquidGlass => (4, 0x16),
                 _ => (0, 0),
             }
@@ -249,18 +561,15 @@ pub fn apply_backdrop(
         }
         // Match the transparent accent path, using acrylic blur with a
         // low nonzero tint and without the modern acrylic recipe.
-        let flags = if glass && accent == 4 { 0 } else { 2 };
-        let composition = composition_material(hwnd, accent, tint, flags, &palette);
-        let shown = if accent == 0 {
-            system && extended
-        } else if !composition && glass {
-            palette.background.a = 0.15;
-            composition_material(hwnd, 2, 0x38, 2, &palette)
+        let flags = if (glass || matches!(backdrop, Backdrop::Transparent | Backdrop::Glass)) && accent == 4 {
+            0
         } else {
-            composition
+            2
         };
+        let composition = composition_material(hwnd, accent, tint, flags, &palette);
+        let shown = if accent == 0 { system && extended } else { composition };
         if translucent && !shown {
-            palette = Palette::new(dark, false);
+            palette = material_palette(dark, backdrop, color, false, false, options);
         }
     }
     palette
@@ -268,7 +577,7 @@ pub fn apply_backdrop(
 
 /// The shared tint and hairline, in device-independent coordinates.
 pub fn paint_background(
-    rt: &windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget,
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
     brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
     palette: &Palette,
     radius: f32,
@@ -320,5 +629,154 @@ pub fn shape(hwnd: windows::Win32::Foundation::HWND, width: i32, height: i32, ra
         if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), false) == 0 {
             let _ = DeleteObject(region.into());
         }
+    }
+}
+
+#[cfg(test)]
+mod layered_tests {
+    use super::*;
+    #[test]
+    fn clear_recipe_distinguishes_intentional_transparency_from_failed_requested_blur() {
+        use crate::config::Backdrop;
+        for dark in [false, true] {
+            for transparency in [0, 1, 36, 85, 99, 100, 101] {
+                for blur in [false, true] {
+                    let options = MaterialOptions {
+                        transparency: Some(transparency),
+                        blur: Some(blur),
+                    };
+                    let transparent = material_palette(dark, Backdrop::Transparent, "", true, true, options);
+                    let glass = material_palette(dark, Backdrop::Glass, "", true, true, options);
+                    assert_eq!(transparent.background.a, (100 - transparency.min(100)) as f32 / 100.);
+                    assert_eq!(transparent.background.a, glass.background.a);
+                    assert_eq!(transparent.text.a, 1.);
+                    assert_eq!(transparent.text.a, glass.text.a);
+                    assert_eq!(
+                        clear_accent(Backdrop::Transparent, options),
+                        clear_accent(Backdrop::Glass, options)
+                    );
+                    let unavailable = material_palette(dark, Backdrop::Transparent, "", true, false, options);
+                    assert_eq!(
+                        unavailable.background.a,
+                        if blur { 1. } else { transparent.background.a }
+                    );
+                    let disabled = material_palette(dark, Backdrop::Transparent, "", false, true, options);
+                    assert_eq!(disabled.background.a, 1., "OS/accessibility policy wins");
+                }
+            }
+            let defaults = MaterialOptions::default();
+            assert_eq!(
+                material_palette(dark, Backdrop::Transparent, "", true, false, defaults)
+                    .background
+                    .a,
+                0.15
+            );
+            assert_eq!(
+                material_palette(dark, Backdrop::Glass, "", true, true, defaults)
+                    .background
+                    .a,
+                0.64
+            );
+            assert_eq!(clear_accent(Backdrop::Glass, defaults), (4, 1));
+            assert_eq!(clear_accent(Backdrop::Transparent, defaults), (2, 0));
+            let override_options = MaterialOptions {
+                transparency: Some(100),
+                blur: Some(false),
+            };
+            assert_eq!(
+                material_palette(dark, Backdrop::Acrylic, "", true, true, override_options)
+                    .background
+                    .a,
+                0.84
+            );
+        }
+    }
+
+    #[test]
+    fn requested_materials_keep_text_readable_over_black_and_white_desktops() {
+        fn luminance(rgb: [f32; 3]) -> f32 {
+            let linear = |value: f32| {
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+        }
+        for dark in [false, true] {
+            for backdrop in [
+                crate::config::Backdrop::Glass,
+                crate::config::Backdrop::Acrylic,
+                crate::config::Backdrop::Solid,
+            ] {
+                let palette = material_palette(dark, backdrop, "", true, true, MaterialOptions::default());
+                let text = luminance([palette.text.r, palette.text.g, palette.text.b]);
+                for desktop in [0., 1.] {
+                    let fill = palette.background;
+                    let blend = |channel| channel * fill.a + desktop * (1. - fill.a);
+                    let background = luminance([blend(fill.r), blend(fill.g), blend(fill.b)]);
+                    let contrast = (text.max(background) + 0.05) / (text.min(background) + 0.05);
+                    assert!(
+                        contrast >= 4.5,
+                        "dark={dark}, backdrop={backdrop:?}, desktop={desktop}, contrast={contrast}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_effects_cannot_restore_stale_or_removed_surface_materials() {
+        assert!(material_is_current(3, 3, true, true));
+        assert!(!material_is_current(3, 4, true, true));
+        assert!(!material_is_current(3, 3, false, true));
+        assert!(!material_is_current(3, 3, true, false));
+    }
+
+    #[test]
+    fn shared_recipe_keeps_tint_and_resolves_opaque_when_effects_or_host_are_unavailable() {
+        use crate::config::Backdrop;
+        for dark in [true, false] {
+            for backdrop in [
+                Backdrop::Acrylic,
+                Backdrop::Mica,
+                Backdrop::Glass,
+                Backdrop::LiquidGlass,
+                Backdrop::Transparent,
+            ] {
+                let blurred = material_palette(dark, backdrop, "", true, true, MaterialOptions::default());
+                assert!(blurred.background.a < 1.);
+                for (effects, ready) in [(false, true), (true, false), (false, false)] {
+                    if backdrop == Backdrop::Transparent && effects {
+                        continue;
+                    }
+                    let fallback = material_palette(dark, backdrop, "", effects, ready, MaterialOptions::default());
+                    assert_eq!(fallback.background.a, 1.);
+                    assert!(!fallback.glass_rim);
+                }
+            }
+            assert_eq!(
+                material_palette(dark, Backdrop::Solid, "", true, true, MaterialOptions::default())
+                    .background
+                    .a,
+                1.
+            );
+        }
+        let custom = material_palette(true, Backdrop::Color, "#FFFFFF", true, true, MaterialOptions::default());
+        assert_eq!(custom.background.r, 1.);
+        assert_eq!(custom.background.a, 1.);
+        assert!(custom.text.r < 0.5);
+        let frosted = material_palette(true, Backdrop::Acrylic, "", true, true, MaterialOptions::default());
+        let glass = material_palette(true, Backdrop::Glass, "", true, true, MaterialOptions::default());
+        assert!(frosted.background.a > glass.background.a);
+    }
+
+    #[test]
+    fn pixel_owned_surfaces_have_no_native_backdrop_frame_or_accent() {
+        let policy = layered_policy();
+        assert_eq!(policy.accent, 0);
+        assert_eq!(policy.system_backdrop, windows::Win32::Graphics::Dwm::DWMSBT_NONE.0);
+        assert_eq!(policy.nonclient, windows::Win32::Graphics::Dwm::DWMNCRP_DISABLED.0);
     }
 }

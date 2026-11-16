@@ -109,6 +109,8 @@ pub struct Frame<'a> {
     pub start: bool,
     pub pins: Option<&'a [&'a crate::indexer::AppEntry]>,
     pub start_focus: Option<usize>,
+    pub start_actions: &'a [(crate::app::start::AppMenuAction, bool)],
+    pub remote_mode: crate::remote_mode::Mode,
     pub footer_menu: Option<(crate::app::start::FooterMenu, usize)>,
     pub start_hover: Option<usize>,
     pub footer_hover: Option<usize>,
@@ -159,6 +161,7 @@ pub fn surface_width() -> f32 {
 
 struct Formats {
     query: IDWriteTextFormat,
+    start_query: IDWriteTextFormat,
     title: IDWriteTextFormat,
     subtitle: IDWriteTextFormat,
     hint: IDWriteTextFormat,
@@ -208,6 +211,7 @@ struct Target {
     accent: ID2D1SolidColorBrush,
     bitmaps: HashMap<String, ID2D1Bitmap>,
     query_layout: Option<CachedLayout>,
+    start_query_layout: Option<CachedLayout>,
     chip_layout: Option<CachedLayout>,
     titles: Vec<Option<CachedTitle>>,
 }
@@ -232,6 +236,7 @@ impl Renderer {
             let (ui, icons) = (fonts.text, fonts.icons);
             let formats = Formats {
                 query: text_format(&dwrite, fonts.display, 20.0, DWRITE_FONT_WEIGHT_NORMAL)?,
+                start_query: text_format(&dwrite, ui, 17.0, DWRITE_FONT_WEIGHT_NORMAL)?,
                 title: ellipsized(&dwrite, text_format(&dwrite, ui, 14.5, DWRITE_FONT_WEIGHT_NORMAL)?)?,
                 subtitle: ellipsized(&dwrite, text_format(&dwrite, ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?)?,
                 hint: text_format(&dwrite, ui, 12.0, DWRITE_FONT_WEIGHT_NORMAL)?,
@@ -333,10 +338,10 @@ impl Renderer {
                     target,
                     &self.formats,
                     frame.palette,
-                    width,
-                    height,
+                    (width, height),
                     menu,
                     frame.footer_hover.unwrap_or(selected),
+                    frame.remote_mode,
                 );
             }
             rt.SetTransform(&Matrix3x2::identity());
@@ -406,6 +411,7 @@ impl Renderer {
                 accent: rt.CreateSolidColorBrush(&white, None)?,
                 bitmaps: HashMap::new(),
                 query_layout: None,
+                start_query_layout: None,
                 chip_layout: None,
                 titles: Vec::new(),
                 rt,
@@ -546,29 +552,51 @@ unsafe fn draw_frame(
         // The query box is drawn from y = 0 and moved to where it sits.
         let window_h = f.content_size.map_or(rt.GetSize().height, |s| s.1);
         let (ox, oy) = crate::morph::content_offset(rt.GetSize().width, rt.GetSize().height, width, window_h);
-        let input_y = input_top(window_h, f.bottom);
+        let input_y = if f.start { 8. } else { input_top(window_h, f.bottom) };
+        let query_format = if f.start { &fm.start_query } else { &fm.query };
         rt.SetTransform(&Matrix3x2::translation(ox, oy + input_y));
         let mid = INPUT_H / 2.0;
         if f.start {
             brush.SetColor(&p.tile);
-            rt.FillRoundedRectangle(&rounded(rect(12., 8., width - 12., INPUT_H - 6.), 10.), brush);
+            rt.FillRoundedRectangle(&rounded(rect(20., 8., width - 20., INPUT_H - 6.), 22.), brush);
         }
         brush.SetColor(&p.placeholder);
-        draw_text(rt, "\u{E721}", &fm.search_glyph, rect(16.0, 0.0, 44.0, INPUT_H), brush);
+        draw_text(
+            rt,
+            "\u{E721}",
+            &fm.search_glyph,
+            rect(
+                if f.start { 24. } else { 16. },
+                0.0,
+                if f.start { 52. } else { 44. },
+                INPUT_H,
+            ),
+            brush,
+        );
 
-        let mut text_x = INPUT_TEXT_X;
+        let mut text_x = INPUT_TEXT_X + if f.start { 8. } else { 0. };
         if let Some(chip) = f.chip {
             let label = format!("{chip} \u{203A}");
             let layout = cached_layout(&mut t.chip_layout, dw, &fm.hint, &label, 240.0, INPUT_H)?;
             let mut metrics = DWRITE_TEXT_METRICS::default();
             layout.GetMetrics(&mut metrics)?;
-            let chip_w = metrics.width + 16.0;
+            let chip_w = if f.start {
+                (metrics.width + 16.).min(((width - text_x - 32.) / 2.).max(16.))
+            } else {
+                metrics.width + 16.
+            };
             brush.SetColor(&p.tile);
             rt.FillRoundedRectangle(
                 &rounded(rect(text_x, mid - 12.0, text_x + chip_w, mid + 12.0), 5.0),
                 brush,
             );
             brush.SetColor(&p.text);
+            if f.start {
+                rt.PushAxisAlignedClip(
+                    &rect(text_x + 8., mid - 12., text_x + chip_w - 8., mid + 12.),
+                    D2D1_ANTIALIAS_MODE_ALIASED,
+                );
+            }
             draw_text(
                 rt,
                 &label,
@@ -576,9 +604,12 @@ unsafe fn draw_frame(
                 rect(text_x + 8.0, mid - 12.0, text_x + chip_w - 8.0, mid + 12.0),
                 brush,
             );
+            if f.start {
+                rt.PopAxisAlignedClip();
+            }
             text_x += chip_w + 10.0;
         }
-        let text_right = width - 20.0;
+        let text_right = width - if f.start { 32. } else { 20. };
         let box_w = text_right - text_x;
         let mut caret_at = text_x;
         if f.text.is_empty() {
@@ -586,12 +617,17 @@ unsafe fn draw_frame(
             draw_text(
                 rt,
                 f.placeholder,
-                &fm.query,
+                query_format,
                 rect(text_x, 0.0, text_right, INPUT_H),
                 brush,
             );
         } else {
-            let layout = cached_layout(&mut t.query_layout, dw, &fm.query, f.text, 100_000.0, INPUT_H)?;
+            let cache = if f.start {
+                &mut t.start_query_layout
+            } else {
+                &mut t.query_layout
+            };
+            let layout = cached_layout(cache, dw, query_format, f.text, 100_000.0, INPUT_H)?;
             let caret = caret_x(&layout, f.caret);
             // Keep the caret in view when the text is wider than the box.
             if caret - *input_scroll > box_w - 2.0 {
@@ -637,11 +673,17 @@ unsafe fn draw_frame(
             brush.SetColor(&p.divider);
             rt.FillRectangle(&rect(0.0, divider, width, divider + 1.0), brush);
         } else if f.rows > 0 {
-            brush.SetColor(&p.divider);
-            rt.FillRectangle(&rect(0.0, divider, width, divider + 1.0), brush);
+            if !f.start {
+                brush.SetColor(&p.divider);
+                rt.FillRectangle(&rect(0.0, divider, width, divider + 1.0), brush);
+            }
 
             for (row, (index, item)) in f.results.iter().enumerate().skip(f.scroll).take(f.rows).enumerate() {
-                let top = row_top(row, window_h, f.bottom);
+                let top = if f.start {
+                    crate::app::start::row_top(row)
+                } else {
+                    row_top(row, window_h, f.bottom)
+                };
                 let mid = top + ROW_H / 2.0;
                 let selected = index == f.selected;
 
@@ -651,7 +693,9 @@ unsafe fn draw_frame(
                         &rounded(rect(PAD, top + 1.0, width - PAD, top + ROW_H - 1.0), 6.0),
                         brush,
                     );
-                    rt.FillRoundedRectangle(&rounded(rect(PAD, mid - 9.0, PAD + 3.0, mid + 9.0), 1.5), accent);
+                    if !f.start {
+                        rt.FillRoundedRectangle(&rounded(rect(PAD, mid - 9.0, PAD + 3.0, mid + 9.0), 1.5), accent);
+                    }
                 }
 
                 let icon_rect = rect(ICON_X, mid - ICON / 2.0, ICON_X + ICON, mid + ICON / 2.0);
@@ -762,7 +806,11 @@ unsafe fn draw_frame(
 
             if f.results.len() > f.rows {
                 // Rows run upward at the bottom, so the track does too.
-                let track_top = row_top(if f.bottom { f.rows - 1 } else { 0 }, window_h, f.bottom);
+                let track_top = if f.start {
+                    crate::app::start::LIST_TOP
+                } else {
+                    row_top(if f.bottom { f.rows - 1 } else { 0 }, window_h, f.bottom)
+                };
                 let track_h = f.rows as f32 * ROW_H;
                 let thumb_h = (track_h * f.rows as f32 / f.results.len() as f32).max(24.0);
                 let max_scroll = (f.results.len() - f.rows) as f32;
@@ -780,16 +828,6 @@ unsafe fn draw_frame(
         if f.start {
             use crate::app::start;
             if let Some(pins) = f.pins {
-                brush.SetColor(&p.text);
-                draw_text(rt, "Pinned apps", &fm.title, rect(20., 64., 175., 87.), brush);
-                brush.SetColor(&p.subtext);
-                draw_text(
-                    rt,
-                    "Right-click apps to pin or unpin",
-                    &fm.hint,
-                    rect(178., 64., width - 18., 87.),
-                    brush,
-                );
                 if pins.is_empty() {
                     draw_text(
                         rt,
@@ -801,11 +839,20 @@ unsafe fn draw_frame(
                 }
                 for (i, app) in pins.iter().enumerate() {
                     let (l, top, r, bottom) = start::tile(i, width, window_h);
+                    rt.PushAxisAlignedClip(
+                        &rect(
+                            l,
+                            top.min(window_h - start::FOOTER),
+                            r,
+                            bottom.min(window_h - start::FOOTER),
+                        ),
+                        D2D1_ANTIALIAS_MODE_ALIASED,
+                    );
                     if f.start_hover.or(f.start_focus) == Some(i) {
                         brush.SetColor(&p.row_selected);
                         rt.FillRoundedRectangle(&rounded(rect(l, top, r, bottom), 9.), brush);
                     }
-                    let size = (bottom - top - 20.).clamp(16., 34.);
+                    let size = start::pin_icon_size(bottom - top);
                     let left = (l + r - size) / 2.;
                     let icon_rect = rect(left, top + 6., left + size, top + 6. + size);
                     if let Some(icon) = f
@@ -821,33 +868,52 @@ unsafe fn draw_frame(
                         let initial: String = app.name.chars().take(1).collect();
                         draw_text(rt, &initial, &fm.letter, icon_rect, brush);
                     }
-                    if bottom - top > 42. {
+                    if bottom - top > 28. {
                         brush.SetColor(&p.text);
                         draw_text(
                             rt,
                             &app.name,
                             &fm.small,
-                            rect(l + 4., top + size + 7., r - 4., bottom),
+                            rect(l + 4., top + size + 12., r - 4., bottom),
                             brush,
                         );
                     }
+                    rt.PopAxisAlignedClip();
+                }
+            }
+            if f.pins.is_none() && f.surface.is_none() && f.footer_menu.is_none() {
+                for (i, (action, enabled)) in f.start_actions.iter().copied().enumerate() {
+                    let (l, top, r, bottom) = start::inline_rect(i, width, window_h);
+                    if enabled && f.start_hover.or(f.start_focus) == Some(start::INLINE_BASE + i) {
+                        brush.SetColor(&p.row_selected);
+                        rt.FillRoundedRectangle(&rounded(rect(l, top, r, bottom), 8.), brush);
+                    }
+                    brush.SetColor(if enabled { &p.subtext } else { &p.placeholder });
+                    let label = if !enabled {
+                        if action == start::AppMenuAction::Administrator {
+                            "Admin unavailable"
+                        } else {
+                            "No file location"
+                        }
+                    } else if action == start::AppMenuAction::Administrator && width < 440. {
+                        "Run as admin"
+                    } else {
+                        action.label()
+                    };
+                    draw_text(rt, label, &fm.subtitle, rect(l + 6., top, r - 6., bottom), brush);
                 }
             }
             let top = window_h - start::FOOTER;
             brush.SetColor(&p.divider);
             rt.FillRectangle(&rect(12., top, width - 12., top + 1.), brush);
-            for (i, (label, glyph)) in [("Profile", "\u{E77B}"), ("Settings", "\u{E713}"), ("Power", "\u{E7E8}")]
-                .into_iter()
-                .enumerate()
-            {
+            for (i, glyph) in ["\u{E77B}", "\u{E713}", "\u{E7E8}"].into_iter().enumerate() {
                 let (l, top, r, bottom) = start::footer(i, width, window_h);
                 if f.start_hover.or(f.start_focus) == Some(start::CAPACITY + i) {
                     brush.SetColor(&p.row_selected);
                     rt.FillRoundedRectangle(&rounded(rect(l, top, r, bottom), 8.), brush);
                 }
                 brush.SetColor(&p.text);
-                draw_text(rt, glyph, &fm.glyph, rect(l + 4., top, l + 29., bottom), brush);
-                draw_text(rt, label, &fm.subtitle, rect(l + 33., top, r - 2., bottom), brush);
+                draw_text(rt, glyph, &fm.glyph, rect(l, top, r, bottom), brush);
             }
         }
         Ok(())
@@ -858,10 +924,10 @@ unsafe fn draw_footer_menu(
     t: &Target,
     fm: &Formats,
     p: &Palette,
-    width: f32,
-    height: f32,
+    (width, height): (f32, f32),
     menu: crate::app::start::FooterMenu,
     selected: usize,
+    remote_mode: crate::remote_mode::Mode,
 ) {
     let actions = menu.actions();
     unsafe {
@@ -881,7 +947,18 @@ unsafe fn draw_footer_menu(
                 brush.SetColor(&p.row_selected);
                 rt.FillRoundedRectangle(&rounded(rect(l, top, r, b), 6.), brush);
             }
-            let (label, icon) = action.map_or(("Quit Wisp", "\u{E711}"), |power| (power.title(), power.glyph()));
+            let label = action.label();
+            let icon = match action {
+                crate::app::start::FooterAction::Power(power) => power.glyph(),
+                crate::app::start::FooterAction::Quit => "\u{E711}",
+                crate::app::start::FooterAction::Remote(mode) => {
+                    if mode == remote_mode {
+                        "\u{E73E}"
+                    } else {
+                        ""
+                    }
+                }
+            };
             brush.SetColor(&p.text);
             draw_text(rt, icon, &fm.glyph, rect(l + 7., top, l + 29., b), brush);
             draw_text(rt, label, &fm.title, rect(l + 36., top, r - 7., b), brush);
@@ -907,11 +984,16 @@ unsafe fn draw_surface(
         let p = f.palette;
         let brush = &t.brush;
         let accent = &t.accent;
-        let (ox, oy) = surface_origin(f.bottom);
+        let (ox, oy) = if f.start {
+            (PAD, crate::app::start::LIST_TOP)
+        } else {
+            surface_origin(f.bottom)
+        };
+        let content_width = if f.start { rt.GetSize().width } else { WIDTH };
         let view_h = s.rows as f32 * ROW_H;
         let dy = oy - s.scroll;
         rt.PushAxisAlignedClip(
-            &rect(0.0, oy - 2.0, WIDTH, oy + view_h + 2.0),
+            &rect(0.0, oy - 2.0, content_width, oy + view_h + 2.0),
             D2D1_ANTIALIAS_MODE_ALIASED,
         );
         if s.widgets.is_empty() {

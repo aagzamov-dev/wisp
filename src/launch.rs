@@ -35,6 +35,30 @@ pub fn open(target: &str) -> Result<()> {
     execute(target, None, false)
 }
 
+pub fn indexed_app(app: &crate::indexer::AppEntry, admin: bool) -> Result<()> {
+    if !admin {
+        return self::app(&app.id, app.path.as_deref(), false);
+    }
+    let target = app
+        .desktop
+        .as_ref()
+        .ok_or_else(|| windows::core::Error::new(E_FAIL, "No desktop launch target"))?;
+    if !crate::indexer::executable_path(&target.target)
+        || (app.id.contains('!') && !crate::indexer::absolute_desktop_path(&app.id))
+    {
+        return Err(windows::core::Error::new(
+            E_FAIL,
+            "This app cannot run as administrator",
+        ));
+    }
+    execute_in(
+        &target.target,
+        target.arguments.as_deref(),
+        target.directory.as_deref(),
+        true,
+    )
+}
+
 pub fn project() -> Result<()> {
     execute(&system_tool(r"System32\DisplaySwitch.exe"), None, false)
 }
@@ -109,14 +133,20 @@ fn system_tool(relative: &str) -> String {
 }
 
 fn execute(file: &str, params: Option<&str>, admin: bool) -> Result<()> {
+    execute_in(file, params, None, admin)
+}
+
+fn execute_in(file: &str, params: Option<&str>, directory: Option<&str>, admin: bool) -> Result<()> {
     let file = HSTRING::from(file);
     let params = params.map(HSTRING::from);
+    let directory = directory.map(HSTRING::from);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_FLAG_NO_UI,
         lpVerb: if admin { w!("runas") } else { w!("open") },
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: params.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
+        lpDirectory: directory.as_ref().map_or(PCWSTR::null(), |p| PCWSTR(p.as_ptr())),
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };

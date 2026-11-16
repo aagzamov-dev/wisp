@@ -29,7 +29,7 @@ pub enum Tip {
 
 /// Explorer's own icons without a callback, such as its volume icon, belong
 /// to the system indicators the dock already shows.
-fn wanted(icon: &Icon) -> bool {
+pub(super) fn wanted(icon: &Icon) -> bool {
     icon.visible() && !(icon.callback == 0 && icon.exes.iter().any(|exe| exe.ends_with(r"\explorer.exe")))
 }
 

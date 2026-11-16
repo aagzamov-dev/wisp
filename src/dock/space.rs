@@ -261,7 +261,7 @@ struct WireMessage {
 /// proxy instead and puts the block in Wisp's process; Explorer then answers
 /// `ABM_SETPOS` without working the work area out again, so maximized
 /// windows would cover the dock until something else made it.
-fn send(message: u32, data: &mut APPBARDATA) -> usize {
+pub(super) fn send(message: u32, data: &mut APPBARDATA) -> usize {
     let Some((tray, explorer)) = crate::tray_host::explorer_tray() else {
         return unsafe { SHAppBarMessage(message, data) };
     };
