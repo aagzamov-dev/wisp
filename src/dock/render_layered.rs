@@ -201,6 +201,7 @@ impl Surface {
                 bitmaps: HashMap::new(),
                 tray: HashMap::new(),
                 media_shapes: HashMap::new(),
+                launcher_shape: None,
                 size: D2D_SIZE_U::default(),
             };
             Ok(Self {
@@ -301,7 +302,7 @@ impl Surface {
         self.prepared = Some((size.width, size.height, dpi));
         Ok(())
     }
-    /// Reuses the completed, masked DIB. No drawing or destructive re-masking.
+    /// Reuses the completed, masked DIB without drawing or reapplying the mask.
     pub fn present_cached(&self, hwnd: HWND, dpi: u32, alpha: u8) -> Result<()> {
         let area = window_area(hwnd)?;
         self.present_prepared(area_size(area), dpi, || self.present_at(hwnd, area, alpha))
@@ -396,6 +397,95 @@ fn properties() -> D2D1_RENDER_TARGET_PROPERTIES {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn topbar_tray_zero_frame_retains_icon_pixels_through_cached_fade() -> Result<()> {
+        let renderer = Renderer::new()?;
+        let shown = [Shown {
+            icon: crate::tray_host::Icon {
+                hwnd: 1,
+                uid: 1,
+                guid: None,
+                callback: 1,
+                version: 4,
+                state: 0,
+                tip: "Tray fixture".into(),
+                image: None,
+                revision: 1,
+                pid: 0,
+                exes: Vec::new(),
+                promoted: None,
+                order: None,
+                accepted: true,
+            },
+            pixels: Some(Arc::new(IconPixels {
+                width: 16,
+                height: 16,
+                bgra: [32, 96, 224, 255].repeat(16 * 16),
+            })),
+        }];
+        for dpi in [96, 120, 144, 192] {
+            for clear in [false, true] {
+                let mut palette = Palette::new(true, true);
+                if clear {
+                    palette.background.a = 0.;
+                }
+                let scale = dpi as f32 / 96.;
+                let size = D2D_SIZE_U {
+                    width: (56. * scale).round() as u32,
+                    height: (56. * scale).round() as u32,
+                };
+                for initial in [0., 0.25] {
+                    let visual = crate::dock::topbar::model::surface_visual(initial);
+                    let frame = TopbarFlyoutFrame {
+                        dpi,
+                        palette: &palette,
+                        shown: &shown,
+                        overflow: &[0],
+                        hover: None,
+                        presentation: (visual.scale, visual.opacity),
+                    };
+                    let mut surface = Surface::new(&renderer.factory, &palette)?;
+                    surface.prepare(size, dpi, frame.cached_contour(), |target| {
+                        draw_topbar_overflow_content(target, &frame)
+                    })?;
+                    let before = surface.pixels(size)?.to_vec();
+                    let icon_pixels = before
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .filter(|p| p[2] > 200 && p[0] < 50 && p[3] == 255)
+                        .count();
+                    assert!(icon_pixels > 100, "cached tray lost icon: {dpi}/{clear}/{initial}");
+                    assert_eq!(&before[..4], &[0, 0, 0, 0]);
+                    for alpha in [0u8, 24, 128, 255, 96, 0, 255] {
+                        surface.present_prepared(size, dpi, || {
+                            // Substitute only the HWND submission; read the actual prepared DIB.
+                            let presented = surface
+                                .pixels(size)?
+                                .iter()
+                                .map(|v| (*v as u32 * alpha as u32 + 127) / 255)
+                                .collect::<Vec<_>>();
+                            assert_eq!(&presented[..4], &[0, 0, 0, 0]);
+                            if alpha == 255 {
+                                assert!(
+                                    presented
+                                        .as_chunks::<4>()
+                                        .0
+                                        .iter()
+                                        .filter(|p| p[2] > 200 && p[0] < 50 && p[3] == 255)
+                                        .count()
+                                        > 100
+                                );
+                            }
+                            Ok(())
+                        })?;
+                        assert_eq!(surface.pixels(size)?, before);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     #[test]
     fn clear_rounded_menus_keep_interior_input_alpha_without_filling_exterior_corners() {
         for dpi in [96, 120, 144, 192] {
@@ -527,7 +617,7 @@ mod tests {
         std::fs::write(path, bmp)
     }
     #[test]
-    fn remote_popup_ticks_reuse_pixels_and_redraw_latest_content_once() -> Result<()> {
+    fn cached_popup_reuses_pixels_until_content_changes() -> Result<()> {
         let renderer = Renderer::new()?;
         let palette = Palette::new(true, false);
         let mut surface = Surface::new(&renderer.factory, &palette)?;
@@ -544,11 +634,9 @@ mod tests {
         surface.prepare(size, 96, (Contour::Round(8.), 255), |t| draw(t, &palette.background))?;
         let original = surface.pixels(size)?.to_vec();
         assert_eq!(original[3], 0, "rounded exterior remains transparent");
-        for elapsed in [0, 30, 60, 90, 120] {
-            let alpha = crate::dock::RemotePopupFade::alpha_at(std::time::Duration::from_millis(elapsed), 120);
+        for _ in 0..5 {
             surface.present_prepared(size, 96, || {
                 presentations.set(presentations.get() + 1);
-                assert!((190..=255).contains(&alpha));
                 Ok(())
             })?;
             assert_eq!(
@@ -569,7 +657,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn remote_popup_cache_rejects_resize_dpi_and_failed_redraw_then_recovers() -> Result<()> {
+    fn prepared_frame_rejects_resize_dpi_and_failed_redraw_then_recovers() -> Result<()> {
         let renderer = Renderer::new()?;
         let palette = Palette::new(true, false);
         let mut surface = Surface::new(&renderer.factory, &palette)?;

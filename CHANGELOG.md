@@ -2,15 +2,29 @@
 
 User-facing changes in each release. Each release on GitHub lists these notes and its pull requests.
 
-## Unreleased
+## 0.6.0 - 2026-11-23
 
-- Add a background transparency percentage and optional blur for Transparent and Glass under Appearance → Shared material. Glass now uses the same base recipe as Transparent with blur enabled by default. Missing settings retain Transparent at 85% and Glass at 36%; explicit settings are shared between the presets. Dock, Start, Controls, tray, previews and Wisp menus follow these settings, including Remote mode, while the top bar and island keep their independent settings. Rounded clear menus retain their input shape; accessibility and failed requested effects keep the opaque fallback. Native appearance and RDP behavior remain unverified under build/unit-only checks.
+- Check for and install stable Wisp updates from **Settings → About**. Optional automatic updates are off by default.
+
+- Replace the alternate Remote Desktop layout with a pause that restores the Windows taskbar and brings Wisp back at the physical console. Use one layout and animation path when Wisp is active.
+
+- Keep top-bar tray clicks tied to the app you pressed, let app-owned menus receive clicks, and add **Show taskbar** to the top-bar tray chevron’s context menu.
+- Add a **Recently installed** Start page to the right of **Pinned**, reachable by horizontal scrolling or the page tabs.
+
+- Keep dock window previews in opening order, oldest first, across hovers and focus changes.
+- Add an editable global Quit Wisp shortcut under Settings → General → Shortcuts. The default is Ctrl+Win+Alt+X.
+
+- Replace the dock's Windows panes with a font-independent Mac-style Command mark, preserving the Start action, hover behavior and theme color.
+
+- Give compact search the same Shared material background and reversible opening/closing fade as Start, retaining search actions and the shared-dock capture path. Keep top-bar tray icons at full opacity in cached frames so an initially invisible opening frame cannot leave a blank tray. Native appearance remains unverified under build/unit-only checks.
+
+- Add a background transparency percentage and optional blur for Transparent and Glass under Appearance → Shared material. Glass uses the same base recipe as Transparent with blur enabled by default. Transparent defaults to 85% and Glass to 36%, and explicit settings are shared between the presets. Dock, Start, Controls, tray, previews and Wisp menus follow these settings. The top bar and island have independent settings. Rounded clear menus retain their input shape, and accessibility and failed requested effects use the opaque fallback.
 
 
 - Make Start app tiles square, tighten Home row spacing and height, and give Profile the same square icon button as Settings and Power. Retain the current app artwork size, search/surface budget, app menus and keyboard actions; native appearance remains unverified.
 
 
-- Match the top-bar tray blur clip to its existing 12 DIP rounded foreground and border, sharing the radius so native blur cannot use a squarer outline. Retain tray actions, animation and Remote layout; native appearance still requires desktop verification.
+- Match the top-bar tray blur clip to its existing 12 DIP rounded foreground and border. Native appearance still requires desktop verification.
 
 
 - Share bounded animation math across Start, dock, tray and menu surfaces. Prevent Start closing from painting a duplicate dock; fade its full native window and reuse prepared pixels. Keep menu entrance dimensions fixed, animate bottom-tray dismissal/reversal, and publish island pixels before matching blur. Keep the island material in its top-bar owner group and retain a readable Glass tint. Reduce Start pin artwork by 40% without shrinking hit targets. Native smoothness, glass appearance and the reported island tint still require desktop verification.
@@ -22,19 +36,14 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 - Open Start app menus through right-click or Menu/Shift+F10 without visible three-dot buttons. Retain Start/Dock pinning, Copy path, Windows Installed apps access, unavailable actions, glass transitions and keyboard accessibility. Resolve desktop shortcut metadata in the background for administrator/file-location actions, and compact searches with few results while retaining home and live surfaces.
 
-- Refine Start with a quiet 12-pin grid, selected-app actions, persistent utility controls and independent Center/Bottom placement; compact Controls retains its actions and subpages. Add a shared Glass/Frosted/Solid material preference across the dock, Start and Wisp-owned menus, including Remote mode, while retaining legacy values, cached fades and accessibility fallbacks. Start keeps local 220/180 ms motion with Remote 120/100 ms caps; native/RDP appearance and performance remain unverified.
+- Refine Start with a 12-pin grid, selected-app actions, persistent utility controls and independent Center/Bottom placement. Compact Controls retains its actions and subpages. Add a shared Glass/Frosted/Solid material preference across the dock, Start and Wisp-owned menus, retaining legacy values, cached fades and accessibility fallbacks. Start opens and closes in 220/180 ms.
 
-- Reduce Remote-mode tray and Controls opening work by preparing their first frame and reusing pixels during short fades; retain normal-mode presentation and disabled/reduced motion.
-
-- Remove the external gaps above and below the Remote-mode dock while retaining its centered width and icon layout; restore normal spacing when returning to local mode.
 - Keep native dock context menus above the dock, including during periodic status updates and tray-menu completion.
 
 - Prepare Control Center before showing it, keep Controls toggles bound to the current panel, and dismiss on outside clicks or Esc even when Windows denies keyboard focus.
 
-- Add Auto/On/Off Remote mode in Settings and Start Profile: a fixed bottom dock with tray and Controls during Remote Desktop, with normal settings restored on console return.
-
 - Smooth Start opening and closing with reversible native-window motion, and add Open, administrator, file-location and pin actions to app context menus.
-- In local Smart mode, auto-hide the dock for the focused maximized app on its own monitor while retaining bottom-strip reveal, leave delay and open-menu holds. Keep actual fullscreen suppression separate; restored/background apps and Remote mode's fixed dock retain their behavior.
+- In Smart mode, auto-hide the dock for the focused maximized app on its own monitor while retaining bottom-strip reveal, leave delay and open-menu holds. Existing fullscreen suppression also applies.
 
 - Add a selectable active-media source list with exact-ID exclusions and an opt-in Firefox quick-add button that recognizes locally registered installations.
 

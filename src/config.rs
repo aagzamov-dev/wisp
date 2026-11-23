@@ -91,6 +91,8 @@ pub enum DockAnimation {
 /// what an old config means.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
+    pub pause_on_rdp: bool,
+    pub automatic_updates: bool,
     pub hide_taskbar: bool,
     pub win_start: bool,
     pub music_notch: bool,
@@ -119,6 +121,7 @@ pub struct Config {
     pub dock_close_ms: u32,
     pub dock_animation: DockAnimation,
     pub hotkey: String,
+    pub quit_hotkey: String,
     pub max_results: usize,
     pub theme: Theme,
     pub backdrop: Backdrop,
@@ -146,22 +149,6 @@ impl Config {
         }
     }
 
-    /// Derive each layout from the latest saved preferences, including edits made during RDP.
-    pub fn for_remote(&self, active: bool) -> Self {
-        let mut config = self.clone();
-        if active {
-            config.dock = true;
-            config.dock_autohide = false;
-            config.dock_smart_hide = false;
-            config.topbar = false;
-            config.music_notch = false;
-            config.hide_taskbar = true;
-            config.dock_open_ms = config.dock_open_ms.min(120);
-            config.dock_close_ms = config.dock_close_ms.min(100);
-        }
-        config
-    }
-
     pub fn path() -> PathBuf {
         util::data_dir().join("config.toml")
     }
@@ -177,13 +164,14 @@ impl Config {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let _ = std::fs::write(&path, DEFAULT_CONFIG);
-                DEFAULT_CONFIG.to_string()
+                let defaults = crate::remote_mode::first_run_config(DEFAULT_CONFIG, &path);
+                let _ = std::fs::write(&path, defaults.as_bytes());
+                defaults.into_owned()
             }
             // Preserve unreadable files, including locked files and invalid UTF-8.
             Err(e) => return (Config::default(), Some(format!("config.toml: {e}"))),
         };
-        match Self::parse(&text) {
+        match Self::parse_for_path(&text, Some(&path)) {
             Ok(mut config) => {
                 config.max_results = config.max_results.clamp(1, 20);
                 config.dock_icon_size = config.dock_icon_size.clamp(24, 40);
@@ -198,9 +186,17 @@ impl Config {
     /// Reads a config, taking each missing key from `config-0.3.toml` or the
     /// default config.
     fn parse(text: &str) -> Result<Config, toml::de::Error> {
+        Self::parse_for_path(text, None)
+    }
+
+    fn parse_for_path(text: &str, path: Option<&std::path::Path>) -> Result<Config, toml::de::Error> {
         let mut table: toml::Table = toml::from_str(DEFAULT_CONFIG)?;
+        let saved: toml::Table = toml::from_str(text)?;
         table.extend(toml::from_str::<toml::Table>(MISSING_KEYS)?);
-        table.extend(toml::from_str::<toml::Table>(text)?);
+        if !saved.contains_key("pause_on_rdp") && path.is_some_and(crate::remote_mode::legacy_opt_out) {
+            table.insert("pause_on_rdp".into(), toml::Value::Boolean(false));
+        }
+        table.extend(saved);
         let mut config: Config = table.try_into()?;
         config.dock_reveal_height = config.dock_reveal_height.clamp(1, 128);
         Ok(config)
@@ -210,7 +206,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn shared_material_options_load_old_and_new_configs_and_survive_remote_layout() {
+    fn shared_material_options_load_old_and_new_configs() {
         use super::Config;
         for mode in ["transparent", "glass"] {
             let old = Config::parse(&format!("backdrop='{mode}'")).unwrap();
@@ -236,7 +232,6 @@ mod tests {
                     .unwrap();
                     assert_eq!(config.backdrop_transparency, Some(expected));
                     assert_eq!(config.backdrop_blur, Some(blur));
-                    assert_eq!(config.for_remote(true).material_options(), config.material_options());
                 }
             }
         }
@@ -319,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn start_placement_is_independent_and_materials_survive_remote_mode() {
+    fn start_placement_is_independent_of_compact_launcher_placement() {
         let old = Config::parse("position='center'").unwrap();
         assert_eq!(old.start_position, Position::Bottom);
         let configured = Config::parse("position='bottom'\nstart_position='center'").unwrap();
@@ -328,18 +323,6 @@ mod tests {
         assert!(Config::parse("start_position='invalid'").is_err());
         assert!(Config::parse("start_position='top'").is_err());
         assert_eq!(Config::parse("position='top'").unwrap().position, Position::Center);
-        for value in [
-            "acrylic",
-            "mica",
-            "solid",
-            "transparent",
-            "glass",
-            "liquid-glass",
-            "color",
-        ] {
-            let saved = Config::parse(&format!("backdrop='{value}'")).unwrap();
-            assert_eq!(saved.for_remote(true).backdrop, saved.backdrop);
-        }
     }
 
     #[test]
@@ -347,6 +330,14 @@ mod tests {
         let config = Config::parse("dock = true\ndock_apps = ['old.app']").unwrap();
         assert!(config.dock);
         assert_eq!(config.window_list, super::WindowListMode::Always);
+    }
+
+    #[test]
+    fn automatic_updates_require_an_explicit_boolean_opt_in() {
+        assert!(!Config::default().automatic_updates);
+        assert!(!Config::parse("theme = 'dark'").unwrap().automatic_updates);
+        assert!(Config::parse("automatic_updates = true").unwrap().automatic_updates);
+        assert!(Config::parse("automatic_updates = 'true'").is_err());
     }
 
     #[test]
@@ -366,6 +357,9 @@ mod tests {
         // A Wisp 0.3 config has none of the dock's keys and keeps the taskbar.
         let config = Config::parse("hotkey = \"Ctrl+Space\"").unwrap();
         assert_eq!((config.hotkey.as_str(), config.max_results), ("Ctrl+Space", 8));
+        assert_eq!(config.quit_hotkey, "Ctrl+Win+Alt+X");
+        let edited = Config::parse("quit_hotkey = 'Win+Alt+Q'").unwrap();
+        assert_eq!(edited.quit_hotkey, "Win+Alt+Q");
         assert!(!config.dock && !config.hide_taskbar);
         assert_eq!(config.position, Position::Center);
         // A new config has them all.
@@ -380,47 +374,36 @@ mod tests {
 #[cfg(test)]
 mod remote_tests {
     use super::*;
+
     #[test]
-    fn console_return_restores_focused_fullscreen_preferences_and_local_timing() {
-        let saved = Config {
-            dock_autohide: true,
-            dock_smart_hide: true,
-            topbar: true,
-            dock_open_ms: 180,
-            dock_close_ms: 160,
-            backdrop: Backdrop::Glass,
-            ..Config::default()
-        };
-        let remote = saved.for_remote(true);
-        assert!(!remote.dock_autohide && !remote.dock_smart_hide && !remote.topbar);
-        assert_eq!((remote.dock_open_ms, remote.dock_close_ms), (120, 100));
-        let local = saved.for_remote(false);
-        assert!(local.dock_autohide && local.dock_smart_hide && local.topbar);
-        assert_eq!((local.dock_open_ms, local.dock_close_ms), (180, 160));
-        assert_eq!(local.backdrop, Backdrop::Glass);
-    }
-    #[test]
-    fn temporary_layout_restores_latest_normal_preferences() {
-        let mut saved = Config {
-            dock: false,
-            topbar: true,
-            music_notch: true,
-            hide_taskbar: false,
-            dock_open_ms: 0,
-            ..Config::default()
-        };
-        let remote = saved.for_remote(true);
-        assert!(remote.dock && remote.hide_taskbar);
-        assert!(!remote.topbar && !remote.music_notch && !remote.dock_autohide && !remote.dock_smart_hide);
-        assert_eq!(remote.dock_open_ms, 0);
-        saved.dock_icon_size = 40;
-        saved.topbar_height = 48;
-        saved.dock_close_ms = 0;
-        assert_eq!(saved.for_remote(true).dock_icon_size, 40);
-        let restored = saved.for_remote(false);
-        assert!(!restored.dock && !restored.hide_taskbar);
-        assert!(restored.topbar && restored.music_notch);
-        assert_eq!(restored.topbar_height, 48);
-        assert_eq!(restored.dock_close_ms, 0);
+    fn remote_pause_defaults_on_and_only_adopts_an_explicit_legacy_opt_out() {
+        let root = std::env::temp_dir().join(format!(
+            "wisp-rdp-config-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("config.toml");
+        let legacy = root.join("remote-mode.txt");
+        let parse = |text| Config::parse_for_path(text, Some(&path)).unwrap().pause_on_rdp;
+        assert!(Config::default().pause_on_rdp);
+        assert!(parse("hide_taskbar = false"));
+
+        for (legacy_value, expected) in [("Auto", true), ("On", true), ("  oFF\r\n", false), ("bad", true)] {
+            std::fs::write(&legacy, legacy_value).unwrap();
+            assert_eq!(parse("hide_taskbar = false"), expected);
+            assert!(parse("pause_on_rdp = true"));
+            assert!(!parse("pause_on_rdp = false"));
+        }
+        std::fs::write(&legacy, "Off").unwrap();
+        let defaults = crate::remote_mode::first_run_config(DEFAULT_CONFIG, &path);
+        assert!(!parse(&defaults));
+        assert!(Config::parse_for_path("pause_on_rdp = 'false'", Some(&path)).is_err());
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "Off");
+        std::fs::remove_file(&legacy).unwrap();
+        std::fs::remove_dir(&root).unwrap();
     }
 }

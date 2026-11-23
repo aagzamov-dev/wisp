@@ -107,10 +107,14 @@ const INPUT_TEXT_X: f32 = 52.0;
 
 pub struct Frame<'a> {
     pub start: bool,
+    pub start_page: Option<crate::app::start::HomePage>,
+    pub recent: Option<&'a [(&'a crate::indexer::AppEntry, &'a str)]>,
+    pub recent_scan_failed: bool,
+    pub recent_scroll: usize,
+    pub recent_total: usize,
     pub pins: Option<&'a [&'a crate::indexer::AppEntry]>,
     pub start_focus: Option<usize>,
     pub start_actions: &'a [(crate::app::start::AppMenuAction, bool)],
-    pub remote_mode: crate::remote_mode::Mode,
     pub footer_menu: Option<(crate::app::start::FooterMenu, usize)>,
     pub start_hover: Option<usize>,
     pub footer_hover: Option<usize>,
@@ -135,6 +139,7 @@ pub struct Frame<'a> {
     pub opacity: f32,
     pub dock_opacity: f32,
     pub shared: bool,
+    pub popup: bool,
     pub radius: f32,
     pub content_size: Option<(f32, f32)>,
 }
@@ -296,7 +301,7 @@ impl Renderer {
         let result = unsafe {
             rt.BeginDraw();
             self.stops.clear();
-            if frame.shared || frame.start {
+            if frame.shared || frame.start || frame.popup {
                 crate::theme::paint_background(&rt, &target.brush, frame.palette, frame.radius);
             } else {
                 rt.Clear(Some(&frame.palette.background));
@@ -341,7 +346,6 @@ impl Renderer {
                     (width, height),
                     menu,
                     frame.footer_hover.unwrap_or(selected),
-                    frame.remote_mode,
                 );
             }
             rt.SetTransform(&Matrix3x2::identity());
@@ -827,13 +831,36 @@ unsafe fn draw_frame(
 
         if f.start {
             use crate::app::start;
+            if let Some(page) = f.start_page {
+                for tab in start::HomePage::ALL {
+                    let (left, top, right, bottom) = tab.tab(width, window_h);
+                    if bottom <= top || right <= left {
+                        continue;
+                    }
+                    let bounds = rounded(rect(left, top, right, bottom), 8.);
+                    let focused = f.start_focus == Some(tab.focus());
+                    if page == tab || f.start_hover == Some(tab.focus()) {
+                        brush.SetColor(&p.row_selected);
+                        rt.FillRoundedRectangle(&bounds, brush);
+                    }
+                    if focused {
+                        rt.DrawRoundedRectangle(&bounds, accent, 1., None);
+                    }
+                    brush.SetColor(if page == tab { &p.text } else { &p.subtext });
+                    let label = rect(left + 8., top, right - 4., bottom);
+                    rt.PushAxisAlignedClip(&label, D2D1_ANTIALIAS_MODE_ALIASED);
+                    draw_text(rt, tab.label(), &fm.subtitle, label, brush);
+                    rt.PopAxisAlignedClip();
+                }
+            }
             if let Some(pins) = f.pins {
-                if pins.is_empty() {
+                if pins.is_empty() && window_h - start::FOOTER >= start::HOME_CONTENT_TOP + 28. {
+                    brush.SetColor(&p.subtext);
                     draw_text(
                         rt,
                         "Search for an app to add your first pin.",
                         &fm.subtitle,
-                        rect(20., 108., width - 20., 137.),
+                        rect(20., start::HOME_CONTENT_TOP, width - 20., start::HOME_CONTENT_TOP + 28.),
                         brush,
                     );
                 }
@@ -881,7 +908,65 @@ unsafe fn draw_frame(
                     rt.PopAxisAlignedClip();
                 }
             }
-            if f.pins.is_none() && f.surface.is_none() && f.footer_menu.is_none() {
+            if f.start_page == Some(start::HomePage::Recent) {
+                let rows = f.recent.unwrap_or_default();
+                if f.recent_total == 0 && start::recent_capacity(window_h) > 0 {
+                    let (left, top, right, bottom) = start::recent_row(0, width);
+                    let label = match (f.recent.is_some(), f.recent_scan_failed) {
+                        (true, _) => "No dated apps yet",
+                        (false, true) => "App dates unavailable",
+                        (false, false) => "Checking app dates…",
+                    };
+                    brush.SetColor(&p.subtext);
+                    draw_text(rt, label, &fm.subtitle, rect(left + 8., top, right - 8., bottom), brush);
+                }
+                for (row, (app, date)) in rows.iter().enumerate() {
+                    let index = start::RECENT_BASE + f.recent_scroll + row;
+                    let (l, top, r, bottom) = start::recent_row(row, width);
+                    let bounds = rounded(rect(l, top, r, bottom), 8.);
+                    let focused = f.start_focus == Some(index);
+                    if f.start_hover == Some(index) || focused {
+                        brush.SetColor(&p.row_selected);
+                        rt.FillRoundedRectangle(&bounds, brush);
+                    }
+                    if focused {
+                        rt.DrawRoundedRectangle(&bounds, accent, 1., None);
+                    }
+                    let icon_rect = rect(l + 8., top + 8., l + 28., bottom - 8.);
+                    if let Some(icon) = f
+                        .icons
+                        .get(&app.id)
+                        .and_then(|px| bitmap(&mut t.bitmaps, rt, &app.id, px))
+                    {
+                        rt.DrawBitmap(&icon, Some(&icon_rect), 1., D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None);
+                    } else {
+                        brush.SetColor(&p.tile);
+                        rt.FillRoundedRectangle(&rounded(icon_rect, 4.), brush);
+                        brush.SetColor(&p.text);
+                        let initial: String = app.name.chars().take(1).collect();
+                        draw_text(rt, &initial, &fm.letter, icon_rect, brush);
+                    }
+                    // Keep the two fields on a shared baseline with a fixed date column.
+                    let date_x = (r - 166.).max(l + 36. + (r - l) / 3.);
+                    let name_rect = rect(l + 36., top, (date_x - 8.).max(l + 36.), bottom);
+                    let date_rect = rect(date_x.min(r - 4.), top, r - 4., bottom);
+                    for (text, region, color) in [(&*app.name, name_rect, &p.text), (*date, date_rect, &p.subtext)] {
+                        rt.PushAxisAlignedClip(&region, D2D1_ANTIALIAS_MODE_ALIASED);
+                        brush.SetColor(color);
+                        draw_text(rt, text, &fm.subtitle, region, brush);
+                        rt.PopAxisAlignedClip();
+                    }
+                }
+                if !rows.is_empty() && f.recent_total > rows.len() {
+                    let track = start::recent_row(rows.len(), width).1 - start::HOME_CONTENT_TOP;
+                    let thumb = (track * rows.len() as f32 / f.recent_total as f32).max(20.);
+                    let progress = f.recent_scroll as f32 / (f.recent_total - rows.len()) as f32;
+                    let top = start::HOME_CONTENT_TOP + (track - thumb) * progress;
+                    brush.SetColor(&p.scrollbar);
+                    rt.FillRoundedRectangle(&rounded(rect(width - 8., top, width - 5., top + thumb), 1.5), brush);
+                }
+            }
+            if f.start_page.is_none() && f.surface.is_none() && f.footer_menu.is_none() {
                 for (i, (action, enabled)) in f.start_actions.iter().copied().enumerate() {
                     let (l, top, r, bottom) = start::inline_rect(i, width, window_h);
                     if enabled && f.start_hover.or(f.start_focus) == Some(start::INLINE_BASE + i) {
@@ -927,7 +1012,6 @@ unsafe fn draw_footer_menu(
     (width, height): (f32, f32),
     menu: crate::app::start::FooterMenu,
     selected: usize,
-    remote_mode: crate::remote_mode::Mode,
 ) {
     let actions = menu.actions();
     unsafe {
@@ -951,13 +1035,6 @@ unsafe fn draw_footer_menu(
             let icon = match action {
                 crate::app::start::FooterAction::Power(power) => power.glyph(),
                 crate::app::start::FooterAction::Quit => "\u{E711}",
-                crate::app::start::FooterAction::Remote(mode) => {
-                    if mode == remote_mode {
-                        "\u{E73E}"
-                    } else {
-                        ""
-                    }
-                }
             };
             brush.SetColor(&p.text);
             draw_text(rt, icon, &fm.glyph, rect(l + 7., top, l + 29., b), brush);

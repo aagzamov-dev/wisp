@@ -52,14 +52,20 @@ mod tray;
 mod tray_host;
 #[path = "../src/util.rs"]
 mod util;
+#[path = "../src/worker.rs"]
+mod worker;
 mod channel {
     use windows::core::{PCWSTR, w};
     pub const NIGHTLY: bool = true;
     pub const NAME: &str = "Wisp capture";
     pub const DATA_DIR: &str = "wisp-demo";
     pub const LAUNCHER_CLASS: PCWSTR = w!("Wisp.Capture.Launcher");
+    pub const LAUNCHER_SURFACE_CLASS: PCWSTR = w!("Wisp.Nightly.Launcher.Surface");
     pub const INSTANCE_MUTEX: PCWSTR = w!("Local\\Wisp.Capture.SingleInstance");
     pub const RUN_VALUE: PCWSTR = w!("Wisp capture");
+    pub fn updates_available() -> bool {
+        false
+    }
 }
 fn main() {
     if let Err(e) = app::run() {

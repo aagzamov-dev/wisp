@@ -10,7 +10,9 @@ Transparent provides adjustable transparency and optional background blur. Glass
 
 The optional config keys are `backdrop_transparency` (a whole percentage from 0 to 100) and `backdrop_blur` (a boolean). Omitting a key keeps the selected mode's default. These overrides affect Transparent and Glass; other saved materials retain their existing behavior. Keep the two applications' parsing, range handling and Settings display consistent.
 
-Shared material applies to the dock, Start, launcher, Controls, tray, window previews and Wisp-owned popups, including Remote mode. The topbar strip and activity island retain their independent tint and blur preferences. Native Windows and third-party menus retain their own appearance.
+Shared material applies to the dock, Start, launcher, Controls, tray, window previews and Wisp-owned popups. The topbar strip and activity island retain their independent tint and blur preferences. Native Windows and third-party menus retain their own appearance.
+
+Independent compact search uses the same painted rounded background and persistent native material path as the other Wisp menus, with a matching 12 DIP window clip. Its opening/closing opacity is separate from background transparency. The shared-dock capture morph retains its existing material path.
 
 ## Implementation rules
 
@@ -24,6 +26,6 @@ Shared material applies to the dock, Start, launcher, Controls, tray, window pre
 
 ## Verification
 
-Check missing-key defaults, saved overrides, percentage boundaries, invalid values, mode changes, blur off versus setup failure, system policy, clear-surface input alpha and Remote/local restoration. Exercise existing clipping and presentation tests; run the applicable workspace build and checks.
+Check missing-key defaults, saved overrides, percentage boundaries, invalid values, mode changes, blur off versus setup failure, system policy, clear-surface input alpha and material recreation after an RDP pause. Exercise existing clipping and presentation tests; run the applicable workspace build and checks.
 
-Record build/unit results separately from native appearance. A native API returning success does not prove that Windows rendered blur. Actual compositing, input, RDP appearance and animation smoothness require authorized desktop verification.
+Record build/unit results separately from native appearance. A native API returning success does not prove that Windows rendered blur. Actual compositing, input, post-resume appearance and animation smoothness require authorized desktop verification.

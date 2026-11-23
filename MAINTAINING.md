@@ -55,12 +55,14 @@ To release:
 
    ```sh
    git tag -a v0.6.0 -m "Wisp v0.6.0"
-   git push origin v0.6.0
+   git push https://github.com/aagzamov-dev/wisp.git refs/tags/v0.6.0
    ```
 
-4. The release workflow tests, builds and publishes the release. Its notes are the version's changelog section, followed by the pull requests. The settings app's updater then offers it to users.
+4. GitHub Actions tests and builds the exact tag, assembles the ZIP and both executable assets, and publishes the release with its changelog notes. The workflow builds the update feed into trusted releases of this fork. Users install the first updater-enabled version from the ZIP, and later stable releases appear in **Settings → About**.
 
 Never move or delete a published tag. If a release is broken, ship a patch release.
+
+The publish job uploads assets to a draft before publishing. If a failed upload leaves an incomplete draft, inspect it and remove the draft while keeping the tag before retrying the job.
 
 ## Repository settings
 

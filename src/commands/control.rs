@@ -128,7 +128,7 @@ fn windows_batteries() -> Vec<(String, Option<u8>)> {
     use windows::Win32::Devices::{DeviceAndDriverInstallation::*, Properties::*};
 
     const BATTERY: DEVPROPKEY = DEVPROPKEY {
-        fmtid: GUID::from_u128(0x104ea319_6ee2_4701_bd47_8ddbF425bbe5),
+        fmtid: GUID::from_u128(0x104ea319_6ee2_4701_bd47_8ddbf425bbe5),
         pid: 2,
     };
     let mut names = Vec::new();
@@ -174,8 +174,10 @@ fn windows_batteries() -> Vec<(String, Option<u8>)> {
             if let Some(len) = property(node, &DEVPKEY_Device_FriendlyName, &mut bytes, DEVPROP_TYPE_STRING) {
                 let name = String::from_utf16_lossy(
                     &bytes[..len]
-                        .chunks_exact(2)
-                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&pair| u16::from_le_bytes(pair))
                         .take_while(|&unit| unit != 0)
                         .collect::<Vec<_>>(),
                 );

@@ -4,15 +4,18 @@
 //! Loaded icons stay cached across rescans.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::{Arc, Mutex};
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Shell::*;
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{HSTRING, Interface, PWSTR, Result};
+
+use crate::worker::WorkerLifetime;
+
+#[path = "indexer/recent.rs"]
+pub(crate) mod recent;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DesktopLaunch {
@@ -42,6 +45,8 @@ pub struct IconPixels {
 
 pub enum IndexEvent {
     Apps(Vec<AppEntry>),
+    ScanFailed,
+    Recent(Vec<recent::RecentApp>),
     Icons(Vec<(String, Arc<IconPixels>)>),
 }
 
@@ -51,16 +56,12 @@ pub struct Indexer {
 
 impl Indexer {
     /// Posts `notify_msg` to `hwnd` after each event to wake the message loop.
-    pub fn spawn(hwnd: HWND, notify_msg: u32, events: Sender<IndexEvent>, icon_size: i32) -> Indexer {
+    pub fn spawn(lifetime: &WorkerLifetime, notify_msg: u32, events: Sender<IndexEvent>, icon_size: i32) -> Indexer {
         let (requests, rx) = channel();
-        let hwnd = hwnd.0 as isize;
+        let lifetime = lifetime.clone();
         std::thread::Builder::new()
             .name("indexer".into())
-            .spawn(move || {
-                worker(rx, events, icon_size, move || unsafe {
-                    let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
-                })
-            })
+            .spawn(move || worker(rx, events, icon_size, &lifetime, notify_msg))
             .expect("could not start app indexing thread");
         Indexer { requests }
     }
@@ -70,30 +71,55 @@ impl Indexer {
     }
 }
 
-fn worker(requests: Receiver<()>, events: Sender<IndexEvent>, icon_size: i32, notify: impl Fn()) {
+fn worker(
+    requests: Receiver<()>,
+    events: Sender<IndexEvent>,
+    icon_size: i32,
+    lifetime: &WorkerLifetime,
+    notify_msg: u32,
+) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
     let mut icons_loaded = HashSet::new();
-    while requests.recv().is_ok() {
+    let mut history = None;
+    while requests.recv().is_ok() && lifetime.running() {
         // One scan handles all pending requests.
         while requests.try_recv().is_ok() {}
 
-        let items = match unsafe { enumerate_apps() } {
+        let items = match unsafe { enumerate_apps(lifetime) } {
             Ok(items) => items,
             Err(e) => {
                 eprintln!("could not list apps: {e}");
+                if events.send(IndexEvent::ScanFailed).is_err() {
+                    return;
+                }
+                lifetime.notify(notify_msg);
                 continue;
             }
         };
+        if !lifetime.running() {
+            return;
+        }
         let apps = items.iter().map(|(app, _)| app.clone()).collect();
         if events.send(IndexEvent::Apps(apps)).is_err() {
             return;
         }
-        notify();
+        lifetime.notify(notify_msg);
+
+        let Some(recent) = scan_recent(&mut history, items.iter().map(|(app, _)| app), lifetime) else {
+            return;
+        };
+        if events.send(IndexEvent::Recent(recent)).is_err() {
+            return;
+        }
+        lifetime.notify(notify_msg);
 
         let mut batch = Vec::new();
         for (app, item) in &items {
+            if !lifetime.running() {
+                return;
+            }
             if icons_loaded.contains(&app.id) {
                 continue;
             }
@@ -106,26 +132,54 @@ fn worker(requests: Receiver<()>, events: Sender<IndexEvent>, icon_size: i32, no
                 if events.send(IndexEvent::Icons(std::mem::take(&mut batch))).is_err() {
                     return;
                 }
-                notify();
+                lifetime.notify(notify_msg);
             }
         }
         if !batch.is_empty() {
             let _ = events.send(IndexEvent::Icons(batch));
-            notify();
+            lifetime.notify(notify_msg);
         }
     }
 }
 
-unsafe fn enumerate_apps() -> Result<Vec<(AppEntry, IShellItem)>> {
+fn scan_recent<'a>(
+    history: &mut Option<recent::History>,
+    apps: impl Iterator<Item = &'a AppEntry>,
+    lifetime: &WorkerLifetime,
+) -> Option<Vec<recent::RecentApp>> {
+    // A fast resume can start a new indexer before the old native calls
+    // return. Load and save history under the same background-only lock.
+    static HISTORY_WRITER: Mutex<()> = Mutex::new(());
+    let _writer = HISTORY_WRITER.lock().unwrap_or_else(|error| error.into_inner());
+    if !lifetime.running() {
+        return None;
+    }
+    history.get_or_insert_with(recent::History::load).scan(apps, lifetime)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn retired_indexer_does_not_open_or_publish_app_history() {
+        let lifetime = super::WorkerLifetime::new(windows::Win32::Foundation::HWND::default());
+        lifetime.stop();
+        let mut history = None;
+        assert!(super::scan_recent(&mut history, std::iter::empty(), &lifetime).is_none());
+        assert!(history.is_none());
+    }
+}
+
+unsafe fn enumerate_apps(lifetime: &WorkerLifetime) -> Result<Vec<(AppEntry, IShellItem)>> {
     unsafe {
         let folder: IShellItem = SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None)?;
         let items: IEnumShellItems = folder.BindToHandler(None, &BHID_EnumItems)?;
         let mut apps = Vec::new();
         let mut seen = HashSet::new();
-        loop {
+        while lifetime.running() {
             let mut slot = [None];
             let mut fetched = 0;
-            if items.Next(&mut slot, Some(&mut fetched)).is_err() || fetched == 0 {
+            items.Next(&mut slot, Some(&mut fetched))?;
+            if fetched == 0 {
                 break;
             }
             let Some(item) = slot[0].take() else { break };

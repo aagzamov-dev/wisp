@@ -13,6 +13,7 @@ const MISSING_KEYS: &str = include_str!("../../src/config-0.3.toml");
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
     pub hotkey: String,
+    pub quit_hotkey: String,
     pub max_results: i64,
     pub theme: String,
     pub backdrop: String,
@@ -20,6 +21,8 @@ pub struct Config {
     pub backdrop_transparency: Option<i64>,
     pub backdrop_blur: Option<bool>,
     pub win_start: bool,
+    pub pause_on_rdp: bool,
+    pub automatic_updates: bool,
     pub music_notch: bool,
     pub music_excluded_apps: Vec<String>,
     pub topbar: bool,
@@ -138,6 +141,7 @@ impl Config {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self {
             hotkey: string("hotkey")?,
+            quit_hotkey: string("quit_hotkey")?,
             max_results,
             theme,
             backdrop,
@@ -154,6 +158,8 @@ impl Config {
                 })
                 .transpose()?,
             win_start: boolean("win_start")?,
+            pause_on_rdp: boolean("pause_on_rdp")?,
+            automatic_updates: boolean("automatic_updates")?,
             music_notch: boolean("music_notch")?,
             music_excluded_apps: get("music_excluded_apps")
                 .as_array()
@@ -240,7 +246,9 @@ impl Store {
     fn document(&self) -> Result<DocumentMut, String> {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.to_owned(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::remote_mode::first_run_config(DEFAULT_CONFIG, &self.path).into_owned()
+            }
             Err(error) => return Err(format!("Cannot read config.toml: {error}")),
         };
         text.parse()
@@ -248,7 +256,15 @@ impl Store {
     }
 
     pub fn load(&self) -> Result<Config, String> {
-        Config::from_document(&self.document()?)
+        self.config(&self.document()?)
+    }
+
+    fn config(&self, doc: &DocumentMut) -> Result<Config, String> {
+        let mut config = Config::from_document(doc)?;
+        if !doc.contains_key("pause_on_rdp") && crate::remote_mode::legacy_opt_out(&self.path) {
+            config.pause_on_rdp = false;
+        }
+        Ok(config)
     }
 
     /// Create the default file only when no config exists.
@@ -259,7 +275,8 @@ impl Store {
         let parent = self.path.parent().ok_or("The config path has no folder.")?;
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
-        file.write_all(DEFAULT_CONFIG.as_bytes())
+        let defaults = crate::remote_mode::first_run_config(DEFAULT_CONFIG, &self.path);
+        file.write_all(defaults.as_bytes())
             .and_then(|()| file.as_file().sync_all())
             .map_err(|error| error.to_string())?;
         match file.persist_noclobber(&self.path) {
@@ -288,7 +305,12 @@ impl Store {
             *value.decor_mut() = old.decor().clone();
         }
         doc[key] = Item::Value(value);
-        let config = Config::from_document(&doc)?;
+        let config = self.config(&doc)?;
+        match key {
+            "hotkey" => validate_shortcut(&config.hotkey, &config.quit_hotkey)?,
+            "quit_hotkey" => validate_shortcut(&config.quit_hotkey, &config.hotkey)?,
+            _ => {}
+        }
         let parent = self.path.parent().ok_or("The config path has no folder.")?;
         std::fs::create_dir_all(parent).map_err(|error| format!("Cannot create the config folder: {error}"))?;
         let mut file = tempfile::NamedTempFile::new_in(parent).map_err(|error| error.to_string())?;
@@ -302,9 +324,17 @@ impl Store {
     }
 }
 
+pub fn validate_shortcut(spec: &str, other: &str) -> Result<(), String> {
+    let shortcut = crate::hotkey::parse(spec)?;
+    if crate::hotkey::parse(other).is_ok_and(|candidate| candidate == shortcut) {
+        return Err("Choose different shortcuts for the launcher and Quit Wisp.".into());
+    }
+    Ok(())
+}
+
 fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
     match key {
-        "hotkey" => {
+        "hotkey" | "quit_hotkey" => {
             crate::hotkey::parse(value.as_str().ok_or("Shortcut must be text.")?)?;
         }
         "max_results" if !value.as_integer().is_some_and(|value| (1..=20).contains(&value)) => {
@@ -344,6 +374,8 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
         | "backdrop_transparency"
         | "backdrop_blur"
         | "win_start"
+        | "pause_on_rdp"
+        | "automatic_updates"
         | "music_notch"
         | "music_excluded_apps"
         | "backdrop"
@@ -375,6 +407,38 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_update_preference_is_off_until_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("config.toml"));
+        std::fs::write(&store.path, "theme = 'light'\n").unwrap();
+        assert!(!store.load().unwrap().automatic_updates);
+        assert!(store.set("automatic_updates", true.into()).unwrap().automatic_updates);
+        assert!(store.load().unwrap().automatic_updates);
+        assert!(store.set("automatic_updates", "true".into()).is_err());
+        assert!(!store.set("automatic_updates", false.into()).unwrap().automatic_updates);
+    }
+
+    #[test]
+    fn remote_pause_uses_legacy_off_until_the_new_preference_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("config.toml"));
+        std::fs::write(&store.path, "theme = 'light'\n").unwrap();
+        let legacy = directory.path().join("remote-mode.txt");
+        std::fs::write(&legacy, "Off\n").unwrap();
+
+        assert!(!store.load().unwrap().pause_on_rdp);
+        assert!(!store.set("theme", "dark".into()).unwrap().pause_on_rdp);
+        assert!(store.set("pause_on_rdp", true.into()).unwrap().pause_on_rdp);
+        assert!(store.load().unwrap().pause_on_rdp);
+        assert!(store.set("pause_on_rdp", "false".into()).is_err());
+        assert_eq!(std::fs::read_to_string(&legacy).unwrap(), "Off\n");
+
+        std::fs::remove_file(&store.path).unwrap();
+        store.ensure_exists().unwrap();
+        assert!(!store.load().unwrap().pause_on_rdp);
+    }
+
     #[test]
     fn shared_material_roundtrip_preserves_missing_defaults_comments_and_unknown_fields() {
         for mode in ["transparent", "glass"] {
@@ -487,6 +551,25 @@ mod tests {
         assert!(saved.contains("# Keep note") && saved.contains("custom=42"));
         assert_eq!(store.load().unwrap().dock_reveal_height, 128);
     }
+    #[test]
+    fn quit_shortcut_persists_and_rejects_the_launcher_chord() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path().join("config.toml"));
+        std::fs::write(&store.path, "# Keep note\nhotkey='Ctrl+Space'\n").unwrap();
+        assert_eq!(store.load().unwrap().quit_hotkey, "Ctrl+Win+Alt+X");
+        assert_eq!(
+            store.set("quit_hotkey", "Win+Alt+Q".into()).unwrap().quit_hotkey,
+            "Win+Alt+Q"
+        );
+        assert!(store.set("quit_hotkey", "Alt".into()).is_err());
+        assert!(store.set("quit_hotkey", "control + SPACE".into()).is_err());
+        assert!(store.set("hotkey", "Alt+Super+q".into()).is_err());
+        let saved = std::fs::read_to_string(&store.path).unwrap();
+        assert!(saved.contains("# Keep note"));
+        assert!(saved.contains("hotkey='Ctrl+Space'"));
+        assert!(saved.contains("Win+Alt+Q"));
+    }
+
     #[test]
     fn preview_monitor_switch_defaults_off_and_preserves_icon_switch() {
         let dir = tempfile::tempdir().unwrap();

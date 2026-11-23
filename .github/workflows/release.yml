@@ -4,55 +4,130 @@ on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  release:
+  build:
+    if: github.repository == 'aagzamov-dev/wisp'
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
       # rust-toolchain.toml selects the Rust version.
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo build --release --workspace
+      - name: Validate tag, crate versions and release notes
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -cnotmatch '\Av(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\z') {
+            throw "Release tag must be vMAJOR.MINOR.PATCH"
+          }
+          $version = $tag.Substring(1)
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA) {
+            throw "Checkout does not match the triggering commit"
+          }
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          foreach ($name in 'wisp', 'wisp-settings') {
+            $package = @($metadata.packages | Where-Object name -CEQ $name)
+            if ($package.Count -ne 1 -or $package[0].version -cne $version) {
+              throw "$name must have version $version"
+            }
+          }
+
+          $section = [regex]::Match((Get-Content CHANGELOG.md -Raw),
+            "(?ms)^## $([regex]::Escape($version))(?:[ \t][^\r\n]*)?\r?\n(.*?)(?=^## |\z)").Groups[1].Value.Trim()
+          if (-not $section) { throw "CHANGELOG.md has no notes for $version" }
+          New-Item -ItemType Directory dist | Out-Null
+          Set-Content -LiteralPath dist/changelog.md -Encoding utf8 -Value $section
+      - run: cargo test --locked --workspace
+      - run: cargo build --locked --release --workspace
+        env:
+          WISP_RELEASE_REPOSITORY: aagzamov-dev/wisp
       - name: Package
         shell: pwsh
         run: |
-          $name = "wisp-${{ github.ref_name }}-x86_64-windows"
+          $tag = $env:GITHUB_REF_NAME
+          $name = "wisp-$tag-x86_64-windows"
           New-Item -ItemType Directory $name | Out-Null
           Copy-Item target/release/wisp.exe, target/release/wisp-settings.exe, README.md, LICENSE $name
-          Compress-Archive $name "$name.zip"
-          Copy-Item target/release/wisp.exe "wisp-${{ github.ref_name }}-x86_64.exe"
-          # The settings app's updater downloads the two .exe files and checks them against SHA256SUMS.txt.
-          Copy-Item target/release/wisp-settings.exe "wisp-settings-${{ github.ref_name }}-x86_64.exe"
-          $files = "$name.zip", "wisp-${{ github.ref_name }}-x86_64.exe", "wisp-settings-${{ github.ref_name }}-x86_64.exe"
-          $files | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash + "  $_" } | Out-File -Encoding ascii SHA256SUMS.txt
-      # The notes are the version's section of CHANGELOG.md, followed by the
-      # pull requests GitHub lists for the release (.github/release.yml).
-      - name: Notes
+          Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
+          Copy-Item target/release/wisp.exe "dist/wisp-$tag-x86_64.exe"
+          Copy-Item target/release/wisp-settings.exe "dist/wisp-settings-$tag-x86_64.exe"
+          Set-Location dist
+          $files = "$name.zip", "wisp-$tag-x86_64.exe", "wisp-settings-$tag-x86_64.exe"
+          $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash + "  $_" } |
+            Set-Content -Encoding ascii SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: release-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Verify and publish
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
+        working-directory: dist
         run: |
-          $version = "${{ github.ref_name }}".TrimStart('v')
-          $section = [regex]::Match((Get-Content CHANGELOG.md -Raw),
-            "(?ms)^## $([regex]::Escape($version))\b[^\n]*\n(.*?)(?=^## |\z)").Groups[1].Value.Trim()
-          if (-not $section) { throw "CHANGELOG.md has no section for $version" }
-          $pulls = gh api "repos/${{ github.repository }}/releases/generate-notes" `
-            -f tag_name="${{ github.ref_name }}" --jq .body
+          $PSNativeCommandUseErrorActionPreference = $true
+          $tag = $env:GITHUB_REF_NAME
+          $repo = $env:GITHUB_REPOSITORY
+          $files = "wisp-$tag-x86_64-windows.zip", "wisp-$tag-x86_64.exe", "wisp-settings-$tag-x86_64.exe"
+          $expected = $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash + "  $_" }
+          if (($expected -join "`n") -cne ((Get-Content -LiteralPath SHA256SUMS.txt) -join "`n")) {
+            throw "Release asset checksums do not match"
+          }
+
+          function Assert-ReleaseTag {
+            $ref = "refs/tags/$tag"
+            $peeled = $ref + '^{}'
+            $refs = git ls-remote --exit-code "$env:GITHUB_SERVER_URL/$repo.git" $ref $peeled
+            $commit = @($refs | Where-Object { ($_ -split '\s+', 2)[1] -ceq $peeled })
+            if ($commit.Count -eq 0) {
+              $commit = @($refs | Where-Object { ($_ -split '\s+', 2)[1] -ceq $ref })
+            }
+            if ($commit.Count -ne 1 -or ($commit[0] -split '\s+', 2)[0] -cne $env:GITHUB_SHA) {
+              throw "Remote release tag does not match the triggering commit"
+            }
+          }
+
+          Assert-ReleaseTag
+          $releases = gh api --paginate "repos/$repo/releases?per_page=100" --jq '.[].tag_name'
+          if ($releases -ccontains $tag) {
+            throw "A release for $tag already exists. Inspect it before retrying."
+          }
+          # GitHub generates the pull request section using .github/release.yml.
+          $section = (Get-Content -LiteralPath changelog.md -Raw).Trim()
+          $pulls = gh api "repos/$repo/releases/generate-notes" -f "tag_name=$tag" --jq .body
           $pulls = $pulls -join "`n"
           "$section`n`n<details>`n<summary>Pull requests</summary>`n`n$pulls`n`n</details>`n" |
-            Out-File -Encoding utf8 notes.md
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          gh release create "${{ github.ref_name }}" `
-            "wisp-${{ github.ref_name }}-x86_64-windows.zip" `
-            "wisp-${{ github.ref_name }}-x86_64.exe" `
-            "wisp-settings-${{ github.ref_name }}-x86_64.exe" `
-            SHA256SUMS.txt `
-            --title "Wisp ${{ github.ref_name }}" --notes-file notes.md
+            Set-Content -Encoding utf8 notes.md
+
+          # A failed upload leaves a draft for inspection.
+          gh release create $tag @files SHA256SUMS.txt --repo $repo --verify-tag --draft `
+            --title "Wisp $tag" --notes-file notes.md
+          Assert-ReleaseTag
+          gh release edit $tag --repo $repo --verify-tag --draft=false --latest

@@ -224,6 +224,68 @@ impl Pins {
 pub const LIST_TOP: f32 = 76.;
 pub const ACTIONS: f32 = 56.;
 pub const INLINE_BASE: usize = CAPACITY + 3;
+pub const TAB_BASE: usize = INLINE_BASE + 3;
+pub const RECENT_BASE: usize = TAB_BASE + 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HomePage {
+    #[default]
+    Pinned,
+    Recent,
+}
+
+impl HomePage {
+    pub const ALL: [Self; 2] = [Self::Pinned, Self::Recent];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pinned => "Pinned",
+            Self::Recent => "Recently installed",
+        }
+    }
+
+    pub fn focus(self) -> usize {
+        TAB_BASE + self as usize
+    }
+
+    pub fn tab(self, width: f32, height: f32) -> (f32, f32, f32, f32) {
+        let pad = 16_f32.min(width / 4.);
+        let segment = ((width - 2. * pad - 4.) / 2.).clamp(0., 160.);
+        let left = pad + self as usize as f32 * (segment + 4.);
+        (left, 80., left + segment, 112_f32.min(height - FOOTER))
+    }
+
+    pub fn horizontal_scroll(pending: &mut i32, delta: i16) -> Option<Self> {
+        match wheel_steps(pending, delta) {
+            n if n > 0 => Some(Self::Recent),
+            n if n < 0 => Some(Self::Pinned),
+            _ => None,
+        }
+    }
+}
+
+pub fn wheel_steps(pending: &mut i32, delta: i16) -> i32 {
+    const WHEEL_STEP: i32 = 120;
+    let total = *pending + i32::from(delta);
+    *pending = total % WHEEL_STEP;
+    total / WHEEL_STEP
+}
+
+pub const HOME_CONTENT_TOP: f32 = 120.;
+const RECENT_ROW_HEIGHT: f32 = 36.;
+
+pub fn recent_capacity(height: f32) -> usize {
+    ((height - FOOTER - HOME_CONTENT_TOP) / RECENT_ROW_HEIGHT).max(0.) as usize
+}
+
+pub fn recent_row(index: usize, width: f32) -> (f32, f32, f32, f32) {
+    let top = HOME_CONTENT_TOP + index as f32 * RECENT_ROW_HEIGHT;
+    (16., top, width - 16., top + RECENT_ROW_HEIGHT)
+}
+
+pub fn contains((left, top, right, bottom): (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+    x >= left && x < right && y >= top && y < bottom
+}
 
 /// A fixed content budget keeps Home, search and the utility bar in place.
 pub fn rows(height: f32) -> usize {
@@ -245,7 +307,7 @@ pub fn pin_icon_size(tile_height: f32) -> f32 {
     (tile_height - 32.).clamp(12., 44.).min((tile_height - 8.).max(0.)) * 0.6
 }
 
-const GRID_TOP: f32 = 84.;
+const GRID_TOP: f32 = HOME_CONTENT_TOP;
 const GRID_GAP: f32 = 4.;
 const GRID_BOTTOM: f32 = 12.;
 
@@ -391,29 +453,19 @@ pub enum FooterMenu {
 pub enum FooterAction {
     Power(Power),
     Quit,
-    Remote(crate::remote_mode::Mode),
 }
 impl FooterAction {
     pub fn label(self) -> &'static str {
         match self {
             Self::Power(power) => power.title(),
             Self::Quit => "Quit Wisp",
-            Self::Remote(crate::remote_mode::Mode::Auto) => "Remote: Auto",
-            Self::Remote(crate::remote_mode::Mode::On) => "Remote: On",
-            Self::Remote(crate::remote_mode::Mode::Off) => "Remote: Off",
         }
     }
 }
 impl FooterMenu {
     pub fn actions(self) -> &'static [FooterAction] {
         match self {
-            Self::Profile => &[
-                FooterAction::Power(Power::Lock),
-                FooterAction::Power(Power::SignOut),
-                FooterAction::Remote(crate::remote_mode::Mode::Auto),
-                FooterAction::Remote(crate::remote_mode::Mode::On),
-                FooterAction::Remote(crate::remote_mode::Mode::Off),
-            ],
+            Self::Profile => &[FooterAction::Power(Power::Lock), FooterAction::Power(Power::SignOut)],
             Self::Power => &[
                 FooterAction::Quit,
                 FooterAction::Power(Power::Sleep),
@@ -637,6 +689,35 @@ mod tests {
         assert!(search_height(100, 8, false) > height);
     }
     #[test]
+    fn home_tabs_and_recent_rows_keep_the_footer_clear() {
+        for width in [320., WIDTH] {
+            let height = home_height(width);
+            for tab in HomePage::ALL {
+                let (left, top, right, bottom) = tab.tab(width, height);
+                assert!(left < right && top < bottom && bottom <= HOME_CONTENT_TOP);
+                assert!(tab.focus() >= INLINE_BASE + 3);
+            }
+            assert!(HomePage::Pinned.tab(width, height).2 < HomePage::Recent.tab(width, height).0);
+            let rows = recent_capacity(height);
+            assert!(rows > 0);
+            assert!(recent_row(rows - 1, width).3 <= height - FOOTER);
+            assert!(recent_row(rows, width).3 > height - FOOTER);
+        }
+        assert_eq!(recent_capacity(HOME_CONTENT_TOP + FOOTER), 0);
+    }
+
+    #[test]
+    fn horizontal_swipes_accumulate_and_choose_the_expected_side() {
+        let mut pending = 0;
+        assert_eq!(HomePage::horizontal_scroll(&mut pending, 40), None);
+        assert_eq!(HomePage::horizontal_scroll(&mut pending, -40), None);
+        assert_eq!(HomePage::horizontal_scroll(&mut pending, 80), None);
+        assert_eq!(HomePage::horizontal_scroll(&mut pending, 50), Some(HomePage::Recent));
+        assert_eq!(pending, 10);
+        assert_eq!(HomePage::horizontal_scroll(&mut pending, -140), Some(HomePage::Pinned));
+    }
+
+    #[test]
     fn start_opacity_follows_full_transition_without_content_floor() {
         let mut motion = Motion::default();
         motion.retarget_duration(true, 180);
@@ -819,24 +900,6 @@ mod tests {
             }
             assert_eq!(utility_focus(focus, actions, true), None);
         }
-    }
-
-    #[test]
-    fn remote_motion_caps_duration_without_resetting_reversal_or_disabled_motion() {
-        let mut motion = Motion::default();
-        motion.retarget_profile(true, true, true);
-        assert_eq!(motion.remaining, 0.12);
-        motion.tick(0.04);
-        let before = (motion.value, motion.velocity);
-        motion.retarget_profile(false, true, true);
-        assert_eq!((motion.value, motion.velocity), before);
-        assert_eq!(motion.remaining, 0.10);
-        motion.tick(0.10);
-        assert!(!motion.active());
-        assert_eq!(motion.value, 0.);
-        motion.retarget_profile(true, false, true);
-        assert_eq!(motion.value, 1.);
-        assert!(!motion.active());
     }
 
     #[test]
@@ -1025,18 +1088,13 @@ mod tests {
 }
 
 #[cfg(test)]
-mod remote_footer_tests {
+mod footer_tests {
     use super::*;
     #[test]
-    fn profile_rows_preserve_power_and_map_each_remote_choice() {
+    fn profile_menu_keeps_lock_and_sign_out() {
         let rows = FooterMenu::Profile.actions();
         assert_eq!(rows[0], FooterAction::Power(Power::Lock));
         assert_eq!(rows[1], FooterAction::Power(Power::SignOut));
-        for (index, mode) in crate::remote_mode::Mode::ALL.into_iter().enumerate() {
-            assert_eq!(rows[index + 2], FooterAction::Remote(mode));
-            let (_, top, _, bottom) = FooterMenu::Profile.row(index + 2, 520., 500.);
-            assert!(bottom > top);
-        }
         assert_eq!(FooterMenu::Power.actions()[0], FooterAction::Quit);
     }
 }
