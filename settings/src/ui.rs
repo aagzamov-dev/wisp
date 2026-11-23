@@ -19,9 +19,19 @@ use crate::{
     hotkey,
     palette::{self, Palette},
     system,
+    update::{feed, install},
 };
 
 const ICON_SVG: &[u8] = include_bytes!("../../assets/icon.svg");
+
+enum UpdateStatus {
+    Idle,
+    Checking,
+    Current,
+    Available(feed::Release),
+    Installing,
+    Failed(String),
+}
 
 /// Config values and the labels the dropdowns show for them.
 const THEMES: [(&str, &str); 3] = [("system", "System"), ("dark", "Dark"), ("light", "Light")];
@@ -51,6 +61,47 @@ const ONBOARDING_STEPS: usize = 3;
 mod notch;
 
 type Choices = SelectState<SearchableVec<&'static str>>;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shortcut {
+    Launcher,
+    Quit,
+}
+
+impl Shortcut {
+    const ALL: [Self; 2] = [Self::Launcher, Self::Quit];
+
+    fn saved(self, config: &Config) -> &str {
+        match self {
+            Self::Launcher => &config.hotkey,
+            Self::Quit => &config.quit_hotkey,
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::Launcher => "hotkey",
+            Self::Quit => "quit_hotkey",
+        }
+    }
+
+    fn error(self, value: &str, config: &Config) -> Option<String> {
+        // A legacy launcher shortcut takes priority over the new Quit default.
+        if self == Self::Launcher && value == config.hotkey {
+            return hotkey::parse(value).err();
+        }
+        let other = match self {
+            Self::Launcher => &config.quit_hotkey,
+            Self::Quit => &config.hotkey,
+        };
+        config::validate_shortcut(value, other).err()
+    }
+}
+
+struct ShortcutInput {
+    field: Entity<InputState>,
+    error: Option<String>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -89,12 +140,11 @@ pub struct Settings {
     store: Option<Store>,
     config: Config,
     error: Option<String>,
-    shortcut_error: Option<String>,
     folder_error: Option<String>,
     page: Page,
     /// `Some(step)` while the one-time onboarding is showing.
     onboarding: Option<usize>,
-    shortcut: Entity<InputState>,
+    shortcuts: [ShortcutInput; 2],
     folder: Entity<InputState>,
     media_app: Entity<InputState>,
     media_sources: Vec<crate::media_identity::Source>,
@@ -102,9 +152,8 @@ pub struct Settings {
     media_loading: bool,
     media_loaded: bool,
     media_error: Option<String>,
+    update: UpdateStatus,
     backdrop_color: Entity<ColorPickerState>,
-    remote_mode: crate::remote_mode::Mode,
-    remote_choice: Entity<Choices>,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
     start_position: Entity<Choices>,
@@ -122,7 +171,7 @@ pub struct Settings {
     topbar_displays: Vec<(String, String, bool)>,
     autostart: bool,
     powertoys: Result<bool, String>,
-    recording: bool,
+    recording: Option<Shortcut>,
     focus: FocusHandle,
     icon: Arc<Image>,
 }
@@ -162,30 +211,13 @@ impl Settings {
                 (None, Config::default(), Some(error))
             }
         };
-        let mode_path = config::path().map(|path| path.with_file_name("remote-mode.txt"));
-        let loaded_mode = mode_path.and_then(|path| crate::remote_mode::load(&path).map_err(|error| error.to_string()));
-        let (remote_mode, mode_error) = match loaded_mode {
-            Ok(mode) => (mode, None),
-            Err(error) => {
-                crate::logging::error("settings.remote_mode", format_args!("stage=initial_load error={error}"));
-                (crate::remote_mode::Mode::Auto, Some(error))
+        let shortcuts = Shortcut::ALL.map(|shortcut| {
+            let value = shortcut.saved(&config);
+            ShortcutInput {
+                field: cx.new(|cx| InputState::new(window, cx).default_value(value.to_owned())),
+                error: shortcut.error(value, &config),
             }
-        };
-        let error = error.or(mode_error);
-        let remote_choice = cx.new(|cx| {
-            SelectState::new(
-                SearchableVec::new(vec!["Auto", "On", "Off"]),
-                Some(IndexPath::new(
-                    crate::remote_mode::Mode::ALL
-                        .iter()
-                        .position(|mode| *mode == remote_mode)
-                        .unwrap_or(0),
-                )),
-                window,
-                cx,
-            )
         });
-        let shortcut = cx.new(|cx| InputState::new(window, cx).default_value(config.hotkey.clone()));
         let media_app = cx.new(|cx| InputState::new(window, cx).placeholder("App name or source ID"));
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let backdrop_color =
@@ -322,16 +354,21 @@ impl Settings {
         }
         let focus = cx.focus_handle();
 
-        cx.subscribe_in(&shortcut, window, |this, input, event, window, cx| {
-            if matches!(event, InputEvent::Change) {
-                let value = input.read(cx).value().to_string();
-                this.shortcut_error = hotkey::parse(&value).err();
-                cx.notify();
-            } else if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
-                this.commit_shortcut(window, cx);
-            }
-        })
-        .detach();
+        for shortcut in Shortcut::ALL {
+            cx.subscribe_in(
+                &shortcuts[shortcut as usize].field,
+                window,
+                move |this, input, event, window, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.shortcuts[shortcut as usize].error = shortcut.error(&input.read(cx).value(), &this.config);
+                        cx.notify();
+                    } else if matches!(event, InputEvent::Blur | InputEvent::PressEnter { .. }) {
+                        this.commit_shortcut(shortcut, window, cx);
+                    }
+                },
+            )
+            .detach();
+        }
         cx.subscribe_in(&backdrop_color, window, |this, _, event, window, cx| {
             if let ColorPickerEvent::Change(Some(color)) = event {
                 let rgb = color.to_rgb();
@@ -346,30 +383,6 @@ impl Settings {
         cx.subscribe_in(&folder, window, |this, _, event, window, cx| {
             if matches!(event, InputEvent::PressEnter { .. }) {
                 this.add_folder(window, cx);
-            }
-        })
-        .detach();
-        cx.subscribe_in(&remote_choice, window, |this, _, event, window, cx| {
-            if let SelectEvent::Confirm(Some(label)) = event
-                && let Some(mode) = crate::remote_mode::Mode::parse(label)
-            {
-                let result = config::path().and_then(|path| {
-                    crate::remote_mode::save(&path.with_file_name("remote-mode.txt"), mode)
-                        .map_err(|error| error.to_string())
-                });
-                match result {
-                    Ok(()) => {
-                        this.remote_mode = mode;
-                        this.error = None;
-                        system::notify_launcher();
-                    }
-                    Err(error) => {
-                        crate::logging::error("settings.remote_mode", format_args!("stage=save error={error}"));
-                        this.error = Some(error);
-                        this.sync_remote_choice(window, cx);
-                    }
-                }
-                cx.notify();
             }
         })
         .detach();
@@ -461,21 +474,14 @@ impl Settings {
         }
         cx.observe_window_appearance(window, |this, window, cx| this.apply_theme(window, cx))
             .detach();
-        cx.observe_window_activation(window, |this, window, cx| {
-            if window.is_window_active() {
-                this.reload_remote_mode(window, cx);
-            }
-        })
-        .detach();
         cx.on_blur(&focus, window, |this, _, cx| {
-            this.recording = false;
+            this.recording = None;
             cx.notify();
         })
         .detach();
 
         let mut this = Self {
             store,
-            shortcut_error: hotkey::parse(&config.hotkey).err(),
             config,
             error,
             folder_error: None,
@@ -488,7 +494,7 @@ impl Settings {
                 })
                 .unwrap_or(Page::General),
             onboarding: welcome.then_some(0),
-            shortcut,
+            shortcuts,
             folder,
             media_app,
             media_sources: Vec::new(),
@@ -496,9 +502,8 @@ impl Settings {
             media_loading: false,
             media_loaded: false,
             media_error: None,
+            update: UpdateStatus::Idle,
             backdrop_color,
-            remote_mode,
-            remote_choice,
             theme,
             backdrop,
             start_position,
@@ -516,7 +521,7 @@ impl Settings {
             topbar_displays: system::topbar_displays(),
             autostart: system::autostart_enabled(),
             powertoys: system::powertoys_run_enabled(),
-            recording: false,
+            recording: None,
             focus,
             icon: Arc::new(Image::from_bytes(ImageFormat::Svg, ICON_SVG.to_vec())),
         };
@@ -548,6 +553,47 @@ impl Settings {
             });
         })
         .detach();
+        cx.notify();
+    }
+
+    fn run_update_action(&mut self, cx: &mut Context<Self>) {
+        if !feed::available() || matches!(self.update, UpdateStatus::Checking | UpdateStatus::Installing) {
+            return;
+        }
+        let executor = cx.background_executor().clone();
+        if let UpdateStatus::Available(release) = &self.update {
+            let release = release.clone();
+            self.update = UpdateStatus::Installing;
+            cx.spawn(async move |this, cx| {
+                let result = executor.spawn(async move { install::schedule(&release, true) }).await;
+                let _ = this.update(cx, |this, cx| match result {
+                    Ok(()) => cx.quit(),
+                    Err(error) => {
+                        crate::logging::error("update.manual", format_args!("stage=schedule {error}"));
+                        this.update = UpdateStatus::Failed(error);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.update = UpdateStatus::Checking;
+            cx.spawn(async move |this, cx| {
+                let result = executor.spawn(async { feed::check() }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.update = match result {
+                        Ok(Some(release)) => UpdateStatus::Available(release),
+                        Ok(None) => UpdateStatus::Current,
+                        Err(error) => {
+                            crate::logging::error("update.manual", format_args!("stage=check {error}"));
+                            UpdateStatus::Failed(error)
+                        }
+                    };
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -598,31 +644,6 @@ impl Settings {
         }
     }
 
-    fn sync_remote_choice(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let index = crate::remote_mode::Mode::ALL
-            .iter()
-            .position(|mode| *mode == self.remote_mode)
-            .map(IndexPath::new);
-        self.remote_choice
-            .update(cx, |state, cx| state.set_selected_index(index, window, cx));
-    }
-
-    fn reload_remote_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match config::path().and_then(|path| {
-            crate::remote_mode::load(&path.with_file_name("remote-mode.txt")).map_err(|error| error.to_string())
-        }) {
-            Ok(mode) => {
-                self.remote_mode = mode;
-                self.sync_remote_choice(window, cx);
-            }
-            Err(error) => {
-                crate::logging::error("settings.remote_mode", format_args!("stage=reload error={error}"));
-                self.error = Some(error);
-            }
-        }
-        cx.notify();
-    }
-
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let result = self
             .store
@@ -633,10 +654,12 @@ impl Settings {
             Ok(config) => {
                 self.config = config;
                 self.error = None;
-                self.shortcut_error = hotkey::parse(&self.config.hotkey).err();
-                let hotkey = self.config.hotkey.clone();
-                self.shortcut
-                    .update(cx, |input, cx| input.set_value(hotkey, window, cx));
+                for shortcut in Shortcut::ALL {
+                    let value = shortcut.saved(&self.config).to_owned();
+                    let input = &mut self.shortcuts[shortcut as usize];
+                    input.error = shortcut.error(&value, &self.config);
+                    input.field.update(cx, |input, cx| input.set_value(value, window, cx));
+                }
                 let theme = index_of(&THEMES, &self.config.theme);
                 self.theme
                     .update(cx, |state, cx| state.set_selected_index(theme, window, cx));
@@ -684,54 +707,63 @@ impl Settings {
                 self.error = Some(error);
             }
         }
-        self.reload_remote_mode(window, cx);
         cx.notify();
     }
 
     fn record(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.recording || !self.focus.is_focused(window) {
+        let Some(shortcut) = self.recording.filter(|_| self.focus.is_focused(window)) else {
             return;
-        }
+        };
         cx.stop_propagation();
         window.prevent_default();
         let key = &event.keystroke;
         if key.key == "escape" && !key.modifiers.modified() {
-            self.recording = false;
-            self.shortcut_error = hotkey::parse(&self.shortcut.read(cx).value()).err();
+            self.recording = None;
+            let input = &mut self.shortcuts[shortcut as usize];
+            input.error = shortcut.error(&input.field.read(cx).value(), &self.config);
             cx.notify();
             return;
         }
         let m = key.modifiers;
         match hotkey::recorded(&key.key, m.control, m.alt, m.shift, m.platform) {
             Ok(value) => {
-                self.recording = false;
-                self.shortcut_error = None;
-                self.shortcut
-                    .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
-                if value != self.config.hotkey {
-                    self.save("hotkey", value.into(), window, cx);
-                }
+                self.recording = None;
+                self.shortcuts[shortcut as usize]
+                    .field
+                    .update(cx, |input, cx| input.set_value(value, window, cx));
+                self.commit_shortcut(shortcut, window, cx);
             }
-            Err(error) => self.shortcut_error = Some(error),
+            Err(error) => self.shortcuts[shortcut as usize].error = Some(error),
         }
         cx.notify();
     }
 
-    fn start_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.recording = true;
-        self.shortcut_error = None;
+    fn start_recording(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+        self.recording = Some(shortcut);
+        self.shortcuts[shortcut as usize].error = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
 
-    fn commit_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let value = self.shortcut.read(cx).value().to_string();
-        self.shortcut_error = hotkey::parse(&value).err();
-        if self.shortcut_error.is_some() {
+    fn commit_shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let input = &mut self.shortcuts[shortcut as usize];
+        let value = input.field.read(cx).value().to_string();
+        input.error = shortcut.error(&value, &self.config);
+        if input.error.is_some() {
             cx.notify();
             return false;
         }
-        value == self.config.hotkey || self.save("hotkey", value.into(), window, cx)
+        if value == shortcut.saved(&self.config) {
+            return true;
+        }
+        if !self.save(shortcut.key(), value.into(), window, cx) {
+            return false;
+        }
+        for shortcut in Shortcut::ALL {
+            let input = &mut self.shortcuts[shortcut as usize];
+            input.error = shortcut.error(&input.field.read(cx).value(), &self.config);
+        }
+        true
     }
 
     fn set_autostart(&mut self, enabled: bool, cx: &mut Context<Self>) {
@@ -788,29 +820,33 @@ impl Settings {
         self.save("file_search_exclude", Value::Array(array), window, cx)
     }
 
-    fn shortcut_control(&self, p: Palette, cx: &mut Context<Self>) -> Div {
+    fn shortcut_control(&self, shortcut: Shortcut, p: Palette, cx: &mut Context<Self>) -> Div {
+        let input = &self.shortcuts[shortcut as usize];
+        let recording = self.recording == Some(shortcut);
+        let (button, label) = match shortcut {
+            Shortcut::Launcher => ("record", "Launcher shortcut"),
+            Shortcut::Quit => ("record-quit", "Quit Wisp shortcut"),
+        };
         v_flex()
             .gap_2()
             .child(
                 h_flex()
                     .gap_2()
-                    .child(Input::new(&self.shortcut).aria_label("Shortcut").flex_1())
+                    .child(Input::new(&input.field).aria_label(label).flex_1())
                     .child(
-                        Button::new("record")
-                            .label(if self.recording {
-                                "Press a shortcut…"
-                            } else {
-                                "Record"
-                            })
-                            .when(self.recording, |b| b.primary())
-                            .on_click(cx.listener(|this, _, window, cx| this.start_recording(window, cx))),
+                        Button::new(button)
+                            .label(if recording { "Press a shortcut…" } else { "Record" })
+                            .when(recording, |b| b.primary())
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| this.start_recording(shortcut, window, cx)),
+                            ),
                     ),
             )
             .child(hint(
                 "Type a shortcut and press Enter, or select Record and press it. Esc cancels.",
                 p,
             ))
-            .children(self.shortcut_error.as_ref().map(|e| error_text(e, p)))
+            .children(input.error.as_ref().map(|e| error_text(e, p)))
     }
 
     fn conflict_warning(&self, p: Palette) -> Option<Div> {
@@ -834,16 +870,30 @@ impl Settings {
     fn general(&self, p: Palette, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .gap_2()
-            .child(label("Remote mode", p))
-            .child(group(p).child(row("Remote mode", "Temporary layout for Remote Desktop", Select::new(&self.remote_choice).accessibility_label("Remote mode").w(px(160.)), p)))
-            .child(hint("Auto uses a fixed bottom dock during Remote Desktop, with apps, tray and Controls. On always uses it; Off keeps your normal layout. Your normal settings are restored on console return in Auto.", p))
-            .child(label("Launcher", p))
+            .child(label("Remote Desktop", p))
+            .child(group(p).child(row(
+                "Pause Wisp during Remote Desktop",
+                "Use the Windows taskbar during Remote Desktop. Wisp resumes when you return to the computer.",
+                Switch::new("pause-on-rdp")
+                    .checked(self.config.pause_on_rdp)
+                    .accessibility_label("Pause Wisp during Remote Desktop")
+                    .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                        this.save("pause_on_rdp", (*enabled).into(), window, cx);
+                    })),
+                p,
+            )))
+            .child(label("Shortcuts", p))
             .child(
-                group(p).child(
-                    item("Shortcut", "Shows or hides the launcher.", p)
-                        .child(self.shortcut_control(p, cx))
-                        .children(self.conflict_warning(p)),
-                ),
+                group(p)
+                    .child(
+                        item("Launcher shortcut", "Shows or hides the launcher.", p)
+                            .child(self.shortcut_control(Shortcut::Launcher, p, cx))
+                            .children(self.conflict_warning(p)),
+                    )
+                    .child(
+                        item("Quit Wisp", "Closes Wisp and restores the Windows taskbar.", p)
+                            .child(self.shortcut_control(Shortcut::Quit, p, cx)),
+                    ),
             )
             .child(div().h_3())
             .child(label("Dock", p))
@@ -1044,7 +1094,7 @@ impl Settings {
                     .child(divider(p))
                     .child(row(
                         "Shared material",
-                        "Dock, Start, Controls, tray and Wisp popups follow this choice, including Remote mode. Windows may limit blur.",
+                        "Dock, Start, Controls, tray and Wisp popups follow this choice. Windows transparency settings may limit blur.",
                         Select::new(&self.backdrop).accessibility_label("Shared material").w(px(160.)),
                         p,
                     ))
@@ -1220,6 +1270,23 @@ impl Settings {
             .as_ref()
             .map(|store| store.path.display().to_string())
             .unwrap_or_else(|| "Config folder unavailable".into());
+        let (description, action, busy): (String, &str, bool) = match &self.update {
+            UpdateStatus::Idle if !feed::available() => (
+                "Updates are unavailable for this build".into(),
+                "Check for updates",
+                true,
+            ),
+            UpdateStatus::Idle => ("Check for a newer version of Wisp".into(), "Check for updates", false),
+            UpdateStatus::Checking => ("Checking for updates…".into(), "Check for updates", true),
+            UpdateStatus::Current => ("Wisp is up to date".into(), "Check for updates", false),
+            UpdateStatus::Available(release) => (
+                format!("Version {} is available", release.version),
+                "Install and restart",
+                false,
+            ),
+            UpdateStatus::Installing => ("Preparing the update…".into(), "Install and restart", true),
+            UpdateStatus::Failed(error) => (error.clone(), "Check for updates", false),
+        };
         v_flex()
             .gap_4()
             .child(
@@ -1232,6 +1299,31 @@ impl Settings {
                             .child(div().text_base().font_weight(FontWeight::SEMIBOLD).child("Wisp"))
                             .child(hint(format!("Version {}", env!("CARGO_PKG_VERSION")), p)),
                     ),
+            )
+            .child(
+                group(p)
+                    .child(row(
+                        "Wisp updates",
+                        description,
+                        Button::new("wisp-update")
+                            .label(action)
+                            .disabled(busy)
+                            .on_click(cx.listener(|this, _, _, cx| this.run_update_action(cx))),
+                        p,
+                    ))
+                    .child(divider(p))
+                    .child(row(
+                        "Install updates automatically",
+                        "Check daily while Settings is closed and restart Wisp to install updates",
+                        Switch::new("automatic-updates")
+                            .checked(self.config.automatic_updates)
+                            .disabled(!feed::available())
+                            .accessibility_label("Install updates automatically")
+                            .on_change(cx.listener(|this, enabled: &bool, window, cx| {
+                                this.save("automatic_updates", (*enabled).into(), window, cx);
+                            })),
+                        p,
+                    )),
             )
             .child(
                 group(p)
@@ -1331,8 +1423,9 @@ impl Settings {
     }
 
     fn onboarding_view(&self, step: usize, p: Palette, cx: &mut Context<Self>) -> AnyElement {
-        let shortcut =
-            group(p).child(item("Shortcut", "Shows or hides the launcher.", p).child(self.shortcut_control(p, cx)));
+        let shortcut = group(p).child(
+            item("Shortcut", "Shows or hides the launcher.", p).child(self.shortcut_control(Shortcut::Launcher, p, cx)),
+        );
         let (title, body): (&str, Div) = match step {
             0 => (
                 "Welcome to Wisp",
@@ -1403,7 +1496,7 @@ impl Settings {
                             Button::new("back")
                                 .label("Back")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.recording = false;
+                                    this.recording = None;
                                     this.onboarding = this.onboarding.map(|s| s.saturating_sub(1));
                                     cx.notify();
                                 })),
@@ -1413,10 +1506,10 @@ impl Settings {
                         Button::new("next")
                             .primary()
                             .label(if last { "Done" } else { "Next" })
-                            .disabled(self.shortcut_error.is_some())
+                            .disabled(self.shortcuts[Shortcut::Launcher as usize].error.is_some())
                             .on_click(cx.listener(move |this, _, window, cx| {
-                                this.recording = false;
-                                if !last && !this.commit_shortcut(window, cx) {
+                                this.recording = None;
+                                if !last && !this.commit_shortcut(Shortcut::Launcher, window, cx) {
                                     return;
                                 }
                                 if last {
@@ -1486,7 +1579,7 @@ fn nav_item(page: Page, active: bool, p: Palette, cx: &mut Context<Settings>) ->
             if page == Page::Notch && !this.media_loaded {
                 this.refresh_media_sources(cx);
             }
-            this.recording = false;
+            this.recording = None;
             this.autostart = system::autostart_enabled();
             cx.notify();
         }))

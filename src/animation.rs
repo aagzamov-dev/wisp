@@ -10,10 +10,6 @@ pub enum Phase {
 }
 
 pub const LOCAL_INTERVAL: u32 = 15;
-pub const REMOTE_INTERVAL: u32 = 30;
-pub fn interval(remote: bool) -> u32 {
-    if remote { REMOTE_INTERVAL } else { LOCAL_INTERVAL }
-}
 fn elapsed(seconds: f32) -> f32 {
     if seconds.is_nan() { 0. } else { seconds.max(0.) }
 }
@@ -68,15 +64,7 @@ impl Motion {
         self.value.clamp(0., 1.)
     }
     pub fn retarget(&mut self, opening: bool, animate: bool) {
-        self.retarget_profile(opening, animate, false);
-    }
-    pub fn retarget_profile(&mut self, opening: bool, animate: bool, remote: bool) {
-        let milliseconds = match (opening, remote) {
-            (true, false) => 220,
-            (false, false) => 180,
-            (true, true) => 120,
-            (false, true) => 100,
-        };
+        let milliseconds = if opening { 220 } else { 180 };
         self.retarget_duration(opening, if animate { milliseconds } else { 0 });
     }
     pub(crate) fn retarget_duration(&mut self, opening: bool, milliseconds: u32) {

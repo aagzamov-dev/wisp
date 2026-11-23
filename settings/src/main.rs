@@ -20,6 +20,7 @@ mod media_sources;
 mod palette;
 mod system;
 mod ui;
+mod update;
 
 use gpui_kit::{AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
 
@@ -29,6 +30,10 @@ fn main() {
         std::eprintln!("Wisp Settings file diagnostics unavailable: {error}");
         #[cfg(not(debug_assertions))]
         let _ = error;
+    }
+    if update::dispatch() {
+        logging::finish("update-dispatched");
+        return;
     }
     logging::event("settings.start", format_args!("ui_thread=true"));
     let args: Vec<String> = std::env::args().collect();

@@ -30,12 +30,14 @@ use crate::drag::{self, Payload};
 use crate::files::{FileResults, FileSearch};
 use crate::history::History;
 use crate::indexer::{AppEntry, IconPixels, IndexEvent, Indexer};
+use crate::remote_session::{self, Session};
 use crate::render::{Frame, Renderer, SurfaceFrame, layout};
 use crate::search::{self, Action, Drill, FileScope, Kind, ResultItem, Searcher};
 use crate::surface::nav::{self, Direction, Rect};
 use crate::surface::{self, Input, Library, Widget};
 use crate::taskbar::{self, TaskbarHider};
 use crate::theme::Palette;
+use crate::worker::WorkerLifetime;
 use crate::{hotkey, launch, system, tray, util};
 
 const WM_APP_FRAME: u32 = WM_APP + 8;
@@ -49,8 +51,13 @@ const WM_APP_RELOAD: u32 = WM_APP + 6;
 const REEL_TIMER: usize = 96;
 const REEL_MS: u32 = 50;
 const WM_APP_COMMANDS: u32 = WM_APP + 7;
-const CLASS_NAME: PCWSTR = crate::channel::LAUNCHER_CLASS;
+const LIFECYCLE_CLASS: PCWSTR = crate::channel::LAUNCHER_CLASS;
+const LAUNCHER_CLASS: PCWSTR = crate::channel::LAUNCHER_SURFACE_CLASS;
+const SESSION_RETRY_TIMER: usize = 1;
+const SESSION_RETRY_MS: u32 = 500;
+const SESSION_RETRY_MAX_MS: u32 = 30_000;
 const HOTKEY_ID: i32 = 1;
+const QUIT_HOTKEY_ID: i32 = 2;
 const CARET_TIMER: usize = 1;
 /// Reads the state again while a surface is open, so it stays live.
 const SURFACE_TIMER: usize = 2;
@@ -61,6 +68,10 @@ const PEEK_TIMER: usize = 3;
 /// not have finished creating it.
 const TASKBAR_TIMER: usize = 4;
 const START_ACTIVATE_TIMER: usize = 5;
+const UPDATE_TIMER: usize = 6;
+// Probe for a closed Settings window once an hour. The helper reserves at most
+// one eligible network check per day across restarts.
+const UPDATE_TIMER_MS: u32 = 60 * 60 * 1_000;
 const TASKBAR_RETRY_MS: u32 = 2000;
 const TASKBAR_ATTEMPTS: u32 = 5;
 /// File results shown after apps, and for a query that starts with `?`.
@@ -79,7 +90,6 @@ const DEFER_INDEX: u8 = 1;
 const DEFER_FILES: u8 = 4;
 const DEFER_HIDE: u8 = 2;
 const DEFER_COMMANDS: u8 = 8;
-const DEFER_REMOTE: u8 = 16;
 const DEFER_RELOAD: u8 = 32;
 const DEFER_PAINT: u8 = 64;
 
@@ -87,23 +97,106 @@ thread_local! {
     static FRAME_PENDING: RefCell<Option<Arc<AtomicBool>>> = const {RefCell::new(None)};
     static LAUNCHER: RefCell<Option<Launcher>> = const { RefCell::new(None) };
     static DEFERRED: Cell<u8> = const { Cell::new(0) };
-    static REMOTE_NOTIFICATIONS: RefCell<Option<crate::remote_session::Notifications>> = const { RefCell::new(None) };
-    static REMOTE_SESSION_ID: Cell<Option<u32>> = const { Cell::new(None) };
+    static LIFECYCLE: Cell<Lifecycle> = const { Cell::new(Lifecycle::new()) };
+    static LISTENER_WINDOW: Cell<Option<HWND>> = const { Cell::new(None) };
+    static SESSION_NOTIFICATIONS: RefCell<Option<remote_session::Notifications>> = const { RefCell::new(None) };
+    static SESSION_RETRY: Cell<Option<SessionRetry>> = const { Cell::new(None) };
+    static ACTIVE_WORKERS: RefCell<Option<WorkerLifetime>> = const { RefCell::new(None) };
+    static PAUSED_CONFIG: RefCell<Option<Config>> = const { RefCell::new(None) };
+    static ACTIVE_WINDOW: Cell<Option<HWND>> = const { Cell::new(None) };
     static DRAGGING: Cell<bool> = const { Cell::new(false) };
 }
 
-// Independent of Launcher borrows so nested native loops can always unregister
-// before destroying the registered HWND.
-fn unregister_remote_notifications() {
-    REMOTE_NOTIFICATIONS.with(|slot| {
-        slot.borrow_mut().take();
-    });
+#[derive(Clone, Copy)]
+struct SessionRetry {
+    waiting_for_console: bool,
+    delay_ms: u32,
+}
+
+impl SessionRetry {
+    fn new(waiting_for_console: bool) -> Self {
+        Self {
+            waiting_for_console,
+            delay_ms: SESSION_RETRY_MS,
+        }
+    }
+
+    fn after_attempt(self, settled: bool) -> Option<Self> {
+        (!settled).then_some(Self {
+            delay_ms: (self.delay_ms * 2).min(SESSION_RETRY_MAX_MS),
+            ..self
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Lifecycle {
+    session_id: Option<u32>,
+    session: Session,
+    pause_on_rdp: bool,
+    retiring: bool,
+    quitting: bool,
+}
+
+impl Lifecycle {
+    const fn new() -> Self {
+        Self {
+            session_id: None,
+            session: Session::Unknown,
+            pause_on_rdp: false,
+            retiring: false,
+            quitting: false,
+        }
+    }
+
+    fn wants_launcher(self) -> bool {
+        !self.quitting && (!self.pause_on_rdp || self.session == Session::Console)
+    }
+
+    fn allows_launcher_work(self) -> bool {
+        self.wants_launcher() && !self.retiring
+    }
+}
+
+fn update_lifecycle(update: impl FnOnce(&mut Lifecycle)) {
+    let previous = LIFECYCLE.get();
+    let mut next = previous;
+    update(&mut next);
+    let cancel = !next.wants_launcher() && previous.allows_launcher_work() && ACTIVE_WINDOW.get().is_some();
+    next.retiring |= cancel;
+    LIFECYCLE.set(next);
+    let intent_changed =
+        previous.allows_launcher_work() != next.allows_launcher_work() || previous.quitting != next.quitting;
+    if intent_changed && let Some(listener) = LISTENER_WINDOW.get() {
+        unsafe {
+            let _ = PostMessageW(Some(listener), WM_NULL, WPARAM(0), LPARAM(0));
+        }
+    }
+    if cancel {
+        ACTIVE_WORKERS.with(|workers| {
+            if let Some(workers) = workers.borrow().as_ref() {
+                workers.stop();
+            }
+        });
+        // Make the new policy visible before native menus pump more messages.
+        unsafe {
+            let _ = EndMenu();
+            let _ = PostMessageW(ACTIVE_WINDOW.get(), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+fn request_quit() {
+    update_lifecycle(|state| state.quitting = true);
 }
 
 /// Returns `None` if the launcher is already borrowed. Windows can send
 /// reentrant messages during `ShowWindow` or a modal `ShellExecuteEx` call.
 /// Runs deferred work after the outer handler releases the borrow.
 fn with_launcher<R>(f: impl FnOnce(&mut Launcher) -> R) -> Option<R> {
+    if !LIFECYCLE.get().allows_launcher_work() {
+        return None;
+    }
     let result = LAUNCHER.with(|cell| cell.try_borrow_mut().ok().and_then(|mut l| l.as_mut().map(f)));
     if result.is_some() {
         run_deferred();
@@ -121,7 +214,7 @@ fn with_launcher_or_defer(work: u8, f: impl FnOnce(&mut Launcher)) {
 fn run_deferred() {
     loop {
         let work = DEFERRED.with(|d| d.replace(0));
-        if work == 0 {
+        if work == 0 || !LIFECYCLE.get().allows_launcher_work() {
             return;
         }
         let ran = LAUNCHER.with(|cell| {
@@ -129,11 +222,11 @@ fn run_deferred() {
                 return false;
             };
             if let Some(l) = launcher.as_mut() {
-                if work & DEFER_REMOTE != 0 {
-                    l.refresh_remote_session();
-                }
                 if work & DEFER_RELOAD != 0 {
                     l.reload_config_if_changed();
+                    if !LIFECYCLE.get().allows_launcher_work() {
+                        return true;
+                    }
                 }
                 if work & DEFER_INDEX != 0 {
                     l.drain_index_events();
@@ -168,14 +261,12 @@ pub fn run() -> Result<()> {
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let _ole = drag::Ole::new()?;
-
         // The mutex limits Wisp to one running instance.
         let _mutex = CreateMutexW(None, true, crate::channel::INSTANCE_MUTEX)?;
         if GetLastError() == ERROR_ALREADY_EXISTS {
             // Wait up to 3 s for a starting instance to create its window.
             for _ in 0..30 {
-                if let Ok(existing) = FindWindowW(CLASS_NAME, PCWSTR::null()) {
+                if let Ok(existing) = FindWindowW(LIFECYCLE_CLASS, PCWSTR::null()) {
                     let mut pid = 0;
                     GetWindowThreadProcessId(existing, Some(&mut pid));
                     let _ = AllowSetForegroundWindow(pid);
@@ -194,44 +285,331 @@ pub fn run() -> Result<()> {
         if flag("--quit") {
             return Ok(());
         }
+        if launch::update_is_interrupted()? {
+            return Err(windows::core::Error::new(
+                E_FAIL,
+                "An interrupted update needs recovery. Open wisp-settings.exe from this installation.",
+            ));
+        }
 
-        let renderer = Renderer::new()?;
-        let system_dpi = GetDpiForSystem();
         let instance = GetModuleHandleW(None)?;
-        // build.rs embeds the icon as resource ID 1.
-        let load_icon = |metric| -> Result<HICON> {
-            let size = GetSystemMetricsForDpi(metric, system_dpi);
-            let icon = LoadImageW(
-                Some(instance.into()),
-                PCWSTR(1 as _),
-                IMAGE_ICON,
-                size,
-                size,
-                LR_DEFAULTCOLOR,
-            )?;
-            Ok(HICON(icon.0))
-        };
-        let small_icon = load_icon(SM_CXSMICON)?;
-        let large_icon = load_icon(SM_CXICON)?;
-
-        let class = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(lifecycle_wndproc),
             hInstance: instance.into(),
-            hCursor: LoadCursorW(None, IDC_ARROW)?,
-            hIcon: large_icon,
-            hIconSm: small_icon,
-            lpszClassName: CLASS_NAME,
+            lpszClassName: LIFECYCLE_CLASS,
             ..Default::default()
         };
-        if RegisterClassExW(&class) == 0 {
+        if RegisterClassW(&class) == 0 {
             return Err(windows::core::Error::from_thread());
         }
+        // Use a hidden top-level window so Settings and other Wisp invocations
+        // can find the existing per-channel endpoint while the launcher is gone.
+        let listener = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            LIFECYCLE_CLASS,
+            PCWSTR::null(),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )?;
+        LISTENER_WINDOW.set(Some(listener));
+        let first_run = !Config::path().exists();
+        let (config, config_error) = Config::load();
+        update_lifecycle(|state| state.pause_on_rdp = config.pause_on_rdp);
+        if !observe_session(listener, false) {
+            set_session_retry(listener, Some(SessionRetry::new(false)));
+        }
+        let result = run_lifecycle(
+            listener,
+            config,
+            config_error,
+            first_run,
+            flag("--show"),
+            flag("--skip-update-check"),
+        );
+        SESSION_NOTIFICATIONS.with(|registration| registration.borrow_mut().take());
+        LISTENER_WINDOW.set(None);
+        let _ = DestroyWindow(listener);
+        result
+    }
+}
+
+// Retry only a missed registration or a console transition whose WTS data
+// is still catching up. Healthy local and RDP sessions never poll.
+fn observe_session(listener: HWND, waiting_for_console: bool) -> bool {
+    let id = match LIFECYCLE.get().session_id {
+        Some(id) => id,
+        None => match remote_session::current_session_id() {
+            Ok(id) => {
+                update_lifecycle(|state| state.session_id = Some(id));
+                id
+            }
+            Err(error) => {
+                crate::logging::error("remote.session_id", format_args!("error={error}"));
+                return false;
+            }
+        },
+    };
+    let registered = SESSION_NOTIFICATIONS.with(|slot| {
+        let mut registration = slot.borrow_mut();
+        if registration.is_none() {
+            match remote_session::Notifications::new(listener) {
+                Ok(notifications) => *registration = Some(notifications),
+                Err(error) => crate::logging::error("remote.register", format_args!("error={error}")),
+            }
+        }
+        registration.is_some()
+    });
+    let observation = remote_session::observe(id);
+    update_lifecycle(|state| state.session = observation.session(state.session));
+    registered && observation.settled(waiting_for_console)
+}
+
+fn set_session_retry(hwnd: HWND, retry: Option<SessionRetry>) {
+    if let Some(retry) = retry {
+        if unsafe { SetTimer(Some(hwnd), SESSION_RETRY_TIMER, retry.delay_ms, None) } == 0 {
+            crate::logging::error("remote.retry_timer", format_args!("could_not_start=true"));
+            return;
+        }
+        SESSION_RETRY.set(Some(retry));
+    } else if SESSION_RETRY.replace(None).is_some() {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), SESSION_RETRY_TIMER);
+        }
+    }
+}
+
+fn check_console_attach(hwnd: HWND) {
+    let retry = (!observe_session(hwnd, true)).then(|| {
+        SESSION_RETRY
+            .get()
+            .filter(|retry| retry.waiting_for_console)
+            .unwrap_or_else(|| SessionRetry::new(true))
+    });
+    set_session_retry(hwnd, retry);
+}
+
+fn run_lifecycle(
+    listener: HWND,
+    config: Config,
+    config_error: Option<String>,
+    first_run: bool,
+    show: bool,
+    skip_update_check: bool,
+) -> Result<()> {
+    let mut settings = config;
+    let mut initial_error = Some(config_error);
+    let mut first_activation = true;
+    let mut waited = false;
+    while !LIFECYCLE.get().quitting {
+        if LIFECYCLE.get().wants_launcher() {
+            if waited {
+                // Retire queued lifecycle messages before reclaiming the shell.
+                // In particular, a Quit queued behind console attach wins.
+                let mut msg = MSG::default();
+                while unsafe { PeekMessageW(&mut msg, Some(listener), 0, 0, PM_REMOVE) }.as_bool() {
+                    if msg.message == WM_QUIT {
+                        request_quit();
+                        return Ok(());
+                    }
+                    dispatch_ui_message(&msg);
+                }
+                if !LIFECYCLE.get().wants_launcher() {
+                    continue;
+                }
+            }
+            let error = initial_error.take().unwrap_or_else(|| {
+                if let Some(config) = PAUSED_CONFIG.with(|config| config.borrow_mut().take()) {
+                    settings = config;
+                }
+                let (config, error) = Config::load();
+                if error.is_none() {
+                    update_lifecycle(|state| state.pause_on_rdp = config.pause_on_rdp);
+                    settings = config;
+                }
+                error
+            });
+            if LIFECYCLE.get().wants_launcher() {
+                crate::logging::event("remote.lifecycle", format_args!("active=true"));
+                settings = run_launcher(
+                    settings,
+                    error,
+                    first_activation && first_run,
+                    first_activation && show,
+                    !(first_activation && skip_update_check),
+                )?;
+                first_activation = false;
+                waited = true;
+            }
+        } else {
+            // A settings change may supersede the configuration read at startup.
+            initial_error = None;
+            if !waited {
+                crate::logging::event("remote.lifecycle", format_args!("active=false"));
+            }
+            waited = true;
+            if !dispatch_next_message() {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_next_message() -> bool {
+    let mut msg = MSG::default();
+    let received = unsafe { GetMessageW(&mut msg, None, 0, 0) }.0;
+    if received <= 0 {
+        if received < 0 {
+            crate::logging::error(
+                "ui.message_loop",
+                format_args!("code={:#010X}", windows::core::Error::from_thread().code().0),
+            );
+        }
+        crate::logging::event(
+            "ui.message_loop.end",
+            format_args!("quit={} exit_code={}", received == 0, msg.wParam.0),
+        );
+        request_quit();
+        return false;
+    }
+    dispatch_ui_message(&msg);
+    true
+}
+
+unsafe extern "system" fn lifecycle_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match msg {
+        remote_session::WM_WTSSESSION_CHANGE => {
+            let Some(id) = LIFECYCLE.get().session_id else {
+                return LRESULT(0);
+            };
+            match remote_session::event_kind(id, lparam.0 as u32, wparam.0) {
+                remote_session::Event::Ignore => {}
+                remote_session::Event::RemoteConnect => {
+                    set_session_retry(hwnd, None);
+                    update_lifecycle(|state| state.session = Session::Remote);
+                }
+                remote_session::Event::ConsoleConnect => check_console_attach(hwnd),
+                remote_session::Event::ConsoleDisconnect => {
+                    if SESSION_RETRY.get().is_some_and(|retry| retry.waiting_for_console) {
+                        set_session_retry(hwnd, None);
+                    }
+                }
+                remote_session::Event::SessionReady => {
+                    if remote_session::owns_console(id) {
+                        check_console_attach(hwnd);
+                    }
+                }
+            }
+        }
+        WM_TIMER if wparam.0 == SESSION_RETRY_TIMER => {
+            if let Some(retry) = SESSION_RETRY.get() {
+                let settled = observe_session(hwnd, retry.waiting_for_console);
+                set_session_retry(hwnd, retry.after_attempt(settled));
+            }
+        }
+        WM_APP_QUIT | WM_CLOSE => request_quit(),
+        WM_ENDSESSION if wparam.0 != 0 => request_quit(),
+        WM_APP_SHOW => {
+            with_launcher(Launcher::show);
+        }
+        WM_APP_RELOAD => {
+            if ACTIVE_WINDOW.get().is_some() && LIFECYCLE.get().allows_launcher_work() {
+                with_launcher_or_defer(DEFER_RELOAD, Launcher::reload_config_if_changed);
+            } else {
+                let (config, error) = Config::load();
+                if error.is_some() {
+                    crate::logging::error("config.reload", format_args!("valid=false"));
+                } else {
+                    update_lifecycle(|state| state.pause_on_rdp = config.pause_on_rdp);
+                    PAUSED_CONFIG.with(|pending| *pending.borrow_mut() = Some(config));
+                }
+            }
+        }
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+    LRESULT(0)
+}
+
+struct LauncherClass {
+    instance: HINSTANCE,
+    system_dpi: u32,
+    small_icon: HICON,
+    large_icon: HICON,
+}
+
+impl LauncherClass {
+    fn register() -> Result<Self> {
+        unsafe {
+            let instance = GetModuleHandleW(None)?.into();
+            let system_dpi = GetDpiForSystem();
+            let cursor = LoadCursorW(None, IDC_ARROW)?;
+            // build.rs embeds the icon as resource ID 1.
+            let load_icon = |metric| -> Result<HICON> {
+                let size = GetSystemMetricsForDpi(metric, system_dpi);
+                let icon = LoadImageW(Some(instance), PCWSTR(1 as _), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)?;
+                Ok(HICON(icon.0))
+            };
+            let mut owner = Self {
+                instance,
+                system_dpi,
+                small_icon: load_icon(SM_CXSMICON)?,
+                large_icon: HICON::default(),
+            };
+            owner.large_icon = load_icon(SM_CXICON)?;
+            let class = WNDCLASSEXW {
+                cbSize: size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(wndproc),
+                hInstance: owner.instance,
+                hCursor: cursor,
+                hIcon: owner.large_icon,
+                hIconSm: owner.small_icon,
+                lpszClassName: LAUNCHER_CLASS,
+                ..Default::default()
+            };
+            if RegisterClassExW(&class) == 0 {
+                return Err(windows::core::Error::from_thread());
+            }
+            Ok(owner)
+        }
+    }
+}
+
+impl Drop for LauncherClass {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = UnregisterClassW(LAUNCHER_CLASS, Some(self.instance));
+            let _ = DestroyIcon(self.small_icon);
+            if !self.large_icon.is_invalid() {
+                let _ = DestroyIcon(self.large_icon);
+            }
+        }
+    }
+}
+
+fn run_launcher(
+    config: Config,
+    config_error: Option<String>,
+    first_run: bool,
+    show: bool,
+    check_updates: bool,
+) -> Result<Config> {
+    let _ole = drag::Ole::new()?;
+    let renderer = Renderer::new()?;
+    let class = LauncherClass::register()?;
+    let system_dpi = class.system_dpi;
+    unsafe {
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
 
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
-            CLASS_NAME,
+            LAUNCHER_CLASS,
             &HSTRING::from(crate::channel::NAME),
             WS_POPUP | WS_CAPTION,
             0,
@@ -240,12 +618,12 @@ pub fn run() -> Result<()> {
             100,
             None,
             None,
-            Some(instance.into()),
+            Some(class.instance),
             None,
         )?;
 
         // Apply WM_NCCALCSIZE before the first draw to remove the visible frame.
-        SetWindowPos(
+        if let Err(error) = SetWindowPos(
             hwnd,
             None,
             0,
@@ -253,11 +631,11 @@ pub fn run() -> Result<()> {
             0,
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
-        )?;
+        ) {
+            let _ = DestroyWindow(hwnd);
+            return Err(error);
+        }
 
-        // Config::load creates the config on first run.
-        let first_run = !Config::path().exists();
-        let (config, config_error) = Config::load();
         crate::logging::event(
             "config.initial",
             format_args!(
@@ -271,16 +649,15 @@ pub fn run() -> Result<()> {
         let (files_tx, files_rx) = channel();
         // Icons are drawn at 32 DIPs; extract them at the system DPI's pixel size.
         let icon_size = (32 * system_dpi as i32 + 95) / 96;
-        let (commands, command_events) = Commands::spawn(hwnd, WM_APP_COMMANDS, icon_size);
+        let workers = WorkerLifetime::new(hwnd);
+        let (commands, command_events) = Commands::spawn(&workers, WM_APP_COMMANDS, icon_size);
         let launcher = Launcher {
             hwnd,
-            saved_config: config.clone(),
             config,
-            remote_mode: crate::remote_mode::Mode::Auto,
-            remote_rdp: false,
             config_mtime: Config::modified(),
             registered_hotkey: None,
-            tray_icon: small_icon,
+            registered_quit_hotkey: None,
+            tray_icon: class.small_icon,
             palette: Palette::new(true, true),
             renderer,
             dpi: system_dpi,
@@ -288,8 +665,16 @@ pub fn run() -> Result<()> {
             rows_that_fit: usize::MAX,
             visible: false,
             start_open: false,
+            popup_open: false,
             start_activating: false,
             start_focus: None,
+            start_page: start::HomePage::Pinned,
+            recent_apps: None,
+            recent_scan_failed: false,
+            recent_scroll: 0,
+            recent_press: None,
+            recent_vertical_delta: 0,
+            start_horizontal_delta: 0,
             footer_menu: None,
             start_hover: None,
             footer_hover: None,
@@ -322,9 +707,9 @@ pub fn run() -> Result<()> {
             apps: Vec::new(),
             icons: HashMap::new(),
             history: History::load(),
-            indexer: Indexer::spawn(hwnd, WM_APP_INDEX, events_tx, icon_size),
+            indexer: Indexer::spawn(&workers, WM_APP_INDEX, events_tx, icon_size),
             index_events: events_rx,
-            file_search: FileSearch::spawn(hwnd, WM_APP_FILES, files_tx, icon_size),
+            file_search: FileSearch::spawn(&workers, WM_APP_FILES, files_tx, icon_size),
             file_events: files_rx,
             last_scan: Instant::now(),
             commands,
@@ -347,9 +732,14 @@ pub fn run() -> Result<()> {
             outline: None,
             previous_foreground: HWND::default(),
         };
+        ACTIVE_WORKERS.with(|active| *active.borrow_mut() = Some(workers.clone()));
+        ACTIVE_WINDOW.set(Some(hwnd));
         LAUNCHER.with(|cell| *cell.borrow_mut() = Some(launcher));
         with_launcher(|l| {
             l.start();
+            if !LIFECYCLE.get().allows_launcher_work() {
+                return;
+            }
             if crate::util::perf::hook_on("WISP_CAPTURE") {
                 if !matches!(
                     crate::util::perf::hook("WISP_CAPTURE_SCENARIO").as_deref(),
@@ -395,12 +785,13 @@ pub fn run() -> Result<()> {
             if let Some(error) = config_error {
                 tray::notify(l.hwnd, "Wisp config", &error, true);
             }
-            if flag("--show") {
+            if show {
                 l.show();
             } else if first_run {
                 // Onboarding is optional. Without the settings app, Wisp starts as usual.
                 let _ = launch::settings(true);
             }
+            l.sync_update_timer(check_updates);
         });
 
         util::perf::event("ready");
@@ -420,46 +811,49 @@ pub fn run() -> Result<()> {
                     continue;
                 }
                 let _ = windows::Win32::Graphics::Dwm::DwmFlush();
-                if !frame_pending.swap(true, Ordering::AcqRel) {
+                if frame_alive.load(Ordering::Acquire) && !frame_pending.swap(true, Ordering::AcqRel) {
                     let _ = PostMessageW(Some(HWND(window as _)), WM_APP_FRAME, WPARAM(0), LPARAM(0));
                 }
             }
         });
-        let mut msg = MSG::default();
-        loop {
+        while LIFECYCLE.get().allows_launcher_work() {
             let animating =
                 with_launcher(|l| l.morph.is_some() || l.dock.as_ref().is_some_and(Dock::animating)).unwrap_or(false);
             active.store(animating, Ordering::Release);
             if animating {
                 pacing.thread().unpark();
             }
-            let received = GetMessageW(&mut msg, None, 0, 0).0;
-            if received <= 0 {
-                if received < 0 {
-                    crate::logging::error(
-                        "ui.message_loop",
-                        format_args!("code={:#010X}", windows::core::Error::from_thread().code().0),
-                    );
-                }
-                crate::logging::event(
-                    "ui.message_loop.end",
-                    format_args!("quit={} exit_code={}", received == 0, msg.wParam.0),
-                );
+            if !dispatch_next_message() {
                 break;
             }
-            dispatch_ui_message(&msg);
         }
+        workers.stop();
+        ACTIVE_WORKERS.with(|active| active.borrow_mut().take());
         alive.store(false, Ordering::Release);
         pacing.thread().unpark();
-        let _ = pacing.join();
         FRAME_PENDING.with(|slot| slot.borrow_mut().take());
-        LAUNCHER.with(|cell| cell.borrow_mut().take());
+        let mut launcher = LAUNCHER.with(|cell| cell.borrow_mut().take()).expect("active launcher");
+        let _ = KillTimer(Some(hwnd), UPDATE_TIMER);
+        if !launcher.shutdown() {
+            // The taskbar watchdog recovers on process exit if restore failed.
+            request_quit();
+        }
+        let settings = launcher.config.clone();
+        drop(launcher);
+        let _ = DestroyWindow(hwnd);
+        ACTIVE_WINDOW.set(None);
+        let _ = pacing.join();
+        DEFERRED.set(0);
+        update_lifecycle(|state| state.retiring = false);
         crate::logging::event("app.resources.released", format_args!("launcher=true"));
+        if !LIFECYCLE.get().quitting {
+            crate::logging::event("remote.lifecycle", format_args!("active=false"));
+        }
         if let Err(error) = dock::topbar_blur::shutdown_current_thread() {
             eprintln!("Could not complete island glass shutdown: {error}");
         }
+        Ok(settings)
     }
-    Ok(())
 }
 
 struct StartAppMenu {
@@ -483,12 +877,10 @@ struct StartAppEffect {
 struct Launcher {
     hwnd: HWND,
     config: Config,
-    saved_config: Config,
-    remote_mode: crate::remote_mode::Mode,
-    remote_rdp: bool,
     config_mtime: Option<SystemTime>,
     /// Registered shortcut; may differ from `config.hotkey` if registration fails.
     registered_hotkey: Option<String>,
+    registered_quit_hotkey: Option<String>,
     tray_icon: HICON,
     palette: Palette,
     renderer: Renderer,
@@ -500,8 +892,17 @@ struct Launcher {
     rows_that_fit: usize,
     visible: bool,
     start_open: bool,
+    // Native popup lifetime survives logical dismissal until the fade completes.
+    popup_open: bool,
     start_activating: bool,
     start_focus: Option<usize>,
+    start_page: start::HomePage,
+    recent_apps: Option<Vec<crate::indexer::recent::RecentApp>>,
+    recent_scan_failed: bool,
+    recent_scroll: usize,
+    recent_press: Option<(String, u64)>,
+    recent_vertical_delta: i32,
+    start_horizontal_delta: i32,
     footer_menu: Option<(start::FooterMenu, usize)>,
     start_hover: Option<usize>,
     footer_hover: Option<usize>,
@@ -615,13 +1016,10 @@ struct Scope {
 
 impl Launcher {
     fn start(&mut self) {
-        let notifications = crate::remote_session::Notifications::new(self.hwnd);
-        REMOTE_SESSION_ID.set(notifications.session);
-        REMOTE_NOTIFICATIONS.with(|slot| *slot.borrow_mut() = Some(notifications));
-        self.read_remote_mode();
-        self.remote_rdp = self.query_remote_session();
-        self.config = self.saved_config.for_remote(self.remote_active());
         self.sync_shell();
+        if !LIFECYCLE.get().allows_launcher_work() {
+            return;
+        }
         self.apply_theme();
         self.set_collapsed_style(true);
         if self.unified() {
@@ -630,7 +1028,7 @@ impl Launcher {
         // Windows needs the tray icon before it can show notifications.
         tray::add(self.hwnd, self.tray_icon, &self.tooltip());
         if !crate::util::perf::hook_on("WISP_CAPTURE") {
-            self.register_hotkey(true);
+            self.register_hotkeys();
         }
         self.sync_win_key();
         self.indexer.rescan();
@@ -652,6 +1050,50 @@ impl Launcher {
         match &self.registered_hotkey {
             Some(hotkey) => format!("{} ({hotkey})", crate::channel::NAME),
             None => format!("{} (no shortcut)", crate::channel::NAME),
+        }
+    }
+
+    fn register_hotkeys(&mut self) {
+        let launcher = hotkey::parse(&self.config.hotkey).ok();
+        let quit = hotkey::parse(&self.config.quit_hotkey);
+        let same_shortcut = launcher.is_some_and(|launcher| quit.as_ref().is_ok_and(|quit| *quit == launcher));
+        if self
+            .registered_quit_hotkey
+            .as_deref()
+            .is_some_and(|previous| previous != self.config.quit_hotkey || same_shortcut)
+        {
+            // Release an old Quit binding before the launcher can reclaim it.
+            unsafe {
+                let _ = UnregisterHotKey(Some(self.hwnd), QUIT_HOTKEY_ID);
+            }
+            self.registered_quit_hotkey = None;
+        }
+        self.register_hotkey(true);
+        if self.registered_quit_hotkey.is_some() {
+            return;
+        }
+
+        let result = quit.and_then(|quit| {
+            let active_launcher = self
+                .registered_hotkey
+                .as_deref()
+                .and_then(|spec| hotkey::parse(spec).ok());
+            if same_shortcut || active_launcher.is_some_and(|launcher| launcher == quit) {
+                return Err("The launcher already uses that shortcut.".into());
+            }
+            unsafe { RegisterHotKey(Some(self.hwnd), QUIT_HOTKEY_ID, quit.modifiers, quit.vk) }
+                .map_err(|_| format!("Windows could not register {} for Quit Wisp.", self.config.quit_hotkey))
+        });
+        match result {
+            Ok(()) => self.registered_quit_hotkey = Some(self.config.quit_hotkey.clone()),
+            Err(error) => tray::notify(
+                self.hwnd,
+                "Could not register shortcut",
+                &format!(
+                    "{error} Change the Quit Wisp shortcut in Settings Р Р†РІР‚В РІР‚в„ў General Р Р†РІР‚В РІР‚в„ў Shortcuts."
+                ),
+                true,
+            ),
         }
     }
 
@@ -699,64 +1141,8 @@ impl Launcher {
         tray::set_tip(hwnd, &self.tooltip());
     }
 
-    fn remote_active(&self) -> bool {
-        self.remote_mode.active(self.remote_rdp)
-    }
-
-    fn read_remote_mode(&mut self) {
-        match crate::remote_mode::load(&util::data_dir().join("remote-mode.txt")) {
-            Ok(mode) => self.remote_mode = mode,
-            Err(error) => crate::logging::error("remote.load", format_args!("error={error}")),
-        }
-    }
-
-    fn query_remote_session(&self) -> bool {
-        let result = crate::remote_session::protocol();
-        if let Err(error) = &result {
-            crate::logging::error("remote.query", format_args!("error={error}"));
-        }
-        crate::remote_session::observed(self.remote_rdp, result)
-    }
-
-    fn refresh_remote_session(&mut self) {
-        let previous = self.remote_active();
-        self.remote_rdp = self.query_remote_session();
-        self.apply_remote_change(previous);
-    }
-
-    fn apply_remote_change(&mut self, previous: bool) {
-        if previous != self.remote_active() {
-            self.config = self.saved_config.for_remote(self.remote_active());
-            crate::logging::event(
-                "remote.layout.changed",
-                format_args!(
-                    "mode={} detected_rdp={} active={} dock_autohide={} dock_smart_hide={} topbar={}",
-                    self.remote_mode.name(),
-                    self.remote_rdp,
-                    self.remote_active(),
-                    self.config.dock_autohide,
-                    self.config.dock_smart_hide,
-                    self.config.topbar
-                ),
-            );
-            self.taskbar_failures = 0;
-            self.sync_shell();
-            self.apply_theme();
-            if self.visible {
-                self.apply_size();
-                self.paint();
-            }
-        }
-    }
-
     fn reload_config_if_changed(&mut self) {
         let _span = util::perf::Span::new("config");
-        let previous = self.remote_active();
-        self.read_remote_mode();
-        if self.remote_mode == crate::remote_mode::Mode::Auto {
-            self.remote_rdp = self.query_remote_session();
-        }
-        self.apply_remote_change(previous);
         let mtime = Config::modified();
         if mtime == self.config_mtime {
             return;
@@ -769,8 +1155,15 @@ impl Launcher {
             tray::notify(self.hwnd, "Wisp config", &error, true);
             return;
         }
-        self.saved_config = config;
-        self.config = self.saved_config.for_remote(self.remote_active());
+        let updates_changed = self.config.automatic_updates != config.automatic_updates;
+        self.config = config;
+        update_lifecycle(|state| state.pause_on_rdp = self.config.pause_on_rdp);
+        if !LIFECYCLE.get().allows_launcher_work() {
+            return;
+        }
+        if updates_changed {
+            self.sync_update_timer(true);
+        }
         crate::logging::event(
             "config.applied",
             format_args!(
@@ -781,8 +1174,39 @@ impl Launcher {
         self.taskbar_failures = 0;
         self.sync_shell();
         self.apply_theme();
-        self.register_hotkey(true);
+        if crate::util::perf::hook_on("WISP_CAPTURE") {
+            self.register_hotkey(true);
+        } else {
+            self.register_hotkeys();
+        }
         self.sync_win_key();
+    }
+
+    fn sync_update_timer(&self, check_now: bool) {
+        if self.config.automatic_updates && crate::channel::updates_available() {
+            if unsafe { SetTimer(Some(self.hwnd), UPDATE_TIMER, UPDATE_TIMER_MS, None) } == 0 {
+                crate::logging::error(
+                    "update.timer",
+                    format_args!("stage=start {}", windows::core::Error::from_thread()),
+                );
+            }
+            if check_now {
+                self.check_updates();
+            }
+        } else {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), UPDATE_TIMER);
+            }
+        }
+    }
+
+    fn check_updates(&self) {
+        if self.config.automatic_updates
+            && crate::channel::updates_available()
+            && let Err(error) = launch::check_updates()
+        {
+            crate::logging::error("update.background", format_args!("stage=launch {error}"));
+        }
     }
 
     /// Hides or restores the Windows taskbar and creates or removes the dock
@@ -820,7 +1244,6 @@ impl Launcher {
             if let Err(error) = dock.sync_monitors() {
                 eprintln!("Could not synchronize monitor docks: {error}");
             }
-            dock.set_remote(self.remote_mode.active(self.remote_rdp));
             dock.apply_theme(
                 dark,
                 self.config.backdrop,
@@ -1022,7 +1445,7 @@ impl Launcher {
             self.hwnd,
             dark,
             self.config.backdrop,
-            self.start_open || self.unified(),
+            self.start_open || self.unified() || !crate::util::perf::hook_on("WISP_CAPTURE"),
             &self.config.backdrop_color,
             self.config.material_options(),
         );
@@ -1051,30 +1474,36 @@ impl Launcher {
     }
 
     fn toggle(&mut self) {
-        if self.start_motion.closing() {
-            self.hide_now();
-            self.show();
-            return;
-        }
-        if self.visible { self.hide() } else { self.show() }
+        self.toggle_popup(false);
     }
 
     fn toggle_start(&mut self) {
-        if self.start_motion.closing() {
-            self.reopen_start();
-            return;
-        }
-        if self.visible {
-            let was_start = self.start_open;
-            self.hide();
-            if was_start {
+        self.toggle_popup(true);
+    }
+
+    fn toggle_popup(&mut self, start: bool) {
+        match popup_toggle(self.start_open, start, self.visible, self.start_motion.closing()) {
+            PopupToggle::Reverse => {
+                self.reopen_popup();
                 return;
             }
+            PopupToggle::Hide => {
+                self.hide();
+                return;
+            }
+            PopupToggle::Replace => self.hide_now(),
+            PopupToggle::Show => {}
         }
-        self.start_open = true;
-        self.start_session = self.start_session.wrapping_add(1);
-        self.start_focus = None;
-        self.start_previous_editor = Some(std::mem::take(&mut self.editor));
+        if start {
+            self.start_open = true;
+            self.start_session = self.start_session.wrapping_add(1);
+            self.start_focus = None;
+            self.start_page = start::HomePage::Pinned;
+            self.recent_scroll = 0;
+            self.recent_vertical_delta = 0;
+            self.start_horizontal_delta = 0;
+            self.start_previous_editor = Some(std::mem::take(&mut self.editor));
+        }
         self.show();
     }
 
@@ -1082,14 +1511,21 @@ impl Launcher {
         self.start_open && self.editor.text().trim().is_empty() && self.scope.is_none() && self.surface.is_none()
     }
 
+    fn start_recent_home(&self) -> bool {
+        self.start_page == start::HomePage::Recent && self.start_home()
+    }
+
     fn show(&mut self) {
         if self.start_motion.closing() {
-            self.reopen_start();
+            self.reopen_popup();
             return;
         }
         let _span = util::perf::Span::new("show");
         util::perf::input("show_to_content");
         self.reload_config_if_changed();
+        if !LIFECYCLE.get().allows_launcher_work() {
+            return;
+        }
         if !crate::util::perf::hook_on("WISP_CAPTURE") {
             self.register_hotkey(false);
         }
@@ -1134,10 +1570,17 @@ impl Launcher {
             self.previous_foreground = unsafe { GetForegroundWindow() };
         }
         self.editor.select_all();
-        if self.start_open {
+        self.popup_open = popup_motion_enabled(
+            self.start_open,
+            self.unified(),
+            crate::util::perf::hook_on("WISP_CAPTURE"),
+        );
+        if self.popup_open {
             self.start_motion = start::Motion::default();
             self.begin_start_motion(true);
             self.apply_launcher_theme(self.dark_theme());
+        }
+        if self.start_open {
             if let Some(dock) = &mut self.dock {
                 dock.set_start_open(true);
             }
@@ -1159,9 +1602,10 @@ impl Launcher {
             dock.hide();
         }
         self.set_collapsed_style(false);
-        if self.start_open {
-            self.start_activating = unsafe { SetTimer(Some(self.hwnd), START_ACTIVATE_TIMER, 70, None) } != 0;
-            // Supply the first Start frame before ShowWindow can display a
+        if self.popup_open {
+            self.start_activating =
+                self.start_open && unsafe { SetTimer(Some(self.hwnd), START_ACTIVATE_TIMER, 70, None) } != 0;
+            // Supply the first popup frame before ShowWindow can display a
             // previous launcher backbuffer while its paint callback reenters.
             self.apply_start_position(0.);
             self.paint();
@@ -1201,18 +1645,20 @@ impl Launcher {
     }
 
     fn begin_start_motion(&mut self, opening: bool) {
-        let animate = self.config.dock_open_ms != 0
-            && (opening || self.config.dock_close_ms != 0)
-            && dock::client_animations_enabled();
-        self.start_motion
-            .retarget_profile(opening, animate, self.remote_active());
+        let animate = popup_animations(
+            opening,
+            self.config.dock_open_ms,
+            self.config.dock_close_ms,
+            dock::client_animations_enabled(),
+        );
+        self.start_motion.retarget(opening, animate);
         self.start_motion_tick = self.start_motion.active().then(Instant::now);
         unsafe {
             if self.start_motion.active() {
                 if SetTimer(
                     Some(self.hwnd),
                     dock::POPUP_FADE_TIMER,
-                    crate::animation::interval(self.remote_active()),
+                    crate::animation::LOCAL_INTERVAL,
                     None,
                 ) == 0
                 {
@@ -1225,12 +1671,15 @@ impl Launcher {
         }
     }
 
-    fn reopen_start(&mut self) {
+    fn reopen_popup(&mut self) {
         self.visible = true;
         self.start_activating = false;
         self.begin_start_motion(true);
         self.apply_start_position(0.);
         self.restart_caret();
+        resume_surface_refresh(self.surface.is_some(), |timer, interval| unsafe {
+            SetTimer(Some(self.hwnd), timer, interval, None);
+        });
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
             let _ = SetForegroundWindow(self.hwnd);
@@ -1239,13 +1688,13 @@ impl Launcher {
     }
 
     fn apply_start_position(&mut self, elapsed: f32) -> crate::animation::Phase {
-        if !self.start_open {
+        if !self.popup_open {
             return self.start_motion.phase();
         }
         let mut presentation_failed = false;
         let phase = self.start_motion.advance_present(elapsed, |opacity| {
             if let Err(error) = self.start_alpha.present(self.hwnd, opacity) {
-                eprintln!("Start opacity: {error}");
+                eprintln!("Launcher popup opacity: {error}");
                 presentation_failed = true;
                 return false;
             }
@@ -1327,7 +1776,7 @@ impl Launcher {
         if self.start_motion.closing() {
             return;
         }
-        if self.start_open && self.visible {
+        if self.popup_open && self.visible {
             self.visible = false;
             self.start_activating = false;
             self.footer_menu = None;
@@ -1349,11 +1798,12 @@ impl Launcher {
 
     fn hide_now(&mut self) {
         self.drag_press = None;
-        if !self.visible && !self.start_open {
+        if !self.visible && !self.start_open && !self.popup_open {
             return;
         }
         self.start_motion_tick = None;
         self.start_motion.retarget(false, false);
+        self.popup_open = false;
         unsafe {
             let _ = KillTimer(Some(self.hwnd), dock::POPUP_FADE_TIMER);
         }
@@ -1405,10 +1855,9 @@ impl Launcher {
         self.set_collapsed_style(true);
         if let Some(dock) = &mut self.dock
             && !self.taskbar.as_ref().is_some_and(TaskbarHider::is_peeking)
+            && !was_start
         {
-            if !was_start {
-                dock.show();
-            }
+            dock.show();
         }
     }
 
@@ -1527,7 +1976,11 @@ impl Launcher {
     }
 
     fn visible_rows(&self) -> usize {
-        self.results.len().min(self.list_rows())
+        if self.start_recent_home() {
+            0
+        } else {
+            self.results.len().min(self.list_rows())
+        }
     }
 
     /// Surfaces reserve their widget budget; search uses only populated rows.
@@ -1559,6 +2012,7 @@ impl Launcher {
                 height,
             );
             self.start_height = (placed.bottom - placed.top) as f32 * 96. / self.dpi as f32;
+            self.clamp_recent_scroll();
             // Compact Home must not reduce the following search/surface budget.
             let list_height = if home {
                 let full = start::placement(
@@ -1588,7 +2042,7 @@ impl Launcher {
             self.begin_morph(self.outline.unwrap(), target, true, 1.0);
         } else {
             let mut presented = target;
-            if self.start_open {
+            if self.popup_open {
                 let offset = self.px(self.start_motion.offset_dip());
                 presented.top += offset;
                 presented.bottom += offset;
@@ -1644,9 +2098,11 @@ impl Launcher {
                 SWP_NOACTIVATE,
             );
         }
-        if self.start_open || self.unified() {
+        if self.start_open || self.unified() || !crate::util::perf::hook_on("WISP_CAPTURE") {
             let radius = if self.start_open {
                 start::RADIUS
+            } else if !self.unified() {
+                crate::morph::radius(1.)
             } else {
                 crate::morph::radius(self.morph_opacity())
             };
@@ -1774,6 +2230,9 @@ impl Launcher {
         let _span = util::perf::Span::new("search");
         let rows_before = self.window_rows();
         if self.start_home() {
+            if self.start_recent_home() {
+                self.cancel_drag_press();
+            }
             self.base_results.clear();
             self.file_results.clear();
             self.file_query = None;
@@ -2236,7 +2695,26 @@ impl Launcher {
                 IndexEvent::Apps(apps) => {
                     self.app_generation = self.app_generation.wrapping_add(1);
                     self.apps = apps;
+                    self.recent_apps = None;
+                    self.recent_scan_failed = false;
+                    if self.start_focus.is_some_and(|index| index >= start::RECENT_BASE) {
+                        self.start_focus = Some(start::HomePage::Recent.focus());
+                    }
+                    if self.start_hover.is_some_and(|index| index >= start::RECENT_BASE) {
+                        self.start_hover = None;
+                    }
                     apps_changed = true;
+                }
+                IndexEvent::ScanFailed => {
+                    self.recent_scan_failed = true;
+                    if self.recent_apps.is_none() {
+                        self.invalidate();
+                    }
+                }
+                IndexEvent::Recent(apps) => {
+                    self.recent_apps = Some(apps);
+                    self.clamp_recent_scroll();
+                    self.invalidate();
                 }
                 IndexEvent::Icons(icons) => {
                     self.icons.extend(icons);
@@ -2459,15 +2937,91 @@ impl Launcher {
         }
         let scale = 96. / self.dpi as f32;
         let (x, y) = (x as f32 * scale, y as f32 * scale);
-        let pins = if self.start_home() {
-            self.pins.apps(&self.apps).len()
-        } else {
-            0
-        };
-        start::hit(x, y, self.start_width, self.window_h(), pins)
+        let height = self.window_h();
+        if self.start_home() {
+            if let Some(page) = start::HomePage::ALL
+                .into_iter()
+                .find(|page| start::contains(page.tab(self.start_width, height), x, y))
+            {
+                return Some(page.focus());
+            }
+            match self.start_page {
+                start::HomePage::Pinned => {
+                    return start::hit(x, y, self.start_width, height, self.pins.apps(&self.apps).len());
+                }
+                start::HomePage::Recent => {
+                    let visible = self
+                        .recent_count()
+                        .saturating_sub(self.recent_scroll)
+                        .min(start::recent_capacity(height));
+                    if let Some(row) =
+                        (0..visible).find(|&row| start::contains(start::recent_row(row, self.start_width), x, y))
+                    {
+                        return Some(start::RECENT_BASE + self.recent_scroll + row);
+                    }
+                }
+            }
+        }
+        start::hit(x, y, self.start_width, height, 0)
+    }
+
+    fn home_app(&self, index: usize) -> Option<&AppEntry> {
+        match self.start_page {
+            start::HomePage::Pinned => self.pins.apps(&self.apps).get(index).copied(),
+            start::HomePage::Recent => {
+                let item = self.recent_apps.as_ref()?.get(index.checked_sub(start::RECENT_BASE)?)?;
+                self.apps.get(item.app_index)
+            }
+        }
+    }
+
+    fn recent_count(&self) -> usize {
+        self.recent_apps.as_ref().map_or(0, Vec::len)
+    }
+
+    fn clamp_recent_scroll(&mut self) {
+        let capacity = start::recent_capacity(self.window_h());
+        if let Some(apps) = &self.recent_apps {
+            self.recent_scroll = self.recent_scroll.min(apps.len().saturating_sub(capacity));
+        }
+        if self.start_focus.is_some_and(|index| {
+            index >= start::RECENT_BASE
+                && (index < start::RECENT_BASE + self.recent_scroll
+                    || index >= start::RECENT_BASE + self.recent_scroll + capacity)
+        }) {
+            self.start_focus = Some(start::HomePage::Recent.focus());
+        }
+    }
+
+    fn set_start_page(&mut self, page: start::HomePage) {
+        if self.start_page != page {
+            self.cancel_drag_press();
+        }
+        self.start_page = page;
+        self.start_horizontal_delta = 0;
+        self.recent_press = None;
+        self.start_focus = Some(page.focus());
+        self.start_hover = None;
+        self.invalidate();
+    }
+
+    fn cancel_drag_press(&mut self) {
+        if self.drag_press.take().is_some() {
+            self.drag_consumed = true;
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+        }
     }
 
     fn start_action(&mut self, index: usize) {
+        if let Some(page) = start::HomePage::ALL.into_iter().find(|page| page.focus() == index) {
+            self.set_start_page(page);
+            return;
+        }
+        if index >= start::INLINE_BASE {
+            return;
+        }
         if index < start::CAPACITY {
             if let Some(app) = self.pins.apps(&self.apps).get(index).map(|app| (*app).clone()) {
                 self.perform(
@@ -2520,20 +3074,6 @@ impl Launcher {
         match menu.actions()[index] {
             start::FooterAction::Power(power) => self.start_power(power),
             start::FooterAction::Quit => self.run_command(Command::Quit),
-            start::FooterAction::Remote(mode) => {
-                match crate::remote_mode::save(&util::data_dir().join("remote-mode.txt"), mode) {
-                    Ok(()) => {
-                        let previous = self.remote_active();
-                        self.remote_mode = mode;
-                        if mode == crate::remote_mode::Mode::Auto {
-                            self.remote_rdp = self.query_remote_session();
-                        }
-                        self.apply_remote_change(previous);
-                    }
-                    Err(error) => tray::notify(self.hwnd, "Remote mode", &error.to_string(), true),
-                }
-                self.paint();
-            }
         }
     }
 
@@ -2574,7 +3114,19 @@ impl Launcher {
             }
             return false;
         }
-        let pins = self.pins.apps(&self.apps).len();
+        let recent = self.start_page == start::HomePage::Recent;
+        let pins = if recent { 0 } else { self.pins.apps(&self.apps).len() };
+        let recent_rows = if recent && start::recent_capacity(self.window_h()) > 0 {
+            self.recent_count()
+        } else {
+            0
+        };
+        let first_app = (pins > 0)
+            .then_some(0)
+            .or((recent_rows > 0).then_some(start::RECENT_BASE));
+        let last_app = pins
+            .checked_sub(1)
+            .or_else(|| recent_rows.checked_sub(1).map(|row| start::RECENT_BASE + row));
         if vk == VK_RETURN {
             if let Some(index) = self.start_focus {
                 self.start_action(index);
@@ -2582,9 +3134,22 @@ impl Launcher {
             return true;
         }
         let current = self.start_focus;
+        let focused_tab = current.is_some_and(|index| (start::TAB_BASE..start::RECENT_BASE).contains(&index));
+        if focused_tab && matches!(vk, VK_LEFT | VK_RIGHT) {
+            self.set_start_page(if vk == VK_LEFT {
+                start::HomePage::Pinned
+            } else {
+                start::HomePage::Recent
+            });
+            return true;
+        }
         self.start_focus = match vk {
-            VK_TAB => {
-                let sequence: Vec<_> = (0..pins).chain(start::CAPACITY..start::CAPACITY + 3).collect();
+            VK_TAB | VK_F6 => {
+                let sequence: Vec<_> = (start::TAB_BASE..start::RECENT_BASE)
+                    .chain(0..pins)
+                    .chain(start::RECENT_BASE..start::RECENT_BASE + recent_rows)
+                    .chain(start::CAPACITY..start::CAPACITY + 3)
+                    .collect();
                 match current.and_then(|i| sequence.iter().position(|&item| item == i)) {
                     Some(i) if shift => i.checked_sub(1).map(|i| sequence[i]),
                     Some(i) => sequence.get(i + 1).copied(),
@@ -2592,7 +3157,20 @@ impl Launcher {
                     None => sequence.first().copied(),
                 }
             }
-            VK_DOWN if current.is_none() => (pins > 0).then_some(0).or(Some(start::CAPACITY)),
+            VK_DOWN if current.is_none() || focused_tab => first_app.or(Some(start::CAPACITY)),
+            VK_UP if focused_tab => None,
+            VK_UP | VK_DOWN if current.is_some_and(|index| index >= start::RECENT_BASE) => {
+                let index = current.unwrap();
+                if vk == VK_UP && index == start::RECENT_BASE {
+                    Some(self.start_page.focus())
+                } else if vk == VK_DOWN && Some(index) == last_app {
+                    Some(start::CAPACITY)
+                } else if vk == VK_UP {
+                    Some(index - 1)
+                } else {
+                    Some(index + 1)
+                }
+            }
             VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN if current.is_some_and(|i| i < pins) => {
                 let step = match vk {
                     VK_LEFT => -1,
@@ -2603,13 +3181,17 @@ impl Launcher {
                 let next = current.unwrap() as isize + step;
                 if next >= 0 && (next as usize) < pins {
                     Some(next as usize)
+                } else if vk == VK_UP {
+                    Some(self.start_page.focus())
                 } else if vk == VK_DOWN {
                     Some(start::CAPACITY)
                 } else {
                     current
                 }
             }
-            VK_LEFT | VK_RIGHT if current.is_some() => {
+            VK_LEFT | VK_RIGHT
+                if current.is_some_and(|index| (start::CAPACITY..start::INLINE_BASE).contains(&index)) =>
+            {
                 let index = current.unwrap();
                 Some(if vk == VK_LEFT {
                     index.saturating_sub(1).max(start::CAPACITY)
@@ -2617,9 +3199,16 @@ impl Launcher {
                     (index + 1).min(start::CAPACITY + 2)
                 })
             }
-            VK_UP if current.is_some() => pins.checked_sub(1),
+            VK_UP if current.is_some_and(|index| (start::CAPACITY..start::INLINE_BASE).contains(&index)) => {
+                last_app.or(Some(self.start_page.focus()))
+            }
             _ => return false,
         };
+        if let Some(row) = self.start_focus.and_then(|index| index.checked_sub(start::RECENT_BASE)) {
+            let capacity = start::recent_capacity(self.window_h());
+            self.recent_scroll = self.recent_scroll.clamp((row + 1).saturating_sub(capacity), row);
+        }
+        self.start_hover = None;
         self.invalidate();
         true
     }
@@ -2676,10 +3265,9 @@ impl Launcher {
         }
         if self.start_home() {
             self.start_hit(x, y).and_then(|index| {
-                self.pins
-                    .apps(&self.apps)
-                    .get(index)
-                    .map(|app| ((*app).clone(), start::AppMenuAction::Open))
+                self.home_app(index)
+                    .cloned()
+                    .map(|app| (app, start::AppMenuAction::Open))
             })
         } else {
             let result = self.results.get(self.row_at(y)?)?;
@@ -2704,7 +3292,7 @@ impl Launcher {
         let pins = self.pins.apps(&self.apps);
         let id = if self.start_home() {
             self.start_hit(x, y)
-                .and_then(|index| pins.get(index))
+                .and_then(|index| self.home_app(index))
                 .map(|app| app.id.clone())
         } else {
             self.row_at(y)
@@ -2773,7 +3361,10 @@ impl Launcher {
                 return;
             }
             self.invalidate();
-            if let Some(index) = self.start_hit(x, y).filter(|&index| index >= start::CAPACITY) {
+            if let Some(index) = self
+                .start_hit(x, y)
+                .filter(|index| (start::CAPACITY..start::INLINE_BASE).contains(index))
+            {
                 let same_button = match menu {
                     start::FooterMenu::Profile => start::CAPACITY,
                     start::FooterMenu::Power => start::CAPACITY + 2,
@@ -2818,7 +3409,21 @@ impl Launcher {
         let opacity = self.morph_opacity();
         let content_size = self.morph.as_ref().map(|_| (layout::WIDTH, self.window_h()));
         let text = self.editor.text();
-        let pins = self.start_home().then(|| self.pins.apps(&self.apps));
+        let start_page = self.start_home().then_some(self.start_page);
+        let pins = (start_page == Some(start::HomePage::Pinned)).then(|| self.pins.apps(&self.apps));
+        let recent_capacity = start::recent_capacity(self.window_h());
+        let recent = self
+            .recent_apps
+            .as_ref()
+            .filter(|_| start_page == Some(start::HomePage::Recent))
+            .map(|recent| {
+                recent
+                    .iter()
+                    .skip(self.recent_scroll)
+                    .take(recent_capacity)
+                    .filter_map(|row| Some((self.apps.get(row.app_index)?, row.date_label.as_str())))
+                    .collect::<Vec<_>>()
+            });
         let start_actions: Vec<_> = self
             .inline_actions()
             .into_iter()
@@ -2832,11 +3437,15 @@ impl Launcher {
             .collect();
         let frame = Frame {
             start: self.start_open,
+            start_page,
+            recent: recent.as_deref(),
+            recent_scan_failed: self.recent_scan_failed,
+            recent_scroll: self.recent_scroll,
+            recent_total: self.recent_count(),
             start_actions: &start_actions,
             pins: pins.as_deref(),
             start_focus: self.start_focus,
             footer_menu: self.footer_menu,
-            remote_mode: self.remote_mode,
             start_hover: self.start_hover,
             footer_hover: self.footer_hover,
             palette: &self.palette,
@@ -2870,8 +3479,8 @@ impl Launcher {
                 rows: self.list_rows(),
             }),
             bottom: self.bottom(),
-            // Start fades the complete native surface, including its backdrop.
-            opacity: if self.start_open {
+            // Independent popups fade the complete native surface, including its backdrop.
+            opacity: if self.popup_open {
                 1.
             } else {
                 crate::morph::fades(opacity).1
@@ -2879,8 +3488,11 @@ impl Launcher {
             dock_opacity: crate::morph::dock_opacity(opacity, self.unified(), self.start_open),
             content_size,
             shared: self.unified(),
+            popup: self.popup_open,
             radius: if self.start_open {
                 start::RADIUS
+            } else if self.popup_open {
+                crate::morph::radius(1.)
             } else {
                 crate::morph::radius(opacity)
             },
@@ -2937,11 +3549,7 @@ impl Launcher {
                     tray::notify(self.hwnd, "Could not change Start with Windows", &e.message(), true);
                 }
             }
-            // Defer destruction until this handler releases the launcher borrow.
-            // WM_DESTROY needs to borrow the launcher for shutdown.
-            tray::CMD_QUIT => unsafe {
-                let _ = PostMessageW(Some(self.hwnd), WM_APP_QUIT, WPARAM(0), LPARAM(0));
-            },
+            tray::CMD_QUIT => request_quit(),
             _ => {}
         }
     }
@@ -3244,8 +3852,7 @@ impl Launcher {
         }
     }
 
-    fn shutdown(&mut self) {
-        unregister_remote_notifications();
+    fn shutdown(&mut self) -> bool {
         self.start_motion.settle();
         self.start_motion_tick = None;
         self.start_activating = false;
@@ -3256,9 +3863,9 @@ impl Launcher {
         self.win_key = None;
         self.notch = None;
         self.dock = None;
-        if let Err(e) = TaskbarHider::configure(&mut self.taskbar, self.hwnd, false) {
-            eprintln!("could not restore the taskbar: {e}");
-        }
+        let taskbar_restored = TaskbarHider::configure(&mut self.taskbar, self.hwnd, false)
+            .inspect_err(|error| eprintln!("could not restore the taskbar: {error}"))
+            .is_ok();
         // Removed last, so Windows works the work area out again from the
         // restored taskbar and the remaining app bars. Waits, so the space
         // is back before Wisp exits.
@@ -3267,8 +3874,10 @@ impl Launcher {
         }
         unsafe {
             let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            let _ = UnregisterHotKey(Some(self.hwnd), QUIT_HOTKEY_ID);
         }
         tray::remove(self.hwnd);
+        taskbar_restored
     }
 }
 
@@ -3281,6 +3890,48 @@ fn mouse_pos(lparam: LPARAM) -> (i32, i32) {
         (lparam.0 & 0xFFFF) as i16 as i32,
         ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
     )
+}
+
+/// Capture and shared-dock surfaces retain their existing morph owner.
+fn popup_motion_enabled(start: bool, shared: bool, capture: bool) -> bool {
+    start || !shared && !capture
+}
+
+fn popup_animations(opening: bool, open_ms: u32, close_ms: u32, client_animations: bool) -> bool {
+    open_ms != 0 && (opening || close_ms != 0) && client_animations
+}
+
+/// Closing pauses live panels. Reversal keeps their snapshot and resumes polling.
+fn resume_surface_refresh(retained: bool, arm: impl FnOnce(usize, u32)) {
+    if retained {
+        arm(SURFACE_TIMER, SURFACE_REFRESH_MS);
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PopupToggle {
+    Reverse,
+    Replace,
+    Hide,
+    Show,
+}
+
+fn popup_toggle(current_start: bool, requested_start: bool, visible: bool, closing: bool) -> PopupToggle {
+    if closing {
+        if current_start == requested_start {
+            PopupToggle::Reverse
+        } else {
+            PopupToggle::Replace
+        }
+    } else if visible {
+        if requested_start && !current_start {
+            PopupToggle::Replace
+        } else {
+            PopupToggle::Hide
+        }
+    } else {
+        PopupToggle::Show
+    }
 }
 
 fn cursor_pos() -> Option<(i32, i32)> {
@@ -3372,7 +4023,6 @@ fn run_start_app_menu(x: i32, y: i32) {
                     && l.config.backdrop == appearance.backdrop
                     && l.config.backdrop_color == appearance.color
                     && l.config.material_options() == appearance.material_options
-                    && l.remote_active() == appearance.remote
                     && start_app_menu_dark(&l.palette) == appearance.dark
                     && l.apps.iter().find(|a| a.id == snapshot.app.id).is_some_and(|a| {
                         start::app_snapshot_matches(
@@ -3401,26 +4051,15 @@ fn run_start_app_menu(x: i32, y: i32) {
 
 fn start_app_menu_appearance(launcher: &mut Launcher) -> start::app_menu::Appearance {
     let animations = dock::client_animations_enabled();
-    start_app_menu_policy(
-        &launcher.palette,
-        &launcher.config,
-        launcher.remote_active(),
-        animations,
-    )
+    start_app_menu_policy(&launcher.palette, &launcher.config, animations)
 }
 
-fn start_app_menu_policy(
-    palette: &Palette,
-    config: &Config,
-    remote: bool,
-    animations: bool,
-) -> start::app_menu::Appearance {
+fn start_app_menu_policy(palette: &Palette, config: &Config, animations: bool) -> start::app_menu::Appearance {
     start::app_menu::Appearance {
         dark: start_app_menu_dark(palette),
         backdrop: config.backdrop,
         color: config.backdrop_color.clone(),
         material_options: config.material_options(),
-        remote,
         opening: animations && config.dock_open_ms != 0,
         closing: animations && config.dock_open_ms != 0 && config.dock_close_ms != 0,
     }
@@ -3543,6 +4182,10 @@ fn run_start_app_effect(effect: StartAppEffect) {
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if msg == WM_HOTKEY && wparam.0 == QUIT_HOTKEY_ID as usize {
+        request_quit();
+        return LRESULT(0);
+    }
     if DRAGGING.with(Cell::get)
         && matches!(
             msg,
@@ -3564,7 +4207,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     {
         return LRESULT(0);
     }
-    let start_closing = with_launcher(|l| l.start_open && l.start_motion.closing()).unwrap_or(false);
+    let start_closing = with_launcher(|l| l.popup_open && l.start_motion.closing()).unwrap_or(false);
     if start_closing {
         if msg == WM_MOUSEACTIVATE {
             return LRESULT(MA_NOACTIVATE as isize);
@@ -3624,7 +4267,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         // borrowed, so the dock's own handler above never sees the message.
         WM_NCACTIVATE => return unsafe { DefWindowProcW(hwnd, msg, wparam, LPARAM(-1)) },
         WM_NCHITTEST => return LRESULT(HTCLIENT as isize),
-        WM_HOTKEY => {
+        WM_HOTKEY if wparam.0 == HOTKEY_ID as usize => {
             util::perf::input("hotkey_to_content");
             with_launcher(Launcher::toggle);
         }
@@ -3727,30 +4370,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         l.paint();
                     }
                     56 => l.hide(),
-                    81 => unsafe {
-                        unregister_remote_notifications();
-                        let _ = DestroyWindow(hwnd);
-                    },
+                    81 => request_quit(),
                     _ => {}
                 }
             });
         }
-        WM_TIMER if wparam.0 == 99 && crate::util::perf::hook_on("WISP_CAPTURE") => unsafe {
-            unregister_remote_notifications();
-            let _ = DestroyWindow(hwnd);
-        },
-        WM_APP_QUIT => unsafe {
-            unregister_remote_notifications();
-            let _ = DestroyWindow(hwnd);
-        },
-        crate::remote_session::WM_WTSSESSION_CHANGE => {
-            if crate::remote_session::relevant(REMOTE_SESSION_ID.get(), lparam.0 as u32, wparam.0) {
-                with_launcher_or_defer(DEFER_REMOTE, Launcher::refresh_remote_session);
-            }
-        }
-        WM_APP_RELOAD => {
-            with_launcher_or_defer(DEFER_RELOAD, Launcher::reload_config_if_changed);
-        }
+        WM_TIMER if wparam.0 == 99 && crate::util::perf::hook_on("WISP_CAPTURE") => request_quit(),
+        WM_APP_QUIT => request_quit(),
         WM_APP_FRAME => {
             with_launcher(|l| {
                 l.step_morph();
@@ -3776,7 +4402,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 return LRESULT(0);
             }
             let inline = with_launcher(|l| {
-                (key == VK_RETURN && l.start_open)
+                (key == VK_RETURN && l.start_open && !l.start_home())
                     .then_some(l.start_focus)
                     .flatten()
                     .and_then(|i| i.checked_sub(start::INLINE_BASE))
@@ -3795,8 +4421,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     return None;
                 }
                 let (x, y) = if l.start_home() {
-                    let index = l.start_focus.filter(|&index| index < l.pins.apps(&l.apps).len())?;
-                    let bounds = start::tile(index, l.start_width, l.start_height);
+                    let index = l.start_focus?;
+                    l.home_app(index)?;
+                    let bounds = match l.start_page {
+                        start::HomePage::Pinned => start::tile(index, l.start_width, l.start_height),
+                        start::HomePage::Recent => {
+                            start::recent_row(index.checked_sub(start::RECENT_BASE + l.recent_scroll)?, l.start_width)
+                        }
+                    };
                     ((bounds.0 + bounds.2) / 2., (bounds.1 + bounds.3) / 2.)
                 } else {
                     l.inline_app()?;
@@ -3828,8 +4460,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     _ => return None,
                 };
                 let app = if l.start_home() {
-                    let index = l.start_focus.filter(|&index| index < start::CAPACITY)?;
-                    l.pins.apps(&l.apps).get(index).map(|app| (*app).clone())?
+                    l.home_app(l.start_focus?)?.clone()
                 } else {
                     if l.start_focus.is_some() {
                         return None;
@@ -3861,6 +4492,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_launcher(|l| {
                 let point = l.content_point(point.0, point.1);
                 l.drag_consumed = false;
+                l.recent_press = if l.start_home() && l.start_page == start::HomePage::Recent {
+                    l.start_hit(point.0, point.1)
+                        .and_then(|index| l.home_app(index))
+                        .map(|app| (app.id.clone(), l.app_generation))
+                } else {
+                    None
+                };
                 l.start_inline_press = l
                     .inline_hit(point.0, point.1)
                     .and_then(|i| Some((l.inline_app()?.clone(), *l.inline_actions().get(i)?, l.app_generation)));
@@ -3892,6 +4530,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_launcher(|l| {
                 l.drag_press = None;
                 l.start_inline_press = None;
+                l.recent_press = None;
             });
         }
         WM_MOUSEMOVE => {
@@ -3958,10 +4597,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 if !consumed && inside {
                     let (x, y) = l.content_point(x, y);
                     if let Some((app, action)) = l.start_app_at(x, y) {
+                        if l.start_home()
+                            && l.start_page == start::HomePage::Recent
+                            && l.recent_press.take() != Some((app.id.clone(), l.app_generation))
+                        {
+                            return None;
+                        }
                         return l.prepare_app_effect(app, action);
                     }
                     l.on_click(x, y);
                 }
+                l.recent_press = None;
                 None
             })
             .flatten();
@@ -3974,9 +4620,41 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             let point = with_launcher(|l| l.content_point(x, y)).unwrap_or((x, y));
             run_start_app_menu(point.0, point.1);
         }
+        WM_MOUSEHWHEEL => {
+            let delta = (wparam.0 >> 16) as i16;
+            if with_launcher(|l| {
+                if !l.start_home() || l.footer_menu.is_some() {
+                    return false;
+                }
+                if let Some(page) = start::HomePage::horizontal_scroll(&mut l.start_horizontal_delta, delta)
+                    && page != l.start_page
+                {
+                    l.set_start_page(page);
+                }
+                true
+            }) == Some(true)
+            {
+                return LRESULT(0);
+            }
+        }
         WM_MOUSEWHEEL => {
             let delta = (wparam.0 >> 16) as u16 as i16;
             with_launcher(|l| {
+                if l.start_home() && l.start_page == start::HomePage::Recent {
+                    if l.footer_menu.is_none() {
+                        let steps = start::wheel_steps(&mut l.recent_vertical_delta, delta);
+                        if steps != 0 {
+                            let old_scroll = l.recent_scroll;
+                            l.recent_scroll = l.recent_scroll.saturating_add_signed(-(steps as isize));
+                            l.clamp_recent_scroll();
+                            if old_scroll != l.recent_scroll {
+                                l.start_hover = None;
+                                l.invalidate();
+                            }
+                        }
+                    }
+                    return;
+                }
                 if l.start_open {
                     let mut cursor = POINT::default();
                     unsafe {
@@ -4145,6 +4823,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         WM_TIMER if wparam.0 == PEEK_TIMER => {
             with_launcher(Launcher::peek_tick);
         }
+        WM_TIMER if wparam.0 == UPDATE_TIMER => {
+            with_launcher(|launcher| launcher.check_updates());
+        }
         WM_TIMER if wparam.0 == TASKBAR_TIMER => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), TASKBAR_TIMER);
@@ -4171,10 +4852,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             with_launcher(Launcher::hide);
             return LRESULT(0);
         }
-        WM_DESTROY => unsafe {
-            with_launcher(Launcher::shutdown);
-            PostQuitMessage(0);
-        },
         m if m != 0 && m == TASKBAR_CREATED.load(Ordering::Relaxed) => {
             // Explorer removes tray icons when it restarts.
             with_launcher(|l| {
@@ -4191,21 +4868,134 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn failed_session_observation_retries_until_the_listener_settles() {
+        for waiting_for_console in [false, true] {
+            let mut retry = super::SessionRetry::new(waiting_for_console);
+            for _ in 0..10 {
+                retry = retry
+                    .after_attempt(false)
+                    .expect("an unresolved session must remain recoverable");
+                assert_eq!(retry.waiting_for_console, waiting_for_console);
+            }
+            assert_eq!(retry.delay_ms, super::SESSION_RETRY_MAX_MS);
+            assert!(retry.after_attempt(true).is_none());
+        }
+    }
+
+    use super::{PopupToggle, popup_animations, popup_motion_enabled, popup_toggle};
+
+    #[test]
+    fn retained_live_panel_resumes_refresh_after_dismissal_reversal_and_stops_at_final_hide() {
+        let mut timer = None;
+        let mut refreshes = 0;
+        let mut arm = |id, interval| timer = Some((id, interval));
+        super::resume_surface_refresh(true, &mut arm);
+        assert_eq!(timer, Some((super::SURFACE_TIMER, super::SURFACE_REFRESH_MS)));
+        refreshes += usize::from(timer.is_some());
+        timer = None; // hide pauses the timer while retaining the panel snapshot.
+        assert_eq!(popup_toggle(false, false, false, true), PopupToggle::Reverse);
+        super::resume_surface_refresh(true, |id, interval| timer = Some((id, interval)));
+        assert_eq!(timer, Some((super::SURFACE_TIMER, 1000)));
+        refreshes += usize::from(timer.is_some());
+        assert_eq!(refreshes, 2, "the retained live panel must refresh after reversal");
+        timer = None; // A completed final dismissal retires the timer.
+        super::resume_surface_refresh(false, |id, interval| timer = Some((id, interval)));
+        assert_eq!(timer, None, "ordinary search must not start live-panel polling");
+        let mut attempts = 0;
+        super::resume_surface_refresh(true, |_, _| {
+            attempts += 1; // Model an unsuccessful native SetTimer; no retry or state replacement.
+        });
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn compact_and_start_popup_lifetimes_reverse_only_the_requested_mode() {
+        use crate::animation::{Motion, Phase};
+        for start in [false, true] {
+            assert!(popup_motion_enabled(start, false, false));
+            let mut motion = Motion::default();
+            assert_eq!(popup_toggle(start, start, false, false), PopupToggle::Show);
+            motion.retarget(true, true);
+            motion.tick(0.04);
+            assert_eq!(popup_toggle(start, start, true, false), PopupToggle::Hide);
+            motion.retarget(false, true);
+            motion.tick(0.01);
+            let before = (motion.value, motion.velocity);
+            assert_eq!(
+                popup_toggle(start, start, false, motion.closing()),
+                PopupToggle::Reverse
+            );
+            motion.retarget(true, true);
+            assert_eq!((motion.value, motion.velocity), before);
+            motion.tick(1.);
+            assert_eq!(motion.phase(), Phase::Open);
+            motion.retarget(false, true);
+            assert_eq!(
+                popup_toggle(start, !start, false, motion.closing()),
+                PopupToggle::Replace
+            );
+            // A mode replacement retires the old lifetime before initializing the requested mode.
+            motion.retarget(false, false);
+            assert_eq!(motion.phase(), Phase::Hidden);
+            motion = Motion::default();
+            motion.retarget(true, true);
+            assert_eq!(motion.value, 0.);
+            motion.tick(1.);
+            assert_eq!(motion.phase(), Phase::Open);
+        }
+        assert_eq!(popup_toggle(false, true, true, false), PopupToggle::Replace);
+        assert_eq!(popup_toggle(true, false, true, false), PopupToggle::Hide);
+        assert!(!popup_motion_enabled(false, true, false));
+        assert!(!popup_motion_enabled(false, false, true));
+        assert!(popup_motion_enabled(true, false, true));
+    }
+
+    #[test]
+    fn both_popup_modes_settle_for_reduced_zero_timer_and_native_failure() {
+        use crate::animation::{Motion, Phase};
+        for start in [false, true] {
+            assert!(popup_motion_enabled(start, false, false));
+            for opening in [false, true] {
+                let expected = if opening { Phase::Open } else { Phase::Hidden };
+                for (open_ms, close_ms, client) in [(0, 180, true), (220, 0, true), (220, 180, false)] {
+                    let mut motion = Motion::at(if opening { 0. } else { 1. });
+                    let animate = popup_animations(opening, open_ms, close_ms, client);
+                    motion.retarget(opening, animate);
+                    if !animate {
+                        assert_eq!(motion.phase(), expected);
+                    }
+                    motion.tick(1.);
+                    assert_eq!(motion.phase(), expected);
+                }
+                let mut motion = Motion::at(if opening { 0. } else { 1. });
+                motion.retarget(opening, true);
+                assert_eq!(motion.advance_present(0.01, |_| false), expected);
+                assert!(!motion.active());
+                motion = Motion::at(if opening { 0. } else { 1. });
+                motion.retarget(opening, true);
+                motion.settle(); // SetTimer failure uses this same completion path.
+                assert_eq!(motion.phase(), expected);
+                assert!(!motion.active());
+            }
+        }
+    }
+
+    #[test]
     fn app_menu_snapshot_tracks_shared_material_overrides_for_reload_cancellation() {
         let palette = super::Palette::new(true, true);
         let mut config = super::Config {
             backdrop: crate::config::Backdrop::Transparent,
             ..Default::default()
         };
-        let before = super::start_app_menu_policy(&palette, &config, false, true);
+        let before = super::start_app_menu_policy(&palette, &config, true);
         config.backdrop_transparency = Some(100);
-        let clear = super::start_app_menu_policy(&palette, &config, false, true);
+        let clear = super::start_app_menu_policy(&palette, &config, true);
         assert_ne!(before, clear);
         assert_eq!(clear.material_options, config.material_options());
         config.backdrop_blur = Some(true);
-        let blurred = super::start_app_menu_policy(&palette, &config, true, true);
+        let blurred = super::start_app_menu_policy(&palette, &config, true);
         assert_ne!(clear, blurred);
-        assert_eq!(blurred.material_options, config.for_remote(true).material_options());
+        assert_eq!(blurred.material_options, config.material_options());
     }
 
     #[test]
@@ -4220,9 +5010,9 @@ mod tests {
             backdrop_color: "#FFFFFF".into(),
             ..Default::default()
         };
-        let captured_light = super::start_app_menu_policy(&light_override, &config, false, true).dark;
+        let captured_light = super::start_app_menu_policy(&light_override, &config, true).dark;
         config.theme = super::Theme::Light;
-        let captured_dark = super::start_app_menu_policy(&dark_override, &config, false, true).dark;
+        let captured_dark = super::start_app_menu_policy(&dark_override, &config, true).dark;
         assert!(!captured_light);
         assert!(captured_dark);
         assert_eq!(super::start_app_menu_dark(&light_override), captured_light);

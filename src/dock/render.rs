@@ -35,6 +35,7 @@ struct Target {
     /// Notification-area icons, by their tray identity.
     tray: HashMap<Key, (Arc<IconPixels>, ID2D1Bitmap)>,
     media_shapes: HashMap<u8, ID2D1PathGeometry>,
+    launcher_shape: Option<ID2D1PathGeometry>,
     size: D2D_SIZE_U,
 }
 
@@ -126,6 +127,12 @@ pub(super) struct TopbarFlyoutFrame<'a> {
     pub overflow: &'a [usize],
     pub hover: Option<usize>,
     pub presentation: (f32, f32),
+}
+impl TopbarFlyoutFrame<'_> {
+    fn cached_contour(&self) -> (layered::Contour, u8) {
+        // The retained DIB owns complete pixels. Only native presentation fades it.
+        (layered::Contour::Round(TOPBAR_FLYOUT_RADIUS * self.presentation.0), 255)
+    }
 }
 pub(super) struct IslandFrame<'a> {
     pub dpi: u32,
@@ -369,14 +376,12 @@ impl Renderer {
 
     pub(super) fn draw_topbar_flyout(&mut self, hwnd: HWND, frame: TopbarFlyoutFrame) -> Result<()> {
         let p = frame.presentation;
-        self.paint_surface(
+        self.paint_surface_with_alpha(
             hwnd,
             frame.dpi,
             frame.palette,
-            (
-                layered::Contour::Round(TOPBAR_FLYOUT_RADIUS * p.0),
-                (p.1.clamp(0., 1.) * 255.).round() as u8,
-            ),
+            frame.cached_contour(),
+            (p.1.clamp(0., 1.) * 255.).round() as u8,
             |target, _| draw_topbar_overflow_content(target, &frame),
         )
     }
@@ -442,6 +447,7 @@ impl Renderer {
                 bitmaps: HashMap::new(),
                 tray: HashMap::new(),
                 media_shapes: HashMap::new(),
+                launcher_shape: None,
                 size: D2D_SIZE_U::default(),
             });
         }
@@ -457,6 +463,10 @@ impl Renderer {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Draws from borrowed control content and per-frame input state"
+    )]
     pub fn draw_control(
         &mut self,
         hwnd: HWND,
@@ -468,9 +478,8 @@ impl Renderer {
         focus: Option<usize>,
         dragging: Option<(usize, u32)>,
         presentation: (f32, f32, f32),
-        remote_alpha: Option<u8>,
     ) -> Result<()> {
-        self.paint_surface_with_alpha(
+        self.paint_surface(
             hwnd,
             dpi,
             palette,
@@ -478,7 +487,6 @@ impl Renderer {
                 layered::Contour::Round(18. * presentation.1),
                 (presentation.2.clamp(0., 1.) * 255.).round() as u8,
             ),
-            remote_alpha.unwrap_or(255),
             |target, formats| {
                 draw_control_content(
                     target,
@@ -820,16 +828,6 @@ impl Renderer {
         })
     }
 
-    pub fn draw_remote_flyout(&mut self, hwnd: HWND, frame: &FlyoutFrame, alpha: u8) -> Result<()> {
-        self.paint_surface_with_alpha(
-            hwnd,
-            frame.dpi,
-            frame.palette,
-            (layered::Contour::Round(8.), 255),
-            alpha,
-            |target, _| draw_flyout(target, frame),
-        )
-    }
     pub fn cached_popup_matches(&self, hwnd: HWND, dpi: u32) -> Result<bool> {
         self.layered
             .as_ref()
@@ -841,11 +839,12 @@ impl Renderer {
             .ok_or_else(|| windows::core::Error::from_hresult(windows::Win32::Foundation::E_FAIL))?
             .present_cached(hwnd, dpi, alpha)
     }
-    pub fn discard_popup_surface(&mut self) {
-        self.layered = None;
-    }
 
     /// Draws an app's windows as a list, highlighting the row under the pointer.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Draws borrowed window rows and preview geometry in a single frame"
+    )]
     pub fn draw_windows(
         &mut self,
         hwnd: HWND,
@@ -1046,6 +1045,7 @@ impl Renderer {
                     bitmaps: HashMap::new(),
                     tray: HashMap::new(),
                     media_shapes: HashMap::new(),
+                    launcher_shape: None,
                     size,
                 });
             }
@@ -1983,6 +1983,46 @@ fn separator(target: &Target, frame: &Frame, x: f32) {
     }
 }
 
+fn draw_command_mark(target: &mut Target, left: f32, top: f32, size: f32) -> Result<()> {
+    unsafe {
+        if target.launcher_shape.is_none() {
+            let geometry = target.rt.GetFactory()?.CreatePathGeometry()?;
+            let sink = geometry.Open()?;
+            let point = |x, y| windows_numerics::Vector2 { X: x, Y: y };
+            let arc = |x, y| D2D1_ARC_SEGMENT {
+                point: point(x, y),
+                size: D2D_SIZE_F { width: 3., height: 3. },
+                rotationAngle: 0.,
+                sweepDirection: D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE,
+                arcSize: D2D1_ARC_SIZE_LARGE,
+            };
+            // Four open-sided loops joined by the central square, on a 24 DIP canvas.
+            sink.BeginFigure(point(19., 8.), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&arc(16., 5.));
+            sink.AddLine(point(16., 19.));
+            sink.AddArc(&arc(19., 16.));
+            sink.AddLine(point(5., 16.));
+            sink.AddArc(&arc(8., 19.));
+            sink.AddLine(point(8., 5.));
+            sink.AddArc(&arc(5., 8.));
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close()?;
+            target.launcher_shape = Some(geometry);
+        }
+        let mut transform = Matrix3x2::identity();
+        target.rt.GetTransform(&mut transform);
+        let scale = size / 24.;
+        target
+            .rt
+            .SetTransform(&(Matrix3x2::scale(scale, scale) * Matrix3x2::translation(left, top) * transform));
+        target
+            .rt
+            .DrawGeometry(target.launcher_shape.as_ref().unwrap(), &target.brush, 2., None);
+        target.rt.SetTransform(&transform);
+    }
+    Ok(())
+}
+
 fn draw_content(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<()> {
     unsafe {
         if frame.animation_scale < 1.0 {
@@ -2057,21 +2097,13 @@ unsafe fn draw(target: &mut Target, formats: &Formats, frame: &Frame) -> Result<
                 icon_top + icon_size,
             );
             let Some(item) = item else {
-                // Draw the four panes directly so Start does not depend on an icon font.
+                // The Command mark is vector geometry, independent of installed icon fonts.
                 target.brush.SetColor(&p.text);
-                let start_size = icon_size * 0.85;
-                let gap = 2. * frame.layout_scale;
-                let pane = (start_size - gap) / 2.;
-                let step = pane + gap;
+                let start_size = icon_size * 0.9;
                 let half = start_size / 2.;
                 let left = (icon_rect.left + icon_rect.right) / 2. - half;
                 let top = (icon_rect.top + icon_rect.bottom) / 2. - half;
-                for y in [top, top + step] {
-                    for x in [left, left + step] {
-                        let bounds = frame.snap_rect(x, y, x + pane, y + pane);
-                        target.rt.FillRectangle(&bounds, &target.brush);
-                    }
-                }
+                draw_command_mark(target, left, top, start_size)?;
                 continue;
             };
             let fallback = item
@@ -2171,8 +2203,6 @@ fn text(
         );
     }
 }
-
-/// Segoe Fluent Icons speaker: muted, silent, or one to three waves.
 
 /// Segoe Fluent Icons battery in tenths, from Battery0 (U+EBA0) or BatteryCharging0 (U+EBAB).
 fn battery_glyph(percent: u32, charging: bool) -> String {

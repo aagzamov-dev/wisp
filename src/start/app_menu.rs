@@ -50,7 +50,6 @@ pub(crate) struct Appearance {
     pub backdrop: Backdrop,
     pub color: String,
     pub material_options: crate::theme::MaterialOptions,
-    pub remote: bool,
     pub opening: bool,
     pub closing: bool,
 }
@@ -185,25 +184,12 @@ impl std::ops::Deref for Fade {
 impl Fade {
     fn new(appearance: &Appearance) -> Self {
         let mut motion = crate::animation::Motion::default();
-        motion.retarget_duration(
-            true,
-            if appearance.opening {
-                if appearance.remote { 120 } else { 180 }
-            } else {
-                0
-            },
-        );
+        motion.retarget_duration(true, if appearance.opening { 180 } else { 0 });
         Self(motion)
     }
     fn close(&mut self, appearance: &Appearance) {
-        self.0.retarget_duration(
-            false,
-            if appearance.closing {
-                if appearance.remote { 90 } else { 140 }
-            } else {
-                0
-            },
-        );
+        self.0
+            .retarget_duration(false, if appearance.closing { 140 } else { 0 });
     }
     fn tick(&mut self, seconds: f32) {
         self.0.tick(seconds);
@@ -458,7 +444,7 @@ fn show(
         accessibility::announce(&window.bridge.access, model.focus, true);
         let mut timer = false;
         if fade.active() {
-            if SetTimer(Some(hwnd), TIMER, crate::animation::interval(appearance.remote), None) == 0 {
+            if SetTimer(Some(hwnd), TIMER, crate::animation::LOCAL_INTERVAL, None) == 0 {
                 return Err(windows::core::Error::from_thread());
             }
             timer = true;
@@ -617,7 +603,7 @@ fn show(
                 }
                 fade.close(&appearance);
                 if fade.active() && !timer {
-                    if SetTimer(Some(hwnd), TIMER, crate::animation::interval(appearance.remote), None) == 0 {
+                    if SetTimer(Some(hwnd), TIMER, crate::animation::LOCAL_INTERVAL, None) == 0 {
                         model.picked = None;
                         break;
                     }
@@ -745,29 +731,30 @@ mod tests {
         }
     }
     #[test]
-    fn fade_is_monotone_bounded_and_stops_with_remote_caps() {
+    fn fade_preserves_desktop_duration_and_reaches_both_endpoints() {
         let a = Appearance {
             dark: true,
             material_options: Default::default(),
             backdrop: Backdrop::Glass,
             color: String::new(),
-            remote: true,
             opening: true,
             closing: true,
         };
         let mut f = Fade::new(&a);
         let mut previous = 0.;
-        for _ in 0..8 {
+        for _ in 0..11 {
             f.tick(0.015);
             assert!(f.value >= previous && f.value <= 1.);
             previous = f.value;
         }
+        assert!(f.active());
+        f.tick(0.03);
         assert!(!f.active());
         assert_eq!(f.alpha(), 255);
         f.close(&a);
-        for _ in 0..7 {
-            f.tick(0.015);
-        }
+        f.tick(0.13);
+        assert!(f.active());
+        f.tick(0.02);
         assert!(!f.active());
         assert_eq!(f.alpha(), 0);
     }
@@ -792,7 +779,6 @@ mod tests {
             material_options: Default::default(),
             backdrop: Backdrop::Solid,
             color: String::new(),
-            remote: false,
             opening: false,
             closing: false,
         };

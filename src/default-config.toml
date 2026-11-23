@@ -4,6 +4,13 @@
 # Examples: "Alt+Space", "Ctrl+Shift+Space", "Win+Alt+R", "Ctrl+F12"
 hotkey = "Alt+Space"
 
+# Global shortcut to quit Wisp and restore the Windows taskbar.
+quit_hotkey = "Ctrl+Win+Alt+X"
+
+# Pause Wisp and restore the Windows taskbar during Remote Desktop.
+pause_on_rdp = true
+automatic_updates = false
+
 # Results visible at once. Scroll to see more.
 max_results = 8
 

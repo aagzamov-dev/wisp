@@ -22,10 +22,10 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+
+use crate::worker::WorkerLifetime;
 use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::HSTRING;
 
 use crate::indexer::{self, IconPixels};
@@ -149,15 +149,15 @@ pub struct Commands {
     network_gate: Arc<Mutex<NetworkGate>>,
     hardware: Arc<Mutex<control::Hardware>>,
     control_events: Sender<Event>,
-    notify_window: isize,
+    lifetime: WorkerLifetime,
     notify_message: u32,
 }
 
 impl Commands {
-    pub fn spawn(hwnd: HWND, notify_msg: u32, icon_size: i32) -> (Commands, Receiver<Event>) {
+    pub fn spawn(lifetime: &WorkerLifetime, notify_msg: u32, icon_size: i32) -> (Commands, Receiver<Event>) {
         let (requests, rx) = channel();
         let (events, events_rx) = channel();
-        let hwnd = hwnd.0 as isize;
+        let worker_lifetime = lifetime.clone();
         let refresh_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pending = refresh_pending.clone();
         let sound_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -175,9 +175,7 @@ impl Commands {
                     pending,
                     pending_sound,
                     pending_topbar,
-                    move || unsafe {
-                        let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
-                    },
+                    (&worker_lifetime, notify_msg),
                 )
             })
             .expect("could not start commands thread");
@@ -194,7 +192,7 @@ impl Commands {
                 network_gate: Arc::new(Mutex::new(NetworkGate::default())),
                 hardware: Arc::new(Mutex::new(control::Hardware::default())),
                 control_events,
-                notify_window: hwnd,
+                lifetime: lifetime.clone(),
                 notify_message: notify_msg,
             },
             events_rx,
@@ -223,7 +221,7 @@ impl Commands {
         let sender = self.notch_reader.get_or_init(|| {
             let (sender, requests) = std::sync::mpsc::sync_channel::<(usize, Vec<String>)>(1);
             let events = self.control_events.clone();
-            let window = self.notify_window;
+            let lifetime = self.lifetime.clone();
             let message = self.notify_message;
             std::thread::spawn(move || {
                 unsafe {
@@ -231,12 +229,13 @@ impl Commands {
                 }
                 let mut reader = media::NotchReader::default();
                 while let Ok((notch, exclusions)) = requests.recv() {
+                    if !lifetime.running() {
+                        break;
+                    }
                     if events.send(Event::Notch(notch, reader.read(&exclusions))).is_err() {
                         break;
                     }
-                    unsafe {
-                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
-                    }
+                    lifetime.notify(message);
                 }
             });
             sender
@@ -251,7 +250,7 @@ impl Commands {
         let sender = self.control.get_or_init(|| {
             let (sender, requests) = std::sync::mpsc::sync_channel(4);
             let events = self.control_events.clone();
-            let window = self.notify_window;
+            let lifetime = self.lifetime.clone();
             let message = self.notify_message;
             let shared = self.hardware.clone();
             std::thread::spawn(move || {
@@ -259,7 +258,13 @@ impl Commands {
                     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                 }
                 while let Ok(request) = requests.recv() {
+                    if !lifetime.running() {
+                        break;
+                    }
                     let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner()).clone();
+                    if !lifetime.running() {
+                        break;
+                    }
                     if let Err(error) = control::run(request, &mut hardware)
                         && events.send(Event::Failed(error)).is_err()
                     {
@@ -274,9 +279,7 @@ impl Commands {
                             break;
                         }
                     }
-                    unsafe {
-                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
-                    }
+                    lifetime.notify(message);
                 }
             });
             sender
@@ -291,7 +294,7 @@ impl Commands {
             let gate = self.network_gate.clone();
             let epoch = self.network_epoch.clone();
             let events = self.control_events.clone();
-            let window = self.notify_window;
+            let lifetime = self.lifetime.clone();
             let message = self.notify_message;
             let _ = std::thread::Builder::new()
                 .name("Wi-Fi discovery".into())
@@ -300,7 +303,7 @@ impl Commands {
                         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
                     }
                     while requests.recv().is_ok() {
-                        loop {
+                        while lifetime.running() {
                             let generation = {
                                 let mut current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
                                 let generation = current_gate.current(epoch.load(std::sync::atomic::Ordering::Acquire));
@@ -308,15 +311,16 @@ impl Commands {
                                     let mut hardware = shared.lock().unwrap_or_else(|error| error.into_inner());
                                     hardware.network_scan = wifi::ScanStatus::Idle;
                                     let _ = events.send(Event::Control(hardware.clone()));
-                                    unsafe {
-                                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
-                                    }
+                                    lifetime.notify(message);
                                 }
                                 generation
                             };
                             let Some(generation) = generation else { break };
                             // Native scanning and callback teardown are outside both locks.
                             let result = wifi::scan_networks(|cached| {
+                                if !lifetime.running() {
+                                    return;
+                                }
                                 let current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
                                 if current_gate.active == Some(generation)
                                     && epoch.load(std::sync::atomic::Ordering::Acquire) == generation
@@ -325,11 +329,12 @@ impl Commands {
                                     hardware.networks = Some(cached);
                                     hardware.network_scan = wifi::ScanStatus::Scanning;
                                     let _ = events.send(Event::Control(hardware.clone()));
-                                    unsafe {
-                                        let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
-                                    }
+                                    lifetime.notify(message);
                                 }
                             });
+                            if !lifetime.running() {
+                                return;
+                            }
                             let mut current_gate = gate.lock().unwrap_or_else(|error| error.into_inner());
                             let current = generation == epoch.load(std::sync::atomic::Ordering::Acquire);
                             let again = current_gate.finish(generation);
@@ -338,9 +343,7 @@ impl Commands {
                             if events.send(Event::Control(hardware.clone())).is_err() {
                                 return;
                             }
-                            unsafe {
-                                let _ = PostMessageW(Some(HWND(window as _)), message, WPARAM(0), LPARAM(0));
-                            }
+                            lifetime.notify(message);
                             drop(hardware);
                             drop(current_gate);
                             if !again {
@@ -361,25 +364,11 @@ impl Commands {
             gate.queued = None;
             hardware.network_scan = wifi::ScanStatus::Failed("Could not start Wi-Fi discovery.".into());
             let _ = self.control_events.send(Event::Control(hardware.clone()));
-            unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(self.notify_window as _)),
-                    self.notify_message,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
-            }
+            self.lifetime.notify(self.notify_message);
             return false;
         }
         let _ = self.control_events.send(Event::Control(hardware.clone()));
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(self.notify_window as _)),
-                self.notify_message,
-                WPARAM(0),
-                LPARAM(0),
-            );
-        }
+        self.lifetime.notify(self.notify_message);
         true
     }
 
@@ -470,20 +459,23 @@ fn worker(
     refresh_pending: Arc<std::sync::atomic::AtomicBool>,
     sound_pending: Arc<std::sync::atomic::AtomicBool>,
     topbar_pending: Arc<std::sync::atomic::AtomicBool>,
-    notify: impl Fn(),
+    (lifetime, notify_message): (&WorkerLifetime, u32),
 ) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
     let send = |event| {
-        if events.send(event).is_ok() {
-            notify();
+        if lifetime.running() && events.send(event).is_ok() {
+            lifetime.notify(notify_message);
         }
     };
     let mut icons_sent = HashSet::new();
     let mut ran = 0;
     let mut state = State::default();
     let mut refresh = |ran: u64, full: bool| {
+        if !lifetime.running() {
+            return;
+        }
         if full {
             state = read_state();
         } else {
@@ -512,6 +504,9 @@ fn worker(
         let mut handled = 0;
         let mut next = Some(first);
         while let Some(request) = next.take() {
+            if !lifetime.running() {
+                return;
+            }
             handled += 1;
             match request {
                 Request::TopbarStatus => {
@@ -567,7 +562,7 @@ fn worker(
                 next = requests.try_recv().ok();
             }
         }
-        if stale {
+        if stale && lifetime.running() {
             if full && sound {
                 // Make the audio snapshot available before device discovery.
                 refresh(ran, false);
@@ -1196,6 +1191,7 @@ mod tests {
             })),
             windows: vec![open_windows::Window {
                 hwnd: 1,
+                pid: 1,
                 title: "README.md - runner - Visual Studio Code".into(),
                 exe: r"C:\Apps\Code.exe".into(),
             }],

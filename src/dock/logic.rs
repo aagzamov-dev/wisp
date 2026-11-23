@@ -1,5 +1,7 @@
 //! Matching and DIP geometry.
 
+use std::collections::HashMap;
+
 use crate::config::WindowListMode;
 use crate::indexer::AppEntry;
 
@@ -29,19 +31,18 @@ pub fn layout_scale(app_icon_size: f32) -> f32 {
 pub fn height(scale: f32) -> f32 {
     HEIGHT * scale
 }
-/// External spacing is removed only in the fixed Remote-mode layout.
-pub fn margin(scale: f32, remote: bool) -> f32 {
-    if remote { 0.0 } else { MARGIN * scale }
+pub fn margin(scale: f32) -> f32 {
+    MARGIN * scale
 }
 
-pub fn reserved_height(scale: f32, remote: bool) -> f32 {
-    height(scale) + 2.0 * margin(scale, remote)
+pub fn reserved_height(scale: f32) -> f32 {
+    height(scale) + 2.0 * margin(scale)
 }
 
-pub fn resting_top(bottom: i32, dpi: u32, app_icon_size: f32, remote: bool) -> i32 {
+pub fn resting_top(bottom: i32, dpi: u32, app_icon_size: f32) -> i32 {
     let scale = dpi as f32 / 96.;
     let layout = layout_scale(app_icon_size);
-    bottom - (height(layout) * scale).round() as i32 - (margin(layout, remote) * scale).round() as i32
+    bottom - (height(layout) * scale).round() as i32 - (margin(layout) * scale).round() as i32
 }
 
 /// Monitor-wide resting dock band, independent of any animated HWND rectangle.
@@ -51,9 +52,8 @@ pub fn bottom_hover_strip(
     (left, top, right, bottom): (i32, i32, i32, i32),
     dpi: u32,
     app_icon_size: f32,
-    remote: bool,
 ) -> bool {
-    let band_top = resting_top(bottom, dpi, app_icon_size, remote).max(top);
+    let band_top = resting_top(bottom, dpi, app_icon_size).max(top);
     (left..right).contains(&x) && (band_top..bottom).contains(&y)
 }
 
@@ -73,10 +73,9 @@ pub fn bottom_hover_zones(
     dpi: u32,
     app_icon_size: f32,
     reveal_height: u32,
-    remote: bool,
 ) -> (bool, bool) {
     let reveal = bottom_reveal_strip(cursor, monitor, reveal_height);
-    let hold = bottom_hover_strip(cursor, monitor, dpi, app_icon_size, remote);
+    let hold = bottom_hover_strip(cursor, monitor, dpi, app_icon_size);
     (reveal, reveal || hold)
 }
 
@@ -137,10 +136,38 @@ pub const PREVIEW_HEADER: f32 = 28.;
 pub const PREVIEW_MONITOR: f32 = 17.;
 pub const PREVIEW_FOOTER: f32 = 24.;
 
-/// Freeze existing cards for the lifetime of a chooser, across z-order refresh,
-/// paging and membership changes. Newly opened windows follow existing cards.
-pub fn preview_order(previous: &[isize], current: &[isize]) -> Vec<isize> {
-    stable_order(previous.to_vec(), current.to_vec(), |old, new| old == new)
+/// First observation of each window lifetime, independent of foreground order.
+#[derive(Default)]
+pub struct PreviewOrder {
+    windows: HashMap<isize, (u32, u64)>,
+    next: u64,
+}
+
+impl PreviewOrder {
+    pub fn observe(&mut self, hwnd: isize, pid: u32) {
+        if self.rank(hwnd, pid).is_none() {
+            self.windows.insert(hwnd, (pid, self.next));
+            self.next += 1;
+        }
+    }
+
+    pub fn close(&mut self, hwnd: isize) {
+        self.windows.remove(&hwnd);
+    }
+
+    pub fn sort<T>(&self, windows: &mut [T], identity: impl Fn(&T) -> (isize, u32)) {
+        windows.sort_by_key(|window| {
+            let (hwnd, pid) = identity(window);
+            self.rank(hwnd, pid).unwrap_or(u64::MAX)
+        });
+    }
+
+    fn rank(&self, hwnd: isize, pid: u32) -> Option<u64> {
+        self.windows
+            .get(&hwnd)
+            .filter(|(owner, _)| *owner == pid)
+            .map(|&(_, rank)| rank)
+    }
 }
 
 pub fn preview_candidates<T>(windows: &[T], local_only: bool, local: impl Fn(&T) -> bool) -> Vec<&T> {
@@ -261,15 +288,6 @@ pub fn parts(tray: Option<usize>, volume: bool, battery: bool) -> Vec<Part> {
                 .filter_map(|(part, shown)| shown.then_some(part)),
         )
         .collect()
-}
-
-/// Remote uses this same list for drawing, size and hit testing, even without audio.
-pub fn remote_parts(mut parts: Vec<Part>) -> Vec<Part> {
-    parts.retain(|part| *part != Part::Clock);
-    if !parts.contains(&Part::Volume) {
-        parts.push(Part::Volume);
-    }
-    parts
 }
 
 /// The notification-area flyout: a grid of cells, as in Windows 11.
@@ -433,10 +451,10 @@ mod tests {
             for dpi in [96, 120, 144, 192] {
                 for x in [-1920, -960, -1] {
                     let top = -(reveal_height as i32);
-                    let (reveal, hold) = bottom_hover_zones((x, top), monitor, dpi, 24., reveal_height, false);
+                    let (reveal, hold) = bottom_hover_zones((x, top), monitor, dpi, 24., reveal_height);
                     assert!(reveal && hold);
-                    assert!(!bottom_hover_zones((x, top - 1), monitor, dpi, 24., reveal_height, false).0);
-                    assert!(!bottom_hover_zones((x, 0), monitor, dpi, 24., reveal_height, false).0);
+                    assert!(!bottom_hover_zones((x, top - 1), monitor, dpi, 24., reveal_height).0);
+                    assert!(!bottom_hover_zones((x, 0), monitor, dpi, 24., reveal_height).0);
                     let mut away = 0;
                     for _ in 0..20 {
                         away = hover_away_polls(away, hold);
@@ -450,17 +468,11 @@ mod tests {
         // A point above the 8px trigger holds an already visible dock, but
         // cannot reveal a hidden one, even at higher Windows scaling.
         for dpi in [96, 192] {
-            assert_eq!(
-                bottom_hover_zones((-1000, -20), monitor, dpi, 24., 8, false),
-                (false, true)
-            );
+            assert_eq!(bottom_hover_zones((-1000, -20), monitor, dpi, 24., 8), (false, true));
         }
         // Tall activation areas must remain part of hold even above the dock.
-        assert!(!bottom_hover_strip((-1000, -100), monitor, 96, 24., false));
-        assert_eq!(
-            bottom_hover_zones((-1000, -100), monitor, 96, 24., 128, false),
-            (true, true)
-        );
+        assert!(!bottom_hover_strip((-1000, -100), monitor, 96, 24.));
+        assert_eq!(bottom_hover_zones((-1000, -100), monitor, 96, 24., 128), (true, true));
         assert!(!bottom_reveal_strip((0, 0), (0, 0, 0, 0), 8));
     }
     #[test]
@@ -479,8 +491,7 @@ mod tests {
         assert_eq!(preview_candidates(&windows, false, |_| false).len(), 3);
         let moved = [(11, 2), (22, 2), (33, 1)];
         let local_after_move = preview_candidates(&moved, true, |window| window.1 == 1);
-        let ids = local_after_move.iter().map(|window| window.0).collect::<Vec<_>>();
-        assert_eq!(preview_order(&[11, 33], &ids), [33]);
+        assert_eq!(local_after_move, [&(33, 1)]);
     }
     #[test]
     fn monitor_wide_bottom_hover_does_not_oscillate_beside_dock() {
@@ -491,7 +502,7 @@ mod tests {
                 let mut revealed = false;
                 let mut away = 0;
                 for _ in 0..20 {
-                    let inside = bottom_hover_strip((x, y), monitor, 96, 24., false);
+                    let inside = bottom_hover_strip((x, y), monitor, 96, 24.);
                     if !revealed {
                         revealed = reveal_from_hover_strip(inside, false);
                     } else {
@@ -505,7 +516,7 @@ mod tests {
         // The usual three outside polls still hide, and re-entering resets it.
         let mut away = 0;
         for expected in 1..=3 {
-            away = hover_away_polls(away, bottom_hover_strip((20, 900), monitor, 96, 24., false));
+            away = hover_away_polls(away, bottom_hover_strip((20, 900), monitor, 96, 24.));
             assert_eq!(away, expected);
         }
         assert_eq!(hover_away_polls(away, true), 0);
@@ -518,32 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn remote_removes_only_external_vertical_space_and_local_return_restores_it() {
+    fn reserved_height_includes_both_external_margins() {
         use super::*;
         for (icon_size, body, gap) in [(24., 42., 6.75), (32., 56., 9.), (40., 70., 11.25)] {
             let layout = layout_scale(icon_size);
             assert_eq!(height(layout), body);
-            assert_eq!(reserved_height(layout, true), body);
-            assert_eq!(reserved_height(layout, false), body + 2. * gap);
-            for dpi in [96, 120, 144, 192] {
-                let physical = dpi as f32 / 96.;
-                let pixels = (body * physical).round() as i32;
-                let gap_pixels = (gap * physical).round() as i32;
-                // Negative monitor coordinates cover displays above the primary.
-                let monitor = (-1920, -1080, 0, 0);
-                for remote in [false, true, false] {
-                    let top = resting_top(0, dpi, icon_size, remote);
-                    assert_eq!(top, -pixels - if remote { 0 } else { gap_pixels });
-                    assert!(bottom_hover_strip((-960, top), monitor, dpi, icon_size, remote));
-                    assert!(!bottom_hover_strip((-960, top - 1), monitor, dpi, icon_size, remote));
-                    assert!(bottom_hover_strip((-960, -1), monitor, dpi, icon_size, remote));
-                    assert!(!bottom_hover_strip((-960, 0), monitor, dpi, icon_size, remote));
-                    assert_eq!(
-                        bottom_hover_zones((-960, -127), monitor, dpi, icon_size, 128, remote),
-                        (true, true)
-                    );
-                }
-            }
+            assert_eq!(reserved_height(layout), body + 2. * gap);
         }
     }
 
@@ -554,26 +545,60 @@ mod tests {
             for icon_size in [24., 32., 40.] {
                 let scale = dpi as f32 / 96.;
                 let layout = layout_scale(icon_size);
-                let expected = (height(layout) * scale).round() as i32 + (margin(layout, false) * scale).round() as i32;
+                let expected = (height(layout) * scale).round() as i32 + (margin(layout) * scale).round() as i32;
                 let monitor = (-2560, -1440, 0, 0);
                 for x in [-2560, -1280, -1] {
-                    assert!(bottom_hover_strip((x, -expected), monitor, dpi, icon_size, false));
-                    assert!(bottom_hover_strip((x, -1), monitor, dpi, icon_size, false));
-                    assert!(!bottom_hover_strip((x, -expected - 1), monitor, dpi, icon_size, false));
-                    assert!(!bottom_hover_strip((x, 0), monitor, dpi, icon_size, false));
+                    assert!(bottom_hover_strip((x, -expected), monitor, dpi, icon_size));
+                    assert!(bottom_hover_strip((x, -1), monitor, dpi, icon_size));
+                    assert!(!bottom_hover_strip((x, -expected - 1), monitor, dpi, icon_size));
+                    assert!(!bottom_hover_strip((x, 0), monitor, dpi, icon_size));
                 }
-                assert!(!bottom_hover_strip((-2561, -1), monitor, dpi, icon_size, false));
-                assert!(!bottom_hover_strip((0, -1), monitor, dpi, icon_size, false));
+                assert!(!bottom_hover_strip((-2561, -1), monitor, dpi, icon_size));
+                assert!(!bottom_hover_strip((0, -1), monitor, dpi, icon_size));
             }
         }
-        assert!(!bottom_hover_strip((0, 0), (0, 0, 0, 0), 96, 24., false));
+        assert!(!bottom_hover_strip((0, 0), (0, 0, 0, 0), 96, 24.));
     }
+    #[test]
+    fn reopened_preview_uses_opening_order_after_focus_changes() {
+        use super::PreviewOrder;
+        let mut order = PreviewOrder::default();
+        order.observe(11, 9);
+        order.observe(22, 9);
+        let mut first_hover = [(11, 9), (22, 9)];
+        order.sort(&mut first_hover, |window| *window);
+
+        let mut next_hover = [(22, 9), (11, 9)];
+        order.observe(22, 9); // Rediscovered after a focus or visibility change.
+        order.sort(&mut next_hover, |window| *window);
+        assert_eq!(next_hover, first_hover);
+
+        // Two openings can arrive before the next inventory reads the latest z-order.
+        order.observe(33, 9);
+        order.observe(44, 9);
+        let mut added = [(44, 9), (33, 9), (22, 9), (11, 9)];
+        order.sort(&mut added, |window| *window);
+        assert_eq!(added, [(11, 9), (22, 9), (33, 9), (44, 9)]);
+
+        order.close(11);
+        order.observe(11, 9); // Even a reused handle in the same process is a new window.
+        order.observe(33, 6); // A changed PID also identifies a new window.
+        let mut reused = [(33, 6), (11, 9), (44, 9), (22, 9)];
+        order.sort(&mut reused, |window| *window);
+        assert_eq!(reused, [(22, 9), (44, 9), (11, 9), (33, 6)]);
+    }
+
     #[test]
     fn chooser_order_survives_vscode_z_order_refresh_and_second_card_stays_bound() {
         use super::*;
-        let opened = preview_order(&[], &[11, 22]);
-        let refreshed = preview_order(&opened, &[22, 11]);
-        assert_eq!(refreshed, [11, 22]);
+        let mut order = PreviewOrder::default();
+        let opened = [(11, 9), (22, 9)];
+        for (hwnd, pid) in opened {
+            order.observe(hwnd, pid);
+        }
+        let mut refreshed = [(22, 9), (11, 9)];
+        order.sort(&mut refreshed, |window| *window);
+        assert_eq!(refreshed, opened);
         let (row, close) = preview_hit(
             PREVIEW_PAD + PREVIEW_WIDTH * 1.5,
             60.,
@@ -583,20 +608,16 @@ mod tests {
         )
         .unwrap();
         let pressed = PreviewPress {
-            hwnd: opened[row],
+            hwnd: opened[row].0,
             pid: 9,
             close,
             middle: false,
         };
         let released = PreviewPress {
-            hwnd: refreshed[row],
+            hwnd: refreshed[row].0,
             ..pressed
         };
         assert_eq!(pressed.release(released), Some((22, false)));
-        // Rebuilding a page after a new window appears retains old positions.
-        let added = preview_order(&refreshed, &[33, 22, 11]);
-        assert_eq!(added, [11, 22, 33]);
-        assert_eq!(preview_order(&added, &[33, 22]), [22, 33]);
     }
 
     #[test]
@@ -929,19 +950,5 @@ mod tests {
         assert_eq!(flyout_hit(x + 1.0, y + 1.0, 6), None);
         assert_eq!(flyout_hit(FLYOUT_PAD - 1.0, 10.0, 3), None);
         assert_eq!(flyout_hit(FLYOUT_PAD + 5.0 * FLYOUT_CELL + 1.0, 10.0, 9), None);
-    }
-}
-
-#[cfg(test)]
-mod remote_tests {
-    use super::*;
-    #[test]
-    fn remote_controls_without_audio_share_clock_free_geometry() {
-        let remote = remote_parts(parts(Some(2), false, false));
-        assert_eq!(remote, [Part::Chevron, Part::Tray(0), Part::Tray(1), Part::Volume]);
-        assert_eq!(part_left(Part::Clock, 3, &remote), None);
-        let controls = part_left(Part::Volume, 3, &remote).unwrap();
-        assert_eq!(part_hit(controls + 1., 20., 3, &remote), Some(Part::Volume));
-        assert_eq!(remote_parts(parts(None, true, false)), [Part::Volume]);
     }
 }

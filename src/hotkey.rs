@@ -2,6 +2,7 @@
 
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 
+#[derive(PartialEq, Eq)]
 pub struct Hotkey {
     pub modifiers: HOT_KEY_MODIFIERS,
     pub vk: u32,
@@ -83,6 +84,10 @@ mod tests {
         let hk = parse("ctrl + shift + k").unwrap();
         assert_eq!(hk.modifiers, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT);
         assert_eq!(hk.vk, 'K' as u32);
+
+        let quit = parse("Ctrl+Win+Alt+X").unwrap();
+        assert_eq!(quit.modifiers, MOD_CONTROL | MOD_WIN | MOD_ALT | MOD_NOREPEAT);
+        assert!(quit == parse("alt+control+super+x").unwrap());
 
         assert_eq!(parse("Win+F12").unwrap().vk, VK_F12.0 as u32);
         assert!(parse("Alt").is_err());

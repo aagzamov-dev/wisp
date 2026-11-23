@@ -16,6 +16,7 @@ use windows::{
 #[derive(Debug, Clone, PartialEq)]
 pub struct Window {
     pub hwnd: isize,
+    pub pid: u32,
     pub title: String,
     /// The program's path, for its icon. Empty if Windows does not tell.
     pub exe: String,
@@ -65,6 +66,7 @@ unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
         }
         windows.push(Window {
             hwnd: hwnd.0 as isize,
+            pid,
             title: String::from_utf16_lossy(&title[..len as usize]),
             exe: process_path(pid),
         });

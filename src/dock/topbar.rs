@@ -139,6 +139,18 @@ impl Preferences {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PointerTarget {
+    hit: Hit,
+    tray_key: Option<tray_host::Key>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrayRightPress {
+    Icon(HWND, tray_host::Key),
+    Chevron,
+}
+
 struct TrayDrag {
     key: tray_host::Key,
     gesture: model::DragGesture,
@@ -239,7 +251,8 @@ struct BarState {
     flyout_closing: bool,
     flyout_base: RECT,
     hover: Option<Hit>,
-    down: Option<Hit>,
+    down: Option<PointerTarget>,
+    tray_right_press: Option<TrayRightPress>,
     focused: Option<Hit>,
     shown: Vec<tray::Shown>,
     inline: Vec<usize>,
@@ -259,6 +272,7 @@ struct BarState {
     pending_panel: Option<(u64, sound::OpenRequest)>,
     actions: ActionQueue,
     tray_menu: Option<(u32, Instant)>,
+    native_menu_open: bool,
     last_click: Option<(tray_host::Key, Instant)>,
     fullscreen_at: Option<Instant>,
     last_request: Instant,
@@ -313,6 +327,7 @@ impl Bar {
             flyout_base: RECT::default(),
             hover: None,
             down: None,
+            tray_right_press: None,
             focused: None,
             shown: Vec::new(),
             inline: Vec::new(),
@@ -337,6 +352,7 @@ impl Bar {
             pending_panel: None,
             actions: ActionQueue::default(),
             tray_menu: None,
+            native_menu_open: false,
             last_click: None,
             fullscreen_at: None,
             last_request: Instant::now() - Duration::from_secs(2),
@@ -671,6 +687,10 @@ impl BarState {
             let _ = unsafe { PostMessageW(Some(self.owner), REFRESH, WPARAM(self.hwnd.0 as usize), LPARAM(0)) };
         }
     }
+    fn surface_order(&self) -> (Option<HWND>, SET_WINDOW_POS_FLAGS) {
+        let order = super::dock_menu_order(self.native_menu_open, self.tray_menu.is_some());
+        ((order != SWP_NOZORDER).then_some(HWND_TOPMOST), SWP_NOACTIVATE | order)
+    }
     fn place(&mut self) {
         let Some(info) = monitor_info(self.monitor) else { return };
         let reserved_top = self
@@ -700,14 +720,15 @@ impl BarState {
                 right: info.rcMonitor.right,
                 bottom: reserved_top + h,
             };
+            let (order, flags) = self.surface_order();
             let _ = SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
+                order,
                 self.rect.left,
                 self.rect.top,
                 self.rect.right - self.rect.left,
                 h,
-                SWP_NOACTIVATE,
+                flags,
             );
             self.place_island();
         }
@@ -729,7 +750,8 @@ impl BarState {
         self.island_prepared = false;
         self.island_geometry = Some(geometry);
         unsafe {
-            let _ = SetWindowPos(self.island, Some(HWND_TOPMOST), x, y, width, height, SWP_NOACTIVATE);
+            let (order, flags) = self.surface_order();
+            let _ = SetWindowPos(self.island, order, x, y, width, height, flags);
         }
         self.sync_panel_opener();
     }
@@ -900,7 +922,8 @@ impl BarState {
                 self.reveal.value,
             );
         let interaction_changed = interaction_before != (self.hover_level.value, self.press_level.value);
-        let (bar_feedback, island_feedback) = model::interaction_surfaces(self.hover.or(self.down));
+        let (bar_feedback, island_feedback) =
+            model::interaction_surfaces(self.hover.or(self.down.map(|target| target.hit)));
         if (island_changed || interaction_changed && island_feedback)
             && let Err(error) = self.present_island()
         {
@@ -913,6 +936,7 @@ impl BarState {
         }
     }
     fn poll(&mut self) {
+        self.poll_tray_menu();
         let reserved = self
             .data
             .topbar_strips
@@ -941,7 +965,6 @@ impl BarState {
                     self.close_panel();
                     self.close_flyout();
                     self.cancel_drag();
-                    self.down = None;
                 }
                 unsafe {
                     let _ = ShowWindow(self.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE });
@@ -961,27 +984,43 @@ impl BarState {
         }
         self.sync_tray();
         self.media_state();
-        if let Some((thread, at)) = self.tray_menu {
-            let mut info = GUITHREADINFO {
-                cbSize: size_of::<GUITHREADINFO>() as u32,
-                ..Default::default()
-            };
-            let menu = unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok() && info.flags.0 & 0x1C != 0;
-            if !menu && at.elapsed() > Duration::from_millis(500) {
-                self.tray_menu = None;
-                unsafe {
-                    let _ = SetWindowPos(
-                        self.hwnd,
-                        Some(HWND_TOPMOST),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
-            }
+    }
+    fn poll_tray_menu(&mut self) {
+        if self.native_menu_open {
+            return;
         }
+        let Some((thread, started)) = self.tray_menu else {
+            return;
+        };
+        if started.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        let mut info = GUITHREADINFO {
+            cbSize: size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        let menu_flags = GUI_INMENUMODE | GUI_SYSTEMMENUMODE | GUI_POPUPMENUMODE;
+        if unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+            && (info.flags.0 & menu_flags.0 != 0 || !info.hwndCapture.is_invalid())
+        {
+            return;
+        }
+        self.tray_menu = None;
+        self.set_tray_order(HWND_TOPMOST);
+    }
+    fn set_tray_order(&self, order: HWND) {
+        // The island, overflow and their material belong to this window's owner group.
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                Some(order),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+        };
     }
     fn sync_tray(&mut self) {
         let icons = self
@@ -1091,19 +1130,23 @@ impl BarState {
         let visual = model::surface_visual(self.flyout_progress.value);
         let anchor = (anchor.left + anchor.right) / 2;
         unsafe {
+            let (order, flags) = self.surface_order();
             let _ = SetWindowPos(
                 self.flyout,
-                Some(HWND_TOPMOST),
+                order,
                 x + ((anchor - x) as f32 * (1. - visual.scale)).round() as i32,
                 self.flyout_base.top - (visual.rise * s).round() as i32,
                 (width as f32 * visual.scale).round() as i32,
                 (height as f32 * visual.scale).round() as i32,
-                SWP_NOACTIVATE,
+                flags,
             );
             let _ = InvalidateRect(Some(self.flyout), None, false);
         }
     }
     fn close_flyout(&mut self) {
+        if matches!(self.tray_right_press, Some(TrayRightPress::Icon(window, _)) if window == self.flyout) {
+            self.tray_right_press = None;
+        }
         self.popup_prepared = false;
         self.flyout_open = false;
         self.flyout_closing = false;
@@ -1122,6 +1165,9 @@ impl BarState {
             return;
         }
         self.flyout_closing = true;
+        if matches!(self.tray_right_press, Some(TrayRightPress::Icon(window, _)) if window == self.flyout) {
+            self.tray_right_press = None;
+        }
         self.flyout_press = None;
         self.flyout_progress.retarget_duration(false, 140);
         self.animate();
@@ -1313,7 +1359,6 @@ impl BarState {
                     self.options.material_options,
                 ),
                 open_ms: 180,
-                remote: false,
             },
         ));
     }
@@ -1321,7 +1366,7 @@ impl BarState {
         self.actions.push(command);
         let _ = unsafe { PostMessageW(Some(self.owner), ACTION, WPARAM(self.hwnd.0 as usize), LPARAM(0)) };
     }
-    fn invoke(&mut self, index: usize, action: Action, rect: RECT) {
+    fn invoke(&mut self, source: HWND, index: usize, action: Action, rect: RECT) {
         let Some(shown) = self.shown.get(index) else { return };
         let key = shown.icon.key();
         let action = if matches!(action, Action::Click) {
@@ -1339,19 +1384,10 @@ impl BarState {
         };
         self.data.tray_anchor.set(self.hwnd);
         self.publish();
-        unsafe {
-            let _ = SetForegroundWindow(if self.flyout_open { self.flyout } else { self.hwnd });
-            if matches!(action, Action::Menu) {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_NOTOPMOST),
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                );
-            }
+        // Both mouse buttons can open a native popup over the bar or overflow.
+        let _ = unsafe { SetForegroundWindow(source) };
+        if self.tray_menu.is_none() {
+            self.set_tray_order(HWND_NOTOPMOST);
         }
         match tray_host::invoke(
             &self.shown[index].icon,
@@ -1360,14 +1396,45 @@ impl BarState {
             rect.bottom,
         ) {
             Ok(thread) => self.tray_menu = Some((thread, Instant::now())),
-            Err(error) => eprintln!("Top bar notification icon: {error}"),
+            Err(error) => {
+                if self.tray_menu.is_none() {
+                    self.set_tray_order(HWND_TOPMOST);
+                }
+                eprintln!("Top bar notification icon: {error}");
+            }
+        }
+    }
+    fn pointer_target(&self, hit: Hit) -> Option<PointerTarget> {
+        let tray_key = if let Hit::Tray(slot) = hit {
+            let &index = self.inline.get(slot)?;
+            Some(self.shown.get(index)?.icon.key())
+        } else {
+            None
+        };
+        Some(PointerTarget { hit, tray_key })
+    }
+    fn flyout_slot(&self, lp: LPARAM) -> Option<usize> {
+        let scale = self.scale() * model::surface_visual(self.flyout_progress.value).scale;
+        let x = (lp.0 as i16) as f32 / scale;
+        let y = ((lp.0 >> 16) as i16) as f32 / scale;
+        logic::flyout_hit(x, y, self.overflow.len())
+    }
+    fn tray_target(&self, hwnd: HWND, lp: LPARAM) -> Option<(usize, RECT)> {
+        if hwnd == self.flyout {
+            let slot = self.flyout_slot(lp)?;
+            Some((*self.overflow.get(slot)?, self.flyout_rect(slot)))
+        } else {
+            let hit @ Hit::Tray(slot) = self.hit(hwnd, lp)? else {
+                return None;
+            };
+            Some((*self.inline.get(slot)?, self.screen_rect(hit)))
         }
     }
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::Tray(i) => {
                 if let Some(&index) = self.inline.get(i) {
-                    self.invoke(index, Action::Click, self.screen_rect(hit));
+                    self.invoke(self.hwnd, index, Action::Click, self.screen_rect(hit));
                 }
             }
             Hit::Overflow => self.toggle_flyout(),
@@ -1435,6 +1502,7 @@ impl BarState {
                 gesture: model::DragGesture::new((p.x, p.y)),
             });
             self.suppress_tray_release = true;
+            self.tray_right_press = None;
             self.flyout_press = None;
             self.down = None;
             unsafe {
@@ -1447,6 +1515,7 @@ impl BarState {
         self.drag = None;
         self.drag_target = None;
         self.down = None;
+        self.tray_right_press = None;
         self.flyout_press = None;
         self.press_level.target = 0.;
         let _ = unsafe { KillTimer(Some(self.hwnd), DRAG) };
@@ -1518,7 +1587,7 @@ fn track_metadata_changed(old: Option<&NotchTrack>, new: Option<&NotchTrack>) ->
     old.zip(new)
         .is_some_and(|(old, new)| old.media.source != new.media.source || old.media.title != new.media.title)
 }
-fn dispatch_release(pressed: Option<Hit>, released: Option<Hit>, dispatch: impl FnOnce(Hit)) {
+fn dispatch_release<T: PartialEq>(pressed: Option<T>, released: Option<T>, dispatch: impl FnOnce(T)) {
     if pressed == released
         && let Some(hit) = released
     {
@@ -1611,6 +1680,39 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
         }
         Rc::increment_strong_count(pointer);
         let state = Rc::from_raw(pointer);
+        // TrackPopupMenu runs a modal loop. Leave the material hosts in state
+        // so nested window messages can still draw and retire their surfaces.
+        let chevron_menu = if msg == WM_RBUTTONUP {
+            state.try_borrow_mut().ok().and_then(|mut s| {
+                if s.visible
+                    && !s.native_menu_open
+                    && s.drag.is_none()
+                    && s.hwnd == hwnd
+                    && s.tray_right_press == Some(TrayRightPress::Chevron)
+                    && s.hit(hwnd, lp) == Some(Hit::Overflow)
+                {
+                    s.tray_right_press = None;
+                    s.native_menu_open = true;
+                    s.dismiss_flyout();
+                    Some(s.owner)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(owner) = chevron_menu {
+            super::run_topbar_chevron_menu(hwnd, owner, || {
+                if GetWindowLongPtrW(hwnd, GWLP_USERDATA) != pointer as isize {
+                    return false;
+                }
+                let mut s = state.borrow_mut();
+                s.native_menu_open = false;
+                s.visible
+            });
+            return LRESULT(0);
+        }
         let snapshot = state
             .try_borrow_mut()
             .ok()
@@ -1836,7 +1938,10 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         if msg == WM_MOUSEACTIVATE && hwnd == s.hwnd {
             return LRESULT(MA_NOACTIVATE as isize);
         }
-        if hwnd == s.flyout && s.flyout_closing && matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP) {
+        if hwnd == s.flyout
+            && s.flyout_closing
+            && matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP)
+        {
             return LRESULT(0);
         }
         match msg {
@@ -1935,21 +2040,7 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 if s.drag.is_some() {
                     s.poll_drag();
                 } else if hwnd == s.flyout {
-                    let x = (lp.0 as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    let y = ((lp.0 >> 16) as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    s.flyout_hover = logic::flyout_hit(x, y, s.overflow.len());
+                    s.flyout_hover = s.flyout_slot(lp);
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 } else {
                     let hit = s.hit(hwnd, lp);
@@ -1978,30 +2069,15 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             WM_LBUTTONDOWN => {
                 s.suppress_tray_release = false;
                 if hwnd == s.flyout {
-                    let x = (lp.0 as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    let y = ((lp.0 >> 16) as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    if let Some(i) = logic::flyout_hit(x, y, s.overflow.len()).and_then(|i| s.overflow.get(i).copied())
-                    {
+                    if let Some(i) = s.flyout_slot(lp).and_then(|i| s.overflow.get(i).copied()) {
                         s.flyout_press = s.shown.get(i).map(|shown| shown.icon.key());
                         s.begin_drag(hwnd, i);
                     }
                 } else {
-                    s.down = s.hit(hwnd, lp);
+                    s.down = s.hit(hwnd, lp).and_then(|hit| s.pointer_target(hit));
                     s.press_level.target = 1.;
                     s.animate();
-                    if let Some(Hit::Tray(i)) = s.down
+                    if let Some(Hit::Tray(i)) = s.down.map(|target| target.hit)
                         && let Some(&index) = s.inline.get(i)
                     {
                         s.begin_drag(hwnd, index);
@@ -2014,32 +2090,18 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                     s.suppress_tray_release = false;
                     s.down = None;
                 } else if hwnd == s.flyout {
-                    let x = (lp.0 as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    let y = ((lp.0 >> 16) as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    if let Some(i) = logic::flyout_hit(x, y, s.overflow.len())
+                    if let Some(i) = s.flyout_slot(lp)
                         && let Some(&index) = s.overflow.get(i)
                         && s.flyout_press == s.shown.get(index).map(|shown| shown.icon.key())
                     {
                         let rect = s.flyout_rect(i);
-                        s.invoke(index, Action::Click, rect);
+                        s.invoke(hwnd, index, Action::Click, rect);
                     }
                     s.flyout_press = None;
                 } else {
-                    let hit = s.hit(hwnd, lp);
+                    let released = s.hit(hwnd, lp).and_then(|hit| s.pointer_target(hit));
                     let pressed = s.down.take();
-                    dispatch_release(pressed, hit, |hit| s.click(hit));
+                    dispatch_release(pressed, released, |target| s.click(target.hit));
                 }
                 s.press_level.target = 0.;
                 s.animate();
@@ -2051,33 +2113,23 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 s.press_level.target = 0.;
                 s.animate();
             }
+            WM_RBUTTONDOWN => {
+                s.tray_right_press = if hwnd == s.hwnd && s.hit(hwnd, lp) == Some(Hit::Overflow) {
+                    Some(TrayRightPress::Chevron)
+                } else {
+                    s.tray_target(hwnd, lp)
+                        .and_then(|(index, _)| s.shown.get(index))
+                        .map(|shown| TrayRightPress::Icon(hwnd, shown.icon.key()))
+                };
+            }
             WM_RBUTTONUP => {
-                if hwnd == s.flyout {
-                    let x = (lp.0 as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    let y = ((lp.0 >> 16) as i16) as f32
-                        / s.scale()
-                        / if hwnd == s.flyout {
-                            model::surface_visual(s.flyout_progress.value).scale
-                        } else {
-                            1.
-                        };
-                    if let Some(i) = logic::flyout_hit(x, y, s.overflow.len())
-                        && let Some(&index) = s.overflow.get(i)
-                    {
-                        let r = s.flyout_rect(i);
-                        s.invoke(index, Action::Menu, r);
-                    }
-                } else if let Some(Hit::Tray(i)) = s.hit(hwnd, lp)
-                    && let Some(&index) = s.inline.get(i)
+                let pressed = s.tray_right_press.take();
+                if s.drag.is_none()
+                    && let Some((index, rect)) = s.tray_target(hwnd, lp)
+                    && let Some(shown) = s.shown.get(index)
+                    && pressed == Some(TrayRightPress::Icon(hwnd, shown.icon.key()))
                 {
-                    let r = s.screen_rect(Hit::Tray(i));
-                    s.invoke(index, Action::Menu, r);
+                    s.invoke(hwnd, index, Action::Menu, rect);
                 }
             }
             WM_MOUSEWHEEL => {
@@ -2175,7 +2227,6 @@ mod tests {
             (old.opacity, old.island_opacity, old.island_blur),
             (new.opacity, new.island_opacity, new.island_blur)
         );
-        assert!(Options::from_config(&config.for_remote(false)) == new);
     }
 
     #[test]
@@ -2311,6 +2362,22 @@ mod overflow_tests {
         dispatch_release(layout.hit(110., 14.), None, &mut click);
         assert!(!open);
         assert_eq!((paints, shows), (1, 1));
+    }
+    #[test]
+    fn inline_tray_release_rejects_replacement_in_same_slot() {
+        let pressed = PointerTarget {
+            hit: Hit::Tray(0),
+            tray_key: Some(tray_host::Key::Window { hwnd: 100, uid: 1 }),
+        };
+        let released = PointerTarget {
+            tray_key: Some(tray_host::Key::Window { hwnd: 200, uid: 1 }),
+            ..pressed
+        };
+        let mut dispatched = false;
+        dispatch_release(Some(pressed), Some(released), |_| dispatched = true);
+        assert!(!dispatched);
+        dispatch_release(Some(pressed), Some(pressed), |_| dispatched = true);
+        assert!(dispatched);
     }
     #[test]
     fn first_frame_precedes_visibility_and_failure_does_not_open() {

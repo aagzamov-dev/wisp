@@ -294,7 +294,6 @@ pub struct OpenRequest {
     pub renderer: Renderer,
     pub material: (bool, crate::config::Backdrop, String, crate::theme::MaterialOptions),
     pub open_ms: u32,
-    pub remote: bool,
 }
 impl OpenRequest {
     pub fn open(self) -> Result<HWND> {
@@ -305,7 +304,6 @@ impl OpenRequest {
             self.renderer,
             (self.material.0, self.material.1, &self.material.2, self.material.3),
             self.open_ms,
-            self.remote,
         )
     }
 }
@@ -466,8 +464,6 @@ struct Panel {
     scroll: f32,
     focus: Option<usize>,
     dragging: Option<(usize, u32)>,
-    remote: bool,
-    remote_motion_ms: u32,
     page_fade_ms: u32,
     page_fade: Option<Instant>,
     surface: Option<SurfaceMotion>,
@@ -1711,8 +1707,7 @@ impl Panel {
         self.foreground_prepared = false;
         self.sync_input_bounds(hwnd);
         let max_scroll = self.max_scroll();
-        let remote_alpha = self.remote.then(|| self.remote_alpha());
-        let page_opacity = self.page_fade.filter(|_| !self.remote).map_or(1., |start| {
+        let page_opacity = self.page_fade.map_or(1., |start| {
             let t = (start.elapsed().as_secs_f32() * 1000. / self.page_fade_ms.max(1) as f32).min(1.);
             0.55 + 0.45 * crate::animation::ease(t)
         });
@@ -1730,36 +1725,10 @@ impl Panel {
                 self.surface.as_ref().map_or(1., SurfaceMotion::scale),
                 self.surface.as_ref().map_or(1., |s| s.progress.value.clamp(0., 1.)),
             ),
-            remote_alpha,
         )?;
         self.frame_presented = true;
         self.foreground_prepared = true;
-        if self.remote {
-            // A direct dirty-frame refresh replaces the pending paint as well.
-            unsafe {
-                let _ = ValidateRect(Some(hwnd), None);
-            }
-        }
         Ok(())
-    }
-    fn remote_alpha(&self) -> u8 {
-        self.page_fade.map_or(255, |start| {
-            super::RemotePopupFade::alpha_at(start.elapsed(), self.page_fade_ms)
-        })
-    }
-    fn present_remote_tick(&mut self, hwnd: HWND) -> Result<()> {
-        self.foreground_prepared = false;
-        if !unsafe { GetUpdateRect(hwnd, None, false) }.as_bool()
-            && self.renderer.cached_popup_matches(hwnd, self.dpi)?
-        {
-            self.renderer
-                .present_cached_popup(hwnd, self.dpi, self.remote_alpha())?;
-            self.frame_presented = true;
-            self.foreground_prepared = true;
-            Ok(())
-        } else {
-            self.present(hwnd)
-        }
     }
 
     fn max_scroll(&self) -> f32 {
@@ -1771,21 +1740,10 @@ impl Panel {
             Click::RefreshNetworks => Some(Action::Hardware(control::Request::Networks)),
             Click::Page(page) => {
                 self.page = page;
-                let ms = if self.remote {
-                    self.remote_motion_ms.min(105)
-                } else {
-                    105
-                };
-                let interval = if self.remote {
-                    super::RemotePopupFade::INTERVAL
-                } else {
-                    15
-                };
-                if ms != 0
-                    && super::client_animations_enabled()
-                    && unsafe { SetTimer(Some(hwnd), PAGE_FADE, interval, None) } != 0
+                if super::client_animations_enabled()
+                    && unsafe { SetTimer(Some(hwnd), PAGE_FADE, crate::animation::LOCAL_INTERVAL, None) } != 0
                 {
-                    self.page_fade_ms = ms;
+                    self.page_fade_ms = 105;
                     self.page_fade = Some(Instant::now());
                 }
                 self.scroll = 0.;
@@ -1874,15 +1832,7 @@ impl Panel {
         if let Some(surface) = &mut self.surface {
             surface.restart(Instant::now());
         }
-        if unsafe {
-            SetTimer(
-                Some(hwnd),
-                SURFACE_MOTION,
-                crate::animation::interval(self.remote),
-                None,
-            )
-        } == 0
-        {
+        if unsafe { SetTimer(Some(hwnd), SURFACE_MOTION, crate::animation::LOCAL_INTERVAL, None) } == 0 {
             if let Some(surface) = &mut self.surface {
                 surface.settle();
             }
@@ -2006,7 +1956,6 @@ pub fn open_at(
     renderer: Renderer,
     material: (bool, crate::config::Backdrop, &str, crate::theme::MaterialOptions),
     open_ms: u32,
-    remote: bool,
 ) -> Result<HWND> {
     let opened_at = Instant::now();
     let Placement {
@@ -2089,9 +2038,7 @@ pub fn open_at(
             scroll: 0.,
             focus: None,
             dragging: None,
-            remote,
-            remote_motion_ms: open_ms.min(120),
-            page_fade_ms: if remote { open_ms.min(120) } else { open_ms },
+            page_fade_ms: open_ms,
             page_fade: None,
             surface: None,
             surface_running: false,
@@ -2188,12 +2135,7 @@ pub fn open_at(
         if open_ms != 0
             && !below
             && super::client_animations_enabled()
-            && SetTimer(
-                Some(hwnd),
-                PAGE_FADE,
-                if remote { super::RemotePopupFade::INTERVAL } else { 15 },
-                None,
-            ) != 0
+            && SetTimer(Some(hwnd), PAGE_FADE, crate::animation::LOCAL_INTERVAL, None) != 0
             && let Some(cell) = panel(hwnd)
         {
             cell.borrow_mut().page_fade = Some(Instant::now());
@@ -2333,11 +2275,7 @@ fn material_effect(hwnd: HWND, present: bool) -> bool {
     let Some(id) = identity(hwnd) else { return true };
     let (material, revision, dpi, opacity, radius) = {
         let Ok(mut p) = cell.try_borrow_mut() else { return true };
-        let opacity = if p.remote {
-            p.remote_alpha() as f32 / 255.
-        } else {
-            p.surface.as_ref().map_or(1., |s| s.progress.value.clamp(0., 1.))
-        };
+        let opacity = p.surface.as_ref().map_or(1., |s| s.progress.value.clamp(0., 1.));
         let radius = 18. * p.surface.as_ref().map_or(1., SurfaceMotion::scale);
         (p.material.take(), p.material_revision, p.dpi, opacity, radius)
     };
@@ -2653,14 +2591,7 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     p.page_fade = None;
                     let _ = KillTimer(Some(hwnd), PAGE_FADE);
                 }
-                if p.remote {
-                    if let Err(error) = p.present_remote_tick(hwnd) {
-                        crate::logging::event("controls.remote.present.failed", format_args!("error={error}"));
-                        request_close(hwnd, true);
-                    }
-                } else {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             WM_TIMER if wp.0 == SURFACE_MOTION => {
                 let mut active = false;
@@ -2914,8 +2845,6 @@ fn qa_panel(entry: Entry, width: f32) -> windows::core::Result<Panel> {
         scroll: 0.,
         focus: None,
         dragging: None,
-        remote: false,
-        remote_motion_ms: 0,
         page_fade_ms: 0,
         page_fade: None,
         surface: None,

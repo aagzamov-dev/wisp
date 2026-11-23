@@ -63,7 +63,7 @@ struct Runtime {
     _apartment: Apartment,
 }
 thread_local! {
-    // Kept for the UI-thread lifetime, even when the last island is disabled.
+    // Kept until shell teardown, even when the last island is disabled.
     // A compositor failure must not create a second dispatcher on the next try.
     static RUNTIME: RefCell<Option<Rc<Runtime>>> = const { RefCell::new(None) };
     static SHUTTING_DOWN: Cell<bool> = const { Cell::new(false) };
@@ -134,8 +134,11 @@ impl Drop for Runtime {
 /// the UI STA and OLE still exist. Current-thread queues require a message pump
 /// during shutdown; waiting with IAsyncAction::join here would deadlock.
 pub(crate) fn shutdown_current_thread() -> Result<()> {
-    SHUTTING_DOWN.set(true);
+    if SHUTTING_DOWN.replace(true) {
+        return Err(Error::from_hresult(E_UNEXPECTED));
+    }
     let Some(shared) = RUNTIME.with(|slot| slot.borrow_mut().take()) else {
+        SHUTTING_DOWN.set(false);
         return Ok(());
     };
     let mut runtime = match Rc::try_unwrap(shared) {
@@ -147,6 +150,8 @@ pub(crate) fn shutdown_current_thread() -> Result<()> {
     };
     runtime.compositor.get_mut().take();
     let Some(controller) = runtime.controller.take() else {
+        drop(runtime);
+        SHUTTING_DOWN.set(false);
         return Ok(());
     };
     let mut terminal = false;
@@ -170,7 +175,7 @@ pub(crate) fn shutdown_current_thread() -> Result<()> {
                 }
             },
             || {
-                // Exit-only wait also observes completion that posts no Win32
+                // This wait also observes completion that posts no Win32
                 // message. No timer or same-thread async join is introduced.
                 let waited = unsafe { MsgWaitForMultipleObjectsEx(None, 50, QS_ALLINPUT, MWMO_INPUTAVAILABLE) };
                 if waited == WAIT_FAILED {
@@ -189,10 +194,13 @@ pub(crate) fn shutdown_current_thread() -> Result<()> {
         terminal = true;
         action.GetResults()
     })();
-    if result.is_err() && !terminal {
-        // Preserve resources for the remaining thread lifetime on an unknown
-        // native failure. This is not confirmation that a pending queue drained;
-        // the caller reports the error and TLS teardown is only a fallback.
+    if terminal {
+        drop(controller);
+        drop(runtime);
+        SHUTTING_DOWN.set(false);
+    } else {
+        // The queue may still be draining. Retain it and keep new hosts
+        // blocked for the remaining thread lifetime.
         runtime.controller = Some(controller);
         RUNTIME.with(|slot| *slot.borrow_mut() = Some(Rc::new(runtime)));
     }
@@ -572,6 +580,23 @@ mod tests {
             "native visibility wins over a cached-hidden companion"
         );
         assert!(!state.hide(false));
+    }
+
+    #[test]
+    fn shutdown_without_a_runtime_allows_later_reinitialization() {
+        assert!(RUNTIME.with(|slot| slot.borrow().is_none()));
+        assert!(shutdown_current_thread().is_ok());
+        assert!(!SHUTTING_DOWN.get());
+        assert!(shutdown_current_thread().is_ok());
+        assert!(!SHUTTING_DOWN.get());
+    }
+
+    #[test]
+    fn reentrant_shutdown_keeps_host_creation_blocked() {
+        SHUTTING_DOWN.set(true);
+        assert!(shutdown_current_thread().is_err());
+        assert!(Runtime::acquire().is_err());
+        SHUTTING_DOWN.set(false);
     }
 
     #[test]

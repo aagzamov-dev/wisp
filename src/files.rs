@@ -11,15 +11,15 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use windows::Win32::Foundation::{E_FAIL, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::E_FAIL;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Search::*;
 use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{GUID, HSTRING, IUnknown, Interface, Result, w};
 
 use crate::indexer::{self, IconPixels};
 use crate::search::NameMatcher;
+use crate::worker::WorkerLifetime;
 
 /// The index has no constant for this OLE DB dialect GUID in the `windows` crate.
 const DBGUID_DEFAULT: GUID = GUID::from_u128(0xc8b521fb_5cf3_11ce_ade5_00aa0044773d);
@@ -65,16 +65,17 @@ pub struct FileSearch {
 
 impl FileSearch {
     /// Starts the worker. After each result is sent, it posts `notify_msg` to `hwnd`.
-    pub fn spawn(hwnd: HWND, notify_msg: u32, results: Sender<FileResults>, icon_size: i32) -> FileSearch {
+    pub fn spawn(
+        lifetime: &WorkerLifetime,
+        notify_msg: u32,
+        results: Sender<FileResults>,
+        icon_size: i32,
+    ) -> FileSearch {
         let (requests, rx) = channel();
-        let hwnd = hwnd.0 as isize;
+        let lifetime = lifetime.clone();
         std::thread::Builder::new()
             .name("file search".into())
-            .spawn(move || {
-                worker(rx, results, icon_size, move || unsafe {
-                    let _ = PostMessageW(Some(HWND(hwnd as _)), notify_msg, WPARAM(0), LPARAM(0));
-                })
-            })
+            .spawn(move || worker(rx, results, icon_size, &lifetime, notify_msg))
             .expect("could not start file search thread");
         FileSearch { requests }
     }
@@ -89,7 +90,13 @@ impl FileSearch {
     }
 }
 
-fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: i32, notify: impl Fn()) {
+fn worker(
+    requests: Receiver<Request>,
+    results: Sender<FileResults>,
+    icon_size: i32,
+    lifetime: &WorkerLifetime,
+    notify_msg: u32,
+) {
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }
@@ -100,7 +107,7 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
     let mut icons_sent = HashSet::new();
 
     let mut next = requests.recv().ok();
-    while let Some(mut request) = next.take() {
+    while let Some(mut request) = next.take().filter(|_| lifetime.running()) {
         // Only the latest query matters.
         loop {
             match requests.try_recv() {
@@ -120,6 +127,9 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
             }
         }
 
+        if !lifetime.running() {
+            return;
+        }
         let rows = match &index {
             Some(ix) => unsafe { ix.query(&request.query) }.unwrap_or_else(|e| {
                 // COM error descriptions can echo SQL or the user's query.
@@ -130,6 +140,9 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
             }),
             None => Vec::new(),
         };
+        if !lifetime.running() {
+            return;
+        }
         let hits = rank(rows, &request, &profile, &mut matcher);
 
         // Skip icon loading and sending if a newer query is already waiting.
@@ -155,10 +168,13 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
         if sent.is_err() {
             return;
         }
-        notify();
+        lifetime.notify(notify_msg);
 
         let mut icons = Vec::new();
         for (key, path) in missing {
+            if !lifetime.running() {
+                return;
+            }
             if icons_sent.contains(&key) {
                 continue;
             }
@@ -176,7 +192,7 @@ fn worker(requests: Receiver<Request>, results: Sender<FileResults>, icon_size: 
             if sent.is_err() {
                 return;
             }
-            notify();
+            lifetime.notify(notify_msg);
         }
         next = requests.recv().ok();
     }
@@ -434,7 +450,8 @@ mod tests {
     #[ignore]
     fn searches_the_windows_index() {
         let (tx, rx) = channel();
-        let search = FileSearch::spawn(HWND::default(), 0, tx, 32);
+        let lifetime = WorkerLifetime::new(windows::Win32::Foundation::HWND::default());
+        let search = FileSearch::spawn(&lifetime, 0, tx, 32);
         let exclude: Arc<[String]> = Arc::from(crate::config::Config::default().file_search_exclude);
         for query in ["readme", "zzqx-no-such-file-qxzz"] {
             let started = Instant::now();

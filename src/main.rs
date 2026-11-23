@@ -36,6 +36,7 @@ mod theme;
 mod tray;
 mod tray_host;
 mod util;
+mod worker;
 
 fn main() {
     let watchdog = std::env::args_os().any(|argument| argument == "--taskbar-watchdog");
