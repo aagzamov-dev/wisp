@@ -8,8 +8,14 @@ on:
 jobs:
   check:
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       # rust-toolchain.toml selects the Rust version.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -18,3 +24,34 @@ jobs:
       # Nightly names and the perf-trace hooks compile only with these features.
       - run: cargo clippy --workspace --all-targets --features wisp/nightly,wisp-settings/nightly,wisp/perf-trace -- -D warnings
       - run: cargo test --workspace
+      - run: cargo build --locked --release --workspace
+        env:
+          WISP_RELEASE_REPOSITORY: aagzamov-dev/wisp
+      - name: Package
+        shell: pwsh
+        run: ./scripts/package-release.ps1
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: wisp-candidate-${{ github.run_attempt }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  installer:
+    needs: check
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Test packages
+        shell: pwsh
+        run: ./scripts/test-installer.ps1

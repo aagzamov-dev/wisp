@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A dock and a launcher for Windows.</b><br>
-  Replaces the taskbar. One ~1.5 MB executable.
+  Replaces the taskbar. One Windows installer.
 </p>
 
 <p align="center">
@@ -26,11 +26,11 @@ It is written in Rust with Win32 and Direct2D. It needs no .NET, web view or Pow
 
 ## Install
 
-1. Download the zip from the [latest release](https://github.com/aagzamov-dev/wisp/releases/latest).
-2. Extract it to `%LOCALAPPDATA%\Programs\Wisp`.
-3. Run `wisp.exe`. The settings app opens and sets your shortcut and **Start with Windows**.
+1. Download **WispSetup.exe** from the [latest release](https://github.com/aagzamov-dev/wisp/releases/latest).
+2. Run Setup as your Windows user. It installs Wisp and Wisp Settings together in `%LOCALAPPDATA%\Programs\Wisp` by default.
+3. Open **Wisp** from the Start menu. Open **Wisp Settings** to configure your shortcut and **Start with Windows**.
 
-To upgrade from a build without an updater, quit Wisp and Settings, then replace both executables with the ones in the new release ZIP. Keep them together in a writable local folder within your Windows user folder, such as `%LOCALAPPDATA%\Programs\Wisp`. Run Wisp with your regular user permissions to install updates from Settings.
+If you installed an older ZIP manually, quit Wisp and Settings, then run Setup in the same folder. This adds the Start menu shortcuts and the Installed Apps entry. Setup keeps settings and pins in `%APPDATA%\wisp`. The portable ZIP is also available on the release page.
 
 In a release build, open **Settings → About → Check for updates**. When a newer release is available, choose **Install and restart**. **Install updates automatically** is off by default. Enable it to let Wisp check daily while it is active and Settings is closed. Updates use stable GitHub Releases from this fork, verify both executables, and restart Wisp if it was running. Your settings and pins are stored separately.
 
@@ -38,7 +38,7 @@ In a release build, open **Settings → About → Check for updates**. When a ne
 > PowerToys Run also uses <kbd>Alt</kbd>+<kbd>Space</kbd>. Turn it off, or change Wisp's shortcut.
 
 > [!NOTE]
-> Wisp is not code-signed. If SmartScreen warns you, select **More info → Run anyway**.
+> Wisp's Windows downloads are unsigned. Check the download against the SHA-256 checksum on the release page.
 
 ## Dock
 

@@ -560,24 +560,51 @@ mod tests {
     const SHA256_XYZ: &str = "sha256:3608bca1e44ea6c4d268eb6db02260269892c0b42b86bbf1e77a6fa16c3c9282";
 
     fn metadata() -> Value {
+        metadata_for("v0.10.0")
+    }
+
+    fn metadata_for(tag: &str) -> Value {
         json!({
             "draft": false,
             "prerelease": false,
-            "tag_name": "v0.10.0",
+            "tag_name": tag,
             "assets": (["wisp", "wisp-settings"].into_iter()
                 .zip([SHA256_ABC, SHA256_XYZ])
                 .map(|(stem, digest)| {
-                    let name = format!("{stem}-v0.10.0-x86_64.exe");
+                    let name = format!("{stem}-{tag}-x86_64.exe");
                     json!({
                         "name": name,
                         "state": "uploaded",
-                        "browser_download_url": format!("https://github.com/aagzamov-dev/wisp/releases/download/v0.10.0/{name}"),
+                        "browser_download_url": format!("https://github.com/aagzamov-dev/wisp/releases/download/{tag}/{name}"),
                         "size": 3,
                         "digest": digest,
                     })
                 })
                 .collect::<Vec<_>>())
         })
+    }
+
+    #[test]
+    fn updates_from_0_7_0_when_release_also_has_setup() {
+        let mut document = metadata_for("v1.0.0");
+        document["assets"].as_array_mut().unwrap().insert(
+            0,
+            json!({
+                "name": "WispSetup.exe",
+                "state": "uploaded",
+                "browser_download_url": "https://github.com/aagzamov-dev/wisp/releases/download/v1.0.0/WispSetup.exe",
+                "size": 12,
+                "digest": SHA256_ABC,
+            }),
+        );
+
+        let release = parse_release(&document, "0.7.0").unwrap().unwrap();
+        assert_eq!(release.version, "1.0.0");
+        assert!(release.assets[0].url.ends_with("/wisp-v1.0.0-x86_64.exe"));
+        assert!(release.assets[1].url.ends_with("/wisp-settings-v1.0.0-x86_64.exe"));
+        let [wisp, settings] = release.fingerprints();
+        assert_eq!(wisp.digest, parse_digest(SHA256_ABC).unwrap());
+        assert_eq!(settings.digest, parse_digest(SHA256_XYZ).unwrap());
     }
 
     #[test]

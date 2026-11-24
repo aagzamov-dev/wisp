@@ -58,7 +58,7 @@ To release:
    git push https://github.com/aagzamov-dev/wisp.git refs/tags/v0.6.0
    ```
 
-4. GitHub Actions tests and builds the exact tag, assembles the ZIP and both executable assets, and publishes the release with its changelog notes. The workflow builds the update feed into trusted releases of this fork. Users install the first updater-enabled version from the ZIP, and later stable releases appear in **Settings → About**.
+4. GitHub Actions tests and builds the exact tag, verifies Setup, and publishes the installer, ZIP, updater executables, and checksums with the changelog notes. See [RELEASING.md](RELEASING.md) for validation and post-publish checks.
 
 Never move or delete a published tag. If a release is broken, ship a patch release.
 

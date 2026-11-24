@@ -4,6 +4,11 @@ User-facing changes in each release. Each release on GitHub lists these notes an
 
 ## Unreleased
 
+## 1.0.0 - 2026-11-24
+
+- Add a per-user Windows Setup with a Start menu entry and an uninstall option in Windows Settings.
+- Keep using **Settings → About** to check for and install Wisp updates.
+
 ## 0.7.0 - 2026-11-24
 
 - Add Soft Rise, Bottom Reveal and Soft Scale dock animations.
