@@ -9,6 +9,8 @@ mod calc;
 mod commands;
 #[path = "../src/config.rs"]
 mod config;
+#[path = "../src/dock_gradient.rs"]
+mod dock_gradient;
 #[path = "../src/remote_mode.rs"]
 mod remote_mode;
 #[path = "../src/remote_session.rs"]

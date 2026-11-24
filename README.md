@@ -101,7 +101,7 @@ Enable **Wisp Settings → Top bar → Enable top bar** for a transparent deskto
 
 Set its height from 24–48 Windows-scaled pixels, adjust the bar's transparency independently of the darker island tint, and choose the main display, all displays, or individual displays. Enable **Blur behind island** for an optional Windows 11 native backdrop beneath the island. It defaults off; unsupported systems, high contrast, and disabled Windows transparency retain the existing tint. Windows controls the native material and can limit it through power policies. Selected displays keep their choices while disconnected. Each selected display reserves a top band for maximized windows and hides its bar during fullscreen. Windows transparency and reduced-motion preferences are respected.
 
-The idle island shows the weekday, date, month and clock in your Windows locale. During music playback it shows artwork, the track name, previous, pause/play, next and the clock. Paused music keeps the controls available for 12 seconds before returning to the date. On narrow displays the track title and artwork yield space to the playback buttons. Click the top bar clock to toggle Wisp's calendar below the island. Wi-Fi and sound open their own menus; Control Center keeps the complete controls.
+The idle island shows the weekday, date, month and clock in your Windows locale. During playback, four small bars beside the artwork react to sound playing through the default Windows output and use a tint from the cover when it is readable. They rest when the output is silent or unavailable and stay still while paused or when Windows reduces motion. The track name appears for five seconds when a song first appears or changes, then the island shrinks while keeping the previous, pause/play, next and clock controls. On narrow displays the title and artwork yield space to those controls. Paused music keeps the controls available for 12 seconds before returning to the date. Click the top bar clock to toggle Wisp's calendar below the island. Wi-Fi and sound open their own menus; Control Center keeps the complete controls.
 
 Hold **Ctrl** and drag a tray icon from the bar into its overflow menu to hide it, or from the overflow menu onto the bar to keep it visible. Keep Ctrl held until you release the mouse. **Esc** cancels. Choices are saved locally in `topbar-tray.toml`; icons without a persistent app identity cannot save a custom placement. The standalone music notch is suspended while any top bar is active.
 
@@ -201,7 +201,7 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 | `dock_icon_size` | `24` | App icon size in the dock, 24–40 DIP. The dock's height, spacing and status area scale with it. |
 | `dock_open_ms` | `180` | Dock opening animation time, 0–500 ms. |
 | `dock_close_ms` | `140` | Dock closing animation time, 0–500 ms. |
-| `dock_animation` | `"slide"` | Dock motion in Appearance. Choose Slide, Fade, Rise + Fade, or Scale + Fade. |
+| `dock_animation` | `"slide"` | Dock motion in Appearance. Choose Slide, Fade, Rise + Fade, Scale + Fade, Soft Rise, Bottom Reveal, or Soft Scale. |
 | `hide_taskbar` | `true` | Hides the Windows taskbar while Wisp is active |
 | `pause_on_rdp` | `true` | Pauses Wisp during Remote Desktop and resumes it at the physical console |
 | `position` | `"bottom"` | Compact launcher only: `"bottom"` grows it from the dock; `"center"` opens it in the middle |
@@ -220,6 +220,8 @@ Open **Settings** from Wisp's tray icon, or edit `%APPDATA%\wisp\config.toml`. T
 **Settings → Appearance → Shared material** applies the same material preference to the dock, Start, Controls and other Wisp-owned menus. Existing material values remain supported; Frosted is the display name for `acrylic`. Native Windows and third-party menus keep their system styling. Top bar transparency and island material settings remain independent. Windows accessibility, transparency and power settings, unsupported systems, or Remote Desktop may limit blur; Wisp retains a readable fallback. Native/RDP appearance and performance have not been verified with live desktop testing.
 
 Transparent and Glass expose background transparency and a blur switch. The percentage affects the background; text and icons keep their normal opacity. Glass shares Transparent's rendering recipe with a blurred default. Explicit transparency and blur values carry between these two modes. Clearer backgrounds can reduce text contrast over bright content. Intentionally disabled blur keeps plain transparency, while failed requested effects and system accessibility policy retain the readable fallback. See [material rules](MATERIALS.md) before changing this behavior; the `wisp-materials` skill points to those same instructions.
+
+In **Settings → Appearance**, set **Dock background** to **Gradient** to reveal a preview and theme controls. Choose Midnight Plum, Deep Teal, Ember, or Slate, then edit the start and end colors, direction, and background transparency. Save your changes as a named theme to switch back to it later. The gradient applies to the dock background. Shared material still controls menus and other Wisp surfaces.
 
 Configs from Wisp 0.3 keep the taskbar. To switch, set `dock` and `hide_taskbar` to `true` and `position` to `"bottom"`.
 

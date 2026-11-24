@@ -5,7 +5,7 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
-use crate::util;
+use crate::{dock_gradient::Gradient, util};
 
 /// wisp-settings includes the same file, so both apps create the same config.
 const DEFAULT_CONFIG: &str = include_str!("default-config.toml");
@@ -84,6 +84,30 @@ pub enum DockAnimation {
     Fade,
     RiseFade,
     ScaleFade,
+    SoftRise,
+    BottomReveal,
+    SoftScale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum DockBackground {
+    SharedMaterial,
+    Gradient,
+}
+
+fn deserialize_gradient<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Gradient, D::Error> {
+    #[derive(Deserialize)]
+    struct Fields {
+        start: String,
+        end: String,
+        direction: String,
+        transparency: i64,
+    }
+
+    let fields = Fields::deserialize(deserializer)?;
+    Gradient::parse(&fields.start, &fields.end, &fields.direction, fields.transparency)
+        .map_err(serde::de::Error::custom)
 }
 
 /// Keys missing from the user's file take their value from `config-0.3.toml`,
@@ -110,6 +134,9 @@ pub struct Config {
     #[serde(default)]
     pub backdrop_blur: Option<bool>,
     pub dock: bool,
+    pub(crate) dock_background: DockBackground,
+    #[serde(default, deserialize_with = "deserialize_gradient")]
+    pub(crate) dock_gradient: Gradient,
     pub dock_autohide: bool,
     /// Physical pixels from the monitor bottom, independent of Windows scaling.
     pub dock_reveal_height: u32,
@@ -142,6 +169,10 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn dock_gradient(&self) -> Option<Gradient> {
+        (self.dock_background == DockBackground::Gradient).then_some(self.dock_gradient)
+    }
+
     pub fn material_options(&self) -> crate::theme::MaterialOptions {
         crate::theme::MaterialOptions {
             transparency: self.backdrop_transparency,
@@ -205,6 +236,59 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gradient_is_dock_only_and_uses_shared_material_by_default() {
+        use crate::dock_gradient::{Direction, Gradient};
+
+        assert_eq!(super::Config::default().dock_gradient(), None);
+        assert_eq!(super::Config::parse("backdrop='glass'").unwrap().dock_gradient(), None);
+        let default_gradient = super::Config::parse("dock_background='gradient'").unwrap();
+        assert_eq!(default_gradient.dock_gradient(), Some(Gradient::default()));
+
+        let saved = "backdrop='glass'\ndock_background='gradient'\n[dock_gradient]\nstart='#12343A'\nend='#233F4D'\ndirection='diagonal'\ntransparency=100";
+        let config = super::Config::parse(saved).unwrap();
+        assert_eq!(config.backdrop, super::Backdrop::Glass);
+        assert_eq!(
+            config.dock_gradient(),
+            Some(Gradient {
+                start: [0x12, 0x34, 0x3A],
+                end: [0x23, 0x3F, 0x4D],
+                direction: Direction::Diagonal,
+                transparency: 100,
+            })
+        );
+        for (valid, invalid) in [
+            ("#12343A", "#123"),
+            ("#233F4D", "#233F4Z"),
+            ("diagonal", "sideways"),
+            ("100", "101"),
+            ("100", "-1"),
+        ] {
+            assert!(
+                super::Config::parse(&saved.replace(valid, invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_and_new_dock_animation_keys_parse() {
+        use super::DockAnimation::*;
+
+        for (key, style) in [
+            ("slide", Slide),
+            ("fade", Fade),
+            ("rise-fade", RiseFade),
+            ("scale-fade", ScaleFade),
+            ("soft-rise", SoftRise),
+            ("bottom-reveal", BottomReveal),
+            ("soft-scale", SoftScale),
+        ] {
+            let config = super::Config::parse(&format!("dock_animation='{key}'")).unwrap();
+            assert_eq!(config.dock_animation, style);
+        }
+    }
+
     #[test]
     fn shared_material_options_load_old_and_new_configs() {
         use super::Config;

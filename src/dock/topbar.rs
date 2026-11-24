@@ -4,8 +4,10 @@
 use super::*;
 use crate::commands::{
     Command,
+    audio::Spectrum,
     media::{Control, NotchTrack},
 };
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SPACE};
 #[path = "topbar_model.rs"]
 pub mod model;
@@ -17,6 +19,7 @@ pub const BATTERY_SETTINGS: u32 = WM_APP + 48;
 const TICK: usize = 1;
 const MOTION: usize = 2;
 const DRAG: usize = 3;
+const TITLE_TIMEOUT: usize = 4;
 const SYNC: u32 = WM_APP + 46;
 const MATERIAL: u32 = WM_APP + 49;
 
@@ -236,6 +239,13 @@ struct BarState {
     track: Option<NotchTrack>,
     media_exclusions: Vec<String>,
     outgoing_track: Option<NotchTrack>,
+    title: model::TrackTitle,
+    outgoing_title: bool,
+    artwork_color: Option<[f32; 3]>,
+    equalizer_color: D2D1_COLOR_F,
+    spectrum: Option<Spectrum>,
+    equalizer: [f32; model::EQUALIZER_BAR_COUNT],
+    animations_enabled: bool,
     track_fade: Spring,
     last_playing: Option<Instant>,
     media_leader: bool,
@@ -311,6 +321,13 @@ impl Bar {
             track: None,
             media_exclusions: Vec::new(),
             outgoing_track: None,
+            title: model::TrackTitle::default(),
+            outgoing_title: false,
+            artwork_color: None,
+            equalizer_color: Palette::new(true, true).text,
+            spectrum: None,
+            equalizer: model::EQUALIZER_IDLE,
+            animations_enabled: client_animations_enabled(),
             track_fade: Spring::new(1.),
             last_playing: None,
             media_leader: false,
@@ -496,6 +513,9 @@ impl Bar {
         if s.track.as_ref().is_some_and(excluded) {
             s.track = None;
             s.last_playing = None;
+            s.reset_title(false);
+            s.artwork_color = None;
+            s.update_equalizer_color();
         }
         if s.outgoing_track.as_ref().is_some_and(excluded) {
             s.outgoing_track = None;
@@ -531,6 +551,20 @@ impl Bar {
             s = self.state.borrow_mut();
         }
         let metadata_changed = track_metadata_changed(s.track.as_ref(), track.as_ref());
+        if metadata_changed || s.track.is_some() != track.is_some() {
+            s.outgoing_title = s.title.deadline.is_some_and(|deadline| Instant::now() < deadline);
+            s.reset_title(track.is_some());
+        }
+        let artwork = |track: &NotchTrack| track.artwork.as_ref().map(Arc::as_ptr);
+        if s.track.as_ref().and_then(artwork) != track.as_ref().and_then(artwork) {
+            s.artwork_color = track.as_ref().and_then(|track| {
+                track
+                    .artwork
+                    .as_ref()
+                    .and_then(|pixels| model::artwork_color(&pixels.bgra))
+            });
+            s.update_equalizer_color();
+        }
         if (track.is_none() || metadata_changed) && s.track.is_some() {
             s.outgoing_track = s.track.take();
         }
@@ -545,7 +579,7 @@ impl Bar {
         }
         s.media_state();
         if changed {
-            s.invalidate();
+            s.invalidate_surfaces(false, true);
         }
     }
     pub fn take_action(&self) -> Option<Command> {
@@ -653,6 +687,7 @@ impl BarState {
         self.blur_presented = None;
         self.palette = crate::theme::apply_topbar(self.hwnd, self.options.opacity, false);
         self.island_palette = crate::theme::apply_topbar(self.island, self.options.island_opacity, true);
+        self.update_equalizer_color();
         let dark = match self.options.theme {
             crate::config::Theme::Dark => true,
             crate::config::Theme::Light => false,
@@ -755,25 +790,44 @@ impl BarState {
         }
         self.sync_panel_opener();
     }
+    fn island_width(&self) -> f32 {
+        self.island_geometry
+            .map_or(self.width.value, |(_, _, width, _, _)| width as f32 / self.scale())
+    }
     /// Publish foreground pixels in the same UI callback as geometry updates.
     /// The wrapper synchronizes the retained blur after this borrow is released.
     fn present_island(&mut self) -> Result<()> {
         let reveal = self.reveal.value.clamp(0., 1.);
+        let track = self.track.as_ref().or(self.outgoing_track.as_ref());
+        let playing = self.media_playing();
+        let equalizer = if self.animations_enabled && playing {
+            self.equalizer
+        } else {
+            model::equalizer_bars(playing, None)
+        };
         let result = self.island_renderer.draw_topbar_island(
             self.island,
             render::IslandFrame {
                 dpi: self.dpi,
                 palette: &self.island_palette,
                 status: &self.status,
-                track: self.track.as_ref().or(self.outgoing_track.as_ref()),
+                track,
                 previous_track: if self.track.is_some() {
                     self.outgoing_track.as_ref()
                 } else {
                     None
                 },
                 track_fade: self.track_fade.value,
+                show_title: if self.track.is_some() {
+                    self.title.deadline.is_some()
+                } else {
+                    self.outgoing_title
+                },
+                show_previous_title: self.outgoing_title,
+                equalizer,
+                equalizer_color: self.equalizer_color,
                 mix: self.content.value,
-                width: self.width.value * (0.94 + 0.06 * reveal),
+                width: self.island_width(),
                 reveal,
                 compact: self.compact,
                 date_width: self.date_width,
@@ -790,6 +844,7 @@ impl BarState {
                 let _ = ValidateRect(Some(self.island), None);
             }
         } else {
+            self.stop_spectrum();
             self.blur_presented = None;
         }
         result
@@ -801,24 +856,90 @@ impl BarState {
     fn music(&self) -> bool {
         model::music_visible(self.track.is_some(), self.last_playing.map(|at| at.elapsed()))
     }
-    fn media_state(&mut self) {
-        if self.track.as_ref().is_some_and(|t| t.media.playing) {
-            self.last_playing = Some(Instant::now());
+    fn media_playing(&self) -> bool {
+        self.track.as_ref().is_some_and(|track| track.media.playing)
+    }
+    fn reset_title(&mut self, has_track: bool) {
+        if self.title.deadline.is_some() {
+            let _ = unsafe { KillTimer(Some(self.hwnd), TITLE_TIMEOUT) };
         }
-        self.content.target = if self.music() { 1. } else { 0. };
+        self.title.reset(has_track);
+    }
+    fn update_equalizer_color(&mut self) {
+        let palette = &self.island_palette;
+        self.equalizer_color = palette.text;
+        if let Some([r, g, b]) = self.artwork_color
+            && !crate::theme::high_contrast()
+        {
+            let tint = D2D1_COLOR_F {
+                r: 0.45 * r + 0.55 * palette.text.r,
+                g: 0.45 * g + 0.55 * palette.text.g,
+                b: 0.45 * b + 0.55 * palette.text.b,
+                a: 1.,
+            };
+            let luminance = |color: D2D1_COLOR_F| {
+                let srgb = |x: f32| {
+                    if x <= 0.04045 {
+                        x / 12.92
+                    } else {
+                        ((x + 0.055) / 1.055).powf(2.4)
+                    }
+                };
+                0.2126 * srgb(color.r) + 0.7152 * srgb(color.g) + 0.0722 * srgb(color.b)
+            };
+            let (fg, bg) = (luminance(tint), luminance(palette.background));
+            if (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05) >= 3. {
+                self.equalizer_color = tint;
+            }
+        }
+    }
+    fn media_state(&mut self) {
+        let now = Instant::now();
+        if self.media_playing() {
+            self.last_playing = Some(now);
+        }
+        let music = self.music();
+        if self.title.refresh(now, self.visible && music) {
+            if self.title.deadline.is_some() {
+                let _ = unsafe {
+                    SetTimer(
+                        Some(self.hwnd),
+                        TITLE_TIMEOUT,
+                        model::TITLE_DURATION.as_millis() as u32,
+                        None,
+                    )
+                };
+            } else {
+                let _ = unsafe { KillTimer(Some(self.hwnd), TITLE_TIMEOUT) };
+            }
+            self.invalidate_surfaces(false, true);
+        }
+        self.content.target = if music { 1. } else { 0. };
         let layout = self.layout();
         let side = (layout.inline as f32 * 28. + 40.).max(if layout.battery { 164. } else { 116. });
         let compact = (layout.width - 2. * side - 24.) < 320.;
         let changed_mode = self.compact != compact;
         self.compact = compact;
-        let desired = if self.music() {
-            self.title_width + self.time_width + 180.
+        let desired = if music {
+            model::IslandLayout::music_width(
+                compact,
+                self.time_width,
+                self.track.as_ref().is_some_and(|track| track.artwork.is_some()),
+                self.title.deadline.map(|_| self.title_width),
+            )
         } else {
             self.date_width + self.time_width + 38.
         };
         self.width.target = desired.min((layout.width - 2. * side - 24.).max(208.));
         if changed_mode {
             self.width.settle();
+        }
+        if self.visible && self.animations_enabled && self.media_playing() {
+            if self.island_prepared && self.spectrum.is_none() {
+                self.spectrum = Spectrum::subscribe();
+            }
+        } else {
+            self.stop_spectrum();
         }
         self.animate();
     }
@@ -860,6 +981,20 @@ impl BarState {
         self.present_flyout_motion();
         self.invalidate();
     }
+    fn stop_spectrum(&mut self) {
+        self.spectrum = None;
+        self.equalizer = model::EQUALIZER_IDLE;
+    }
+    fn visible_spectrum(&self) -> Option<&Spectrum> {
+        self.spectrum.as_ref().filter(|_| {
+            self.island_prepared
+                && self.content.value > 0.
+                && model::IslandLayout::new(self.island_width(), self.compact, self.time_width)
+                    .media(false)
+                    .equalizer_left
+                    .is_some()
+        })
+    }
     fn animate(&mut self) {
         if [
             &self.width,
@@ -872,10 +1007,11 @@ impl BarState {
         .iter()
         .all(|s| s.value == s.target && s.velocity == 0.)
             && !self.flyout_progress.active()
+            && self.visible_spectrum().is_none()
         {
             return;
         }
-        if !self.visible || !client_animations_enabled() {
+        if !self.visible || !self.animations_enabled {
             self.settle_motion();
             return;
         }
@@ -885,10 +1021,15 @@ impl BarState {
         self.last_frame = Instant::now();
         self.motion_running = unsafe { SetTimer(Some(self.hwnd), MOTION, crate::animation::LOCAL_INTERVAL, None) } != 0;
         if !self.motion_running {
+            self.stop_spectrum();
             self.settle_motion();
         }
     }
     fn frame(&mut self) {
+        if !self.visible || !self.animations_enabled {
+            self.settle_motion();
+            return;
+        }
         let island_before = (
             self.width.value,
             self.content.value,
@@ -910,6 +1051,12 @@ impl BarState {
         if self.content.value == 0. || self.track.is_some() && self.track_fade.value == 1. {
             self.outgoing_track = None;
         }
+        let mut equalizer_changed = false;
+        if let Some(spectrum) = self.visible_spectrum() {
+            let bars = model::equalizer_bars(true, Some(spectrum.levels()));
+            equalizer_changed = self.equalizer != bars;
+            self.equalizer = bars;
+        }
         self.place_island();
         if self.flyout_open && self.flyout_progress.value != flyout_before {
             self.present_flyout_motion();
@@ -924,13 +1071,13 @@ impl BarState {
         let interaction_changed = interaction_before != (self.hover_level.value, self.press_level.value);
         let (bar_feedback, island_feedback) =
             model::interaction_surfaces(self.hover.or(self.down.map(|target| target.hit)));
-        if (island_changed || interaction_changed && island_feedback)
+        if (island_changed || equalizer_changed || interaction_changed && island_feedback)
             && let Err(error) = self.present_island()
         {
             eprintln!("Top bar island frame: {error}");
         }
         self.invalidate_surfaces(interaction_changed && bar_feedback, false);
-        if !active {
+        if !active && self.visible_spectrum().is_none() {
             self.motion_running = false;
             let _ = unsafe { KillTimer(Some(self.hwnd), MOTION) };
         }
@@ -961,6 +1108,7 @@ impl BarState {
                     self.place();
                     self.animate();
                 } else {
+                    self.stop_spectrum();
                     self.island_prepared = false;
                     self.close_panel();
                     self.close_flyout();
@@ -1475,13 +1623,8 @@ impl BarState {
             if self.music()
                 && y >= 0.
                 && y < self.options.height as f32
-                && let Some(hit) = model::IslandLayout::new(
-                    self.island_geometry
-                        .map_or(self.width.value, |(_, _, w, _, _)| w as f32 / self.scale()),
-                    self.compact,
-                    self.time_width,
-                )
-                .media_hit(x)
+                && let Some(hit) =
+                    model::IslandLayout::new(self.island_width(), self.compact, self.time_width).media_hit(x)
             {
                 return Some(hit);
             }
@@ -1584,8 +1727,11 @@ impl BarState {
 }
 
 fn track_metadata_changed(old: Option<&NotchTrack>, new: Option<&NotchTrack>) -> bool {
-    old.zip(new)
-        .is_some_and(|(old, new)| old.media.source != new.media.source || old.media.title != new.media.title)
+    old.zip(new).is_some_and(|(old, new)| {
+        old.media.source != new.media.source
+            || old.media.title != new.media.title
+            || old.media.artist != new.media.artist
+    })
 }
 fn dispatch_release<T: PartialEq>(pressed: Option<T>, released: Option<T>, dispatch: impl FnOnce(T)) {
     if pressed == released
@@ -1949,6 +2095,7 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
             WM_TIMER if wp.0 == TICK => s.poll(),
             WM_TIMER if wp.0 == MOTION => s.frame(),
             WM_TIMER if wp.0 == DRAG => s.poll_drag(),
+            WM_TIMER if wp.0 == TITLE_TIMEOUT => s.media_state(),
             SYNC => {
                 s.preferences = Preferences::load();
                 s.partition();
@@ -1963,6 +2110,7 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 s.media_state();
             }
             WM_SETTINGCHANGE => {
+                s.animations_enabled = client_animations_enabled();
                 s.material();
                 s.measure_content();
                 s.media_state();
@@ -1973,6 +2121,8 @@ unsafe extern "system" fn proc_inner(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
                 if hwnd == s.island {
                     if let Err(error) = s.present_island() {
                         eprintln!("Top bar island draw: {error}");
+                    } else {
+                        s.animate();
                     }
                     let _ = EndPaint(hwnd, &paint);
                     return LRESULT(0);
@@ -2325,6 +2475,9 @@ mod overflow_tests {
         assert!(!track_metadata_changed(Some(&old), Some(&next)));
         next.media.playing = false;
         assert!(!track_metadata_changed(Some(&old), Some(&next)));
+        next.media.artist = "Different artist".into();
+        assert!(track_metadata_changed(Some(&old), Some(&next)));
+        next.media.artist.clone_from(&old.media.artist);
         next.media.title = "Track B".into();
         assert!(track_metadata_changed(Some(&old), Some(&next)));
     }

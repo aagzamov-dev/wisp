@@ -423,6 +423,7 @@ pub enum Style {
     CurrentRow,
     CompactCard(bool),
     Footer,
+    CalendarSelection,
     CalendarDay {
         today: bool,
         selected: bool,
@@ -557,6 +558,43 @@ impl Panel {
             })
         {
             self.calendar.focused = day;
+        }
+    }
+    fn navigate_calendar(&mut self, key: u16) -> bool {
+        use super::calendar::Action;
+        self.remember_calendar_focus();
+        let month = self.calendar.month;
+        match key {
+            0x25 => self.calendar.move_days(-1),
+            0x27 => self.calendar.move_days(1),
+            0x26 => self.calendar.move_days(-7),
+            0x28 => self.calendar.move_days(7),
+            0x21 => self.calendar.apply(Action::Month(-1)),
+            0x22 => self.calendar.apply(Action::Month(1)),
+            0x24 => {
+                self.calendar.refresh();
+                self.calendar.apply(Action::Today);
+            }
+            _ => return false,
+        }
+        if self.calendar.month != month || key == 0x24 {
+            self.rebuild();
+        }
+        self.focus_calendar_day();
+        true
+    }
+    fn update_calendar_selection(&mut self) {
+        let selection = self.calendar.selected;
+        for element in &mut self.elements {
+            match (&element.click, &mut element.style) {
+                (Some(Click::Calendar(super::calendar::Action::Day(date))), Style::CalendarDay { selected, .. }) => {
+                    *selected = *date == selection;
+                }
+                (_, Style::CalendarSelection) => {
+                    element.title = format!("Selected: {}", super::calendar::long_label(selection));
+                }
+                _ => {}
+            }
         }
     }
     fn ensure_focus_visible(&mut self) {
@@ -1321,7 +1359,7 @@ impl Panel {
                 w: self.width - 44.,
                 h: 34.,
             },
-            Style::Text,
+            Style::CalendarSelection,
             format!("Selected: {}", super::calendar::long_label(self.calendar.selected)),
             "",
             "",
@@ -1780,13 +1818,19 @@ impl Panel {
                 None
             }
             Click::Calendar(action) => {
-                if matches!(action, super::calendar::Action::Today) {
+                use super::calendar::Action;
+                let month = self.calendar.month;
+                let selection = self.calendar.selected;
+                if action == Action::Today {
                     self.calendar.refresh();
                 }
-                let browse = matches!(action, super::calendar::Action::Month(_));
                 self.calendar.apply(action.clone());
-                self.rebuild();
-                if browse {
+                if self.calendar.month != month || action == Action::Today {
+                    self.rebuild();
+                } else if self.calendar.selected != selection {
+                    self.update_calendar_selection();
+                }
+                if matches!(action, Action::Month(_)) {
                     self.focus_calendar_button(&action);
                 } else {
                     self.focus_calendar_day();
@@ -2491,50 +2535,10 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             return LRESULT(0);
         }
         if msg == WM_KEYDOWN && p.page == Page::Calendar {
-            let focused = p.focus.and_then(|i| p.elements.get(i)).and_then(|e| match &e.click {
-                Some(Click::Calendar(super::calendar::Action::Day(day))) => Some(*day),
-                _ => None,
-            });
-            if let Some(day) = focused {
-                p.calendar.focused = day;
+            if wp.0 as u16 == 0x1b {
+                return LRESULT(0);
             }
-
-            let handled = match wp.0 as u16 {
-                0x1b => return LRESULT(0),
-                0x25 => {
-                    p.calendar.move_days(-1);
-                    true
-                }
-                0x27 => {
-                    p.calendar.move_days(1);
-                    true
-                }
-                0x26 => {
-                    p.calendar.move_days(-7);
-                    true
-                }
-                0x28 => {
-                    p.calendar.move_days(7);
-                    true
-                }
-                0x21 => {
-                    p.calendar.apply(super::calendar::Action::Month(-1));
-                    true
-                }
-                0x22 => {
-                    p.calendar.apply(super::calendar::Action::Month(1));
-                    true
-                }
-                0x24 => {
-                    p.calendar.refresh();
-                    p.calendar.apply(super::calendar::Action::Today);
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                p.rebuild();
-                p.focus_calendar_day();
+            if p.navigate_calendar(wp.0 as u16) {
                 p.fit(hwnd);
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 return LRESULT(0);
@@ -2662,7 +2666,11 @@ unsafe fn dispatch(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             WM_MOUSEWHEEL => {
                 if p.dragging.is_none() {
                     let delta = (wp.0 >> 16) as i16 as f32;
-                    p.scroll = (p.scroll - delta * (42. / 120.)).clamp(0., p.max_scroll());
+                    let scroll = (p.scroll - delta * (42. / 120.)).clamp(0., p.max_scroll());
+                    if p.page == Page::Calendar && scroll == p.scroll {
+                        return LRESULT(0);
+                    }
+                    p.scroll = scroll;
                 }
             }
             WM_LBUTTONDOWN => {
@@ -3284,6 +3292,75 @@ mod entry_tests {
         assert_eq!(p.calendar.selected, selected);
         Ok(())
     }
+    #[test]
+    fn calendar_keyboard_keeps_prepared_labels_until_the_month_changes() -> Result<()> {
+        use super::super::calendar::Action;
+        use super::super::calendar_model::Date;
+
+        let mut p = qa_panel(Entry::Calendar, 392.)?;
+        let selected = Date::new(2026, 11, 29).unwrap();
+        p.calendar.apply(Action::Day(selected));
+        p.rebuild();
+        p.focus_calendar_day();
+        // Mark the prepared grid to detect accidental reformatting during focus-only input.
+        p.elements[0].title = "Prepared month label".into();
+
+        assert!(p.navigate_calendar(0x27));
+        let november_end = Date::new(2026, 11, 30).unwrap();
+        assert_eq!(p.elements[0].title, "Prepared month label");
+        assert!(matches!(
+            p.elements[p.focus.unwrap()].click,
+            Some(Click::Calendar(Action::Day(day))) if day == november_end
+        ));
+        assert_eq!(p.calendar.selected, selected);
+
+        assert!(p.navigate_calendar(0x27));
+        let december_start = Date::new(2026, 12, 1).unwrap();
+        assert_ne!(p.elements[0].title, "Prepared month label");
+        assert_eq!(p.calendar.month, december_start.month());
+        assert!(matches!(
+            p.elements[p.focus.unwrap()].click,
+            Some(Click::Calendar(Action::Day(day))) if day == december_start
+        ));
+        assert_eq!(p.calendar.selected, selected);
+        Ok(())
+    }
+
+    #[test]
+    fn calendar_selection_updates_the_marker_and_footer_in_the_prepared_grid() -> Result<()> {
+        use super::super::calendar::{Action, long_label};
+
+        let mut p = qa_panel(Entry::Calendar, 392.)?;
+        let previous = p.calendar.selected;
+        let selected = previous.shift_days(1);
+        p.elements[0].title = "Prepared month label".into();
+
+        p.activate(Click::Calendar(Action::Day(selected)), HWND::default(), None);
+
+        assert_eq!(p.elements[0].title, "Prepared month label");
+        assert_eq!(p.calendar.selected, selected);
+        assert!(matches!(
+            p.elements[p.focus.unwrap()].click,
+            Some(Click::Calendar(Action::Day(day))) if day == selected
+        ));
+        assert_eq!(
+            p.elements
+                .iter()
+                .filter_map(|e| match (&e.click, e.style) {
+                    (Some(Click::Calendar(Action::Day(day))), Style::CalendarDay { selected: true, .. }) => Some(*day),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [selected]
+        );
+        assert!(
+            p.elements
+                .iter()
+                .any(|e| e.title == format!("Selected: {}", long_label(selected)))
+        );
+        Ok(())
+    }
+
     #[test]
     fn weekday_change_remaps_focused_date_and_enter_target() -> windows::core::Result<()> {
         let mut p = qa_panel(Entry::Calendar, 392.)?;

@@ -14,6 +14,7 @@ mod calc;
 mod channel;
 mod commands;
 mod config;
+mod dock_gradient;
 mod remote_mode;
 mod remote_session;
 

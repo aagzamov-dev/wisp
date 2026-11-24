@@ -2,8 +2,10 @@
 
 use super::logic::Part;
 use super::status::Status;
+use super::topbar::model::{EQUALIZER_BAR_COUNT, EQUALIZER_BAR_STEP, EQUALIZER_BAR_WIDTH};
 use super::tray::Shown;
 use super::{Item, logic};
+use crate::dock_gradient::{Direction, Gradient};
 use crate::indexer::IconPixels;
 use crate::theme::Palette;
 use crate::tray_host::Key;
@@ -36,6 +38,7 @@ struct Target {
     tray: HashMap<Key, (Arc<IconPixels>, ID2D1Bitmap)>,
     media_shapes: HashMap<u8, ID2D1PathGeometry>,
     launcher_shape: Option<ID2D1PathGeometry>,
+    dock_gradient: Option<(Gradient, ID2D1LinearGradientBrush)>,
     size: D2D_SIZE_U,
 }
 
@@ -79,6 +82,8 @@ pub(super) struct DragFrame {
 
 pub struct Frame<'a> {
     pub animation_scale: f32,
+    pub gradient: Option<Gradient>,
+    pub alpha: u8,
     pub dpi: u32,
     pub palette: &'a Palette,
     pub(super) items: &'a [Item],
@@ -141,6 +146,10 @@ pub(super) struct IslandFrame<'a> {
     pub track: Option<&'a crate::commands::media::NotchTrack>,
     pub previous_track: Option<&'a crate::commands::media::NotchTrack>,
     pub track_fade: f32,
+    pub show_title: bool,
+    pub show_previous_title: bool,
+    pub equalizer: [f32; EQUALIZER_BAR_COUNT],
+    pub equalizer_color: D2D1_COLOR_F,
     pub reveal: f32,
     pub mix: f32,
     pub width: f32,
@@ -430,10 +439,46 @@ impl Renderer {
 
     pub fn draw(&mut self, hwnd: HWND, frame: &Frame) -> Result<()> {
         self.update_formats(frame.layout_scale)?;
+        if let Some(gradient) = frame.gradient {
+            return self.paint_surface_with_alpha(
+                hwnd,
+                frame.dpi,
+                frame.palette,
+                (
+                    layered::Contour::Round(8.0 * frame.layout_scale * frame.animation_scale),
+                    255,
+                ),
+                frame.alpha,
+                |target, formats| {
+                    paint_dock_gradient(
+                        target,
+                        frame.palette,
+                        8.0 * frame.layout_scale * frame.animation_scale,
+                        gradient,
+                    )?;
+                    draw_content(target, formats, frame)
+                },
+            );
+        }
         self.paint(hwnd, frame.dpi, frame.palette, |target, formats| {
             background(target, frame.palette, frame.layout_scale);
             draw_content(target, formats, frame)
         })
+    }
+
+    pub(super) fn present_cached_dock(&self, hwnd: HWND, dpi: u32, alpha: u8) -> Result<bool> {
+        if let Some(surface) = &self.layered
+            && surface.cached_matches(hwnd, dpi)?
+        {
+            surface.present_cached(hwnd, dpi, alpha)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    pub(super) fn clear_dock_target(&mut self) {
+        self.target = None;
+        self.layered = None;
     }
 
     pub fn draw_on(&mut self, rt: &ID2D1HwndRenderTarget, frame: &Frame) -> Result<()> {
@@ -448,6 +493,7 @@ impl Renderer {
                 tray: HashMap::new(),
                 media_shapes: HashMap::new(),
                 launcher_shape: None,
+                dock_gradient: None,
                 size: D2D_SIZE_U::default(),
             });
         }
@@ -1046,6 +1092,7 @@ impl Renderer {
                     tray: HashMap::new(),
                     media_shapes: HashMap::new(),
                     launcher_shape: None,
+                    dock_gradient: None,
                     size,
                 });
             }
@@ -1118,6 +1165,10 @@ fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFram
         track,
         track_fade,
         previous_track,
+        show_title,
+        show_previous_title,
+        equalizer,
+        equalizer_color,
         reveal,
         mix,
         width,
@@ -1175,12 +1226,19 @@ fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFram
             .any(|track| track.artwork.as_ref().is_some_and(|art| Arc::ptr_eq(pixels, art)))
     });
     if mix > 0. {
-        for (track, weight, offset) in [
-            (previous_track, 1. - track_fade, -2. * track_fade),
+        let media = island.media(
+            [track, previous_track]
+                .into_iter()
+                .flatten()
+                .any(|track| track.artwork.is_some()),
+        );
+        for (track, weight, offset, title_visible) in [
+            (previous_track, 1. - track_fade, -2. * track_fade, show_previous_title),
             (
                 track,
                 if previous_track.is_some() { track_fade } else { 1. },
                 2. * (1. - track_fade),
+                show_title,
             ),
         ] {
             let Some(track) = track else {
@@ -1193,11 +1251,13 @@ fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFram
             let track_alpha = mix * weight.clamp(0., 1.);
             let top = (height - 20.) / 2. + offset;
             let art = rect(8., top, 28., top + 20.);
-            let cover_key = format!("topbar-cover:{}:{}", track.media.source, track.media.title);
             if let Some(pixels) = &track.artwork
-                && island.title_right.is_some()
+                && media.artwork
             {
-                if !target.bitmaps.contains_key(&cover_key) {
+                let cached = target.bitmaps.values().find(|(cached, _)| Arc::ptr_eq(cached, pixels));
+                let bitmap = if let Some((_, bitmap)) = cached {
+                    bitmap
+                } else {
                     let bitmap = unsafe {
                         rt.CreateBitmap(
                             D2D_SIZE_U {
@@ -1216,27 +1276,23 @@ fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFram
                             },
                         )
                     }?;
-                    target.bitmaps.insert(cover_key.clone(), (pixels.clone(), bitmap));
-                }
+                    let cover_key = format!("{:p}", Arc::as_ptr(pixels));
+                    &target.bitmaps.entry(cover_key).or_insert((pixels.clone(), bitmap)).1
+                };
                 unsafe {
                     rt.DrawBitmap(
-                        &target.bitmaps[&cover_key].1,
+                        bitmap,
                         Some(&art),
                         track_alpha,
                         D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                         None,
                     );
                 }
-            } else if island.title_right.is_some() {
+            }
+            if title_visible && let Some((left, right)) = media.title {
                 unsafe {
                     brush.SetColor(&color(track_alpha));
                 }
-                text(&rt, &brush, &formats.glyph, "\u{E8D6}", art);
-            }
-            unsafe {
-                brush.SetColor(&color(track_alpha));
-            }
-            if let Some(right) = island.title_right {
                 text(
                     &rt,
                     &brush,
@@ -1246,13 +1302,32 @@ fn draw_island_content(target: &mut Target, formats: &Formats, frame: IslandFram
                     } else {
                         &track.media.title
                     },
-                    rect(36., offset, right, height + offset),
+                    rect(left, offset, right, height + offset),
                 );
             }
         }
         let Some(track) = track.or(previous_track) else {
             return Ok(());
         };
+        if let Some(left) = media.equalizer_left {
+            unsafe {
+                brush.SetColor(&D2D1_COLOR_F {
+                    a: mix * reveal,
+                    ..equalizer_color
+                });
+                for (i, bar_height) in equalizer.into_iter().enumerate() {
+                    let x = left + EQUALIZER_BAR_STEP * i as f32;
+                    let top = (height - bar_height) / 2.;
+                    rt.FillRoundedRectangle(
+                        &rounded(
+                            rect(x, top, x + EQUALIZER_BAR_WIDTH, top + bar_height),
+                            EQUALIZER_BAR_WIDTH / 2.,
+                        ),
+                        &brush,
+                    );
+                }
+            }
+        }
         for (hit, left) in [
             (Hit::Previous, island.controls[0]),
             (Hit::PlayPause, island.controls[1]),
@@ -1754,7 +1829,7 @@ fn draw_control_content(target: &mut Target, formats: &Formats, frame: ControlFr
                 Style::Section => {
                     text(&item.title, &formats.control_title, bounds, main);
                 }
-                Style::Text => {
+                Style::Text | Style::CalendarSelection => {
                     if selected {
                         fill(bounds, 12., hover);
                     }
@@ -1891,6 +1966,64 @@ fn tile(target: &Target, frame: &Frame, left: f32, right: f32, color: &D2D1_COLO
 /// DWM rounds the corners and draws the backdrop; this only tints it.
 fn background(target: &Target, palette: &Palette, layout_scale: f32) {
     crate::theme::paint_background(&target.rt, &target.brush, palette, 8.0 * layout_scale);
+}
+
+fn paint_dock_gradient(target: &mut Target, palette: &Palette, radius: f32, gradient: Gradient) -> Result<()> {
+    let rt = &target.rt;
+    let size = unsafe { rt.GetSize() };
+    let (end_x, end_y) = match gradient.direction {
+        Direction::LeftToRight => (size.width, 0.),
+        Direction::TopToBottom => (0., size.height),
+        Direction::Diagonal => {
+            // The two axes contribute equally even on a very wide dock.
+            let factor = 2. * size.width * size.height / (size.width.powi(2) + size.height.powi(2));
+            (size.height * factor, size.width * factor)
+        }
+    };
+    let end = windows_numerics::Vector2 { X: end_x, Y: end_y };
+    unsafe {
+        if target
+            .dock_gradient
+            .as_ref()
+            .is_none_or(|(cached, _)| *cached != gradient)
+        {
+            let color = |[r, g, b]: [u8; 3]| D2D1_COLOR_F {
+                r: f32::from(r) / 255.,
+                g: f32::from(g) / 255.,
+                b: f32::from(b) / 255.,
+                a: (100 - gradient.transparency.min(100)) as f32 / 100.,
+            };
+            let stops = rt.CreateGradientStopCollection(
+                &[
+                    D2D1_GRADIENT_STOP {
+                        position: 0.,
+                        color: color(gradient.start),
+                    },
+                    D2D1_GRADIENT_STOP {
+                        position: 1.,
+                        color: color(gradient.end),
+                    },
+                ],
+                D2D1_GAMMA_2_2,
+                D2D1_EXTEND_MODE_CLAMP,
+            )?;
+            let brush = rt.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: windows_numerics::Vector2::default(),
+                    endPoint: end,
+                },
+                None,
+                &stops,
+            )?;
+            target.dock_gradient = Some((gradient, brush));
+        }
+        let (_, brush) = target.dock_gradient.as_ref().unwrap();
+        brush.SetEndPoint(end);
+        rt.Clear(None);
+        rt.FillRectangle(&rect(0., 0., size.width, size.height), brush);
+    }
+    crate::theme::paint_background_border(rt, &target.brush, palette, radius);
+    Ok(())
 }
 
 /// Draws a notification icon centered on (`x`, `y`). Its pixels are made

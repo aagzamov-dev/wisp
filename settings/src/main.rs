@@ -8,6 +8,8 @@ mod logging;
 #[path = "../../src/channel.rs"]
 mod channel;
 mod config;
+#[path = "../../src/dock_gradient.rs"]
+mod dock_gradient;
 #[path = "../../src/remote_mode.rs"]
 #[allow(dead_code)]
 mod remote_mode;
