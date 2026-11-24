@@ -56,18 +56,10 @@ jobs:
           WISP_RELEASE_REPOSITORY: aagzamov-dev/wisp
       - name: Package
         shell: pwsh
-        run: |
-          $tag = $env:GITHUB_REF_NAME
-          $name = "wisp-$tag-x86_64-windows"
-          New-Item -ItemType Directory $name | Out-Null
-          Copy-Item target/release/wisp.exe, target/release/wisp-settings.exe, README.md, LICENSE $name
-          Compress-Archive -Path $name -DestinationPath "dist/$name.zip"
-          Copy-Item target/release/wisp.exe "dist/wisp-$tag-x86_64.exe"
-          Copy-Item target/release/wisp-settings.exe "dist/wisp-settings-$tag-x86_64.exe"
-          Set-Location dist
-          $files = "$name.zip", "wisp-$tag-x86_64.exe", "wisp-settings-$tag-x86_64.exe"
-          $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash + "  $_" } |
-            Set-Content -Encoding ascii SHA256SUMS.txt
+        run: ./scripts/package-release.ps1
+      - name: Test packages
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
       - uses: actions/upload-artifact@v4
         id: upload
         with:
@@ -95,7 +87,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $tag = $env:GITHUB_REF_NAME
           $repo = $env:GITHUB_REPOSITORY
-          $files = "wisp-$tag-x86_64-windows.zip", "wisp-$tag-x86_64.exe", "wisp-settings-$tag-x86_64.exe"
+          $files = "wisp-$tag-x86_64-windows.zip", "wisp-$tag-x86_64.exe", "wisp-settings-$tag-x86_64.exe", 'WispSetup.exe'
           $expected = $files | ForEach-Object { (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash + "  $_" }
           if (($expected -join "`n") -cne ((Get-Content -LiteralPath SHA256SUMS.txt) -join "`n")) {
             throw "Release asset checksums do not match"
