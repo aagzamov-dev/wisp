@@ -45,11 +45,14 @@ const BACKDROPS: [(&str, &str); 7] = [
     ("color", "Custom color"),
 ];
 const START_POSITIONS: [(&str, &str); 2] = [("bottom", "Bottom"), ("center", "Center")];
-const DOCK_ANIMATIONS: [(&str, &str); 4] = [
+const DOCK_ANIMATIONS: [(&str, &str); 7] = [
     ("slide", "Slide"),
     ("fade", "Fade"),
     ("rise-fade", "Rise + Fade"),
     ("scale-fade", "Scale + Fade"),
+    ("soft-rise", "Soft Rise"),
+    ("bottom-reveal", "Bottom Reveal"),
+    ("soft-scale", "Soft Scale"),
 ];
 const WINDOW_LISTS: [(&str, &str); 3] = [
     ("multiple", "Only for multiple windows"),
@@ -57,6 +60,8 @@ const WINDOW_LISTS: [(&str, &str); 3] = [
     ("off", "Off"),
 ];
 const ONBOARDING_STEPS: usize = 3;
+#[path = "ui/dock_gradient.rs"]
+mod dock_gradient;
 #[path = "ui/notch.rs"]
 mod notch;
 
@@ -154,6 +159,7 @@ pub struct Settings {
     media_error: Option<String>,
     update: UpdateStatus,
     backdrop_color: Entity<ColorPickerState>,
+    dock_gradient: dock_gradient::Controls,
     theme: Entity<Choices>,
     backdrop: Entity<Choices>,
     start_position: Entity<Choices>,
@@ -222,6 +228,7 @@ impl Settings {
         let folder = cx.new(|cx| InputState::new(window, cx).placeholder("Folder name"));
         let backdrop_color =
             cx.new(|cx| ColorPickerState::new(window, cx).default_value(backdrop_swatch(&config.backdrop_color)));
+        let dock_gradient = dock_gradient::Controls::new(&config, window, cx);
         let theme = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(labels(&THEMES)),
@@ -504,6 +511,7 @@ impl Settings {
             media_error: None,
             update: UpdateStatus::Idle,
             backdrop_color,
+            dock_gradient,
             theme,
             backdrop,
             start_position,
@@ -621,11 +629,21 @@ impl Settings {
     }
 
     fn save(&mut self, key: &str, value: Value, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.save_with(key, |store| store.set(key, value), window, cx)
+    }
+
+    fn save_with(
+        &mut self,
+        key: &str,
+        edit: impl FnOnce(&Store) -> Result<Config, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let result = self
             .store
             .as_ref()
             .ok_or_else(|| "Cannot find the config folder.".into())
-            .and_then(|store| store.set(key, value));
+            .and_then(edit);
         match result {
             Ok(config) => {
                 self.config = config;
@@ -663,6 +681,7 @@ impl Settings {
                 let theme = index_of(&THEMES, &self.config.theme);
                 self.theme
                     .update(cx, |state, cx| state.set_selected_index(theme, window, cx));
+                self.dock_gradient.sync(&self.config, window, cx);
                 let animation = index_of(&DOCK_ANIMATIONS, &self.config.dock_animation);
                 self.dock_animation
                     .update(cx, |state, cx| state.set_selected_index(animation, window, cx));
@@ -1094,7 +1113,7 @@ impl Settings {
                     .child(divider(p))
                     .child(row(
                         "Shared material",
-                        "Dock, Start, Controls, tray and Wisp popups follow this choice. Windows transparency settings may limit blur.",
+                        "Used by Start, Controls, tray and Wisp popups, and by the dock when it uses the shared material.",
                         Select::new(&self.backdrop).accessibility_label("Shared material").w(px(160.)),
                         p,
                     ))
@@ -1133,8 +1152,13 @@ impl Settings {
                             ColorPicker::new(&self.backdrop_color).accessibility_label("Custom backdrop color"),
                             p,
                         ))
-                    }),
+                    })
+                    .child(divider(p))
+                    .child(self.dock_gradient.background_row(p)),
             )
+            .when(self.config.dock_background == "gradient", |page| {
+                page.child(div().h_3()).child(self.dock_gradient.section(&self.config, p, cx))
+            })
             .child(div().h_3())
             .child(label("Dock animation", p))
             .child(

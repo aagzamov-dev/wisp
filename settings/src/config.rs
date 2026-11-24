@@ -2,7 +2,9 @@
 
 use std::{io::Write, path::PathBuf};
 
-use toml_edit::{DocumentMut, Item, Value};
+use toml_edit::{DocumentMut, InlineTable, Item, Value};
+
+use crate::dock_gradient::{Direction, Gradient};
 
 /// The launcher creates its config from the same file.
 pub const DEFAULT_CONFIG: &str = include_str!("../../src/default-config.toml");
@@ -37,6 +39,9 @@ pub struct Config {
     pub position: String,
     pub start_position: String,
     pub dock: bool,
+    pub dock_background: String,
+    pub dock_gradient: Gradient,
+    pub dock_gradient_themes: Vec<(String, Gradient)>,
     pub dock_autohide: bool,
     pub dock_reveal_height: i64,
     pub dock_smart_hide: bool,
@@ -82,11 +87,38 @@ impl Config {
         };
         let theme = string("theme")?;
         choice(&theme, &["system", "dark", "light"], "theme")?;
+        let dock_animation = string("dock_animation")?;
         choice(
-            &string("dock_animation")?,
-            &["slide", "fade", "rise-fade", "scale-fade"],
+            &dock_animation,
+            &[
+                "slide",
+                "fade",
+                "rise-fade",
+                "scale-fade",
+                "soft-rise",
+                "bottom-reveal",
+                "soft-scale",
+            ],
             "dock_animation",
         )?;
+        let dock_background = string("dock_background")?;
+        choice(&dock_background, &["shared-material", "gradient"], "dock_background")?;
+        let dock_gradient = doc
+            .get("dock_gradient")
+            .map(read_gradient)
+            .transpose()?
+            .unwrap_or_default();
+        let dock_gradient_themes = doc
+            .get("dock_gradient_themes")
+            .map(|item| {
+                item.as_table_like()
+                    .ok_or("dock_gradient_themes must be a table.")?
+                    .iter()
+                    .map(|(name, item)| Ok((name.to_owned(), read_gradient(item)?)))
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         let backdrop = string("backdrop")?;
         choice(
             &backdrop,
@@ -192,6 +224,9 @@ impl Config {
             position,
             start_position,
             dock: boolean("dock")?,
+            dock_background,
+            dock_gradient,
+            dock_gradient_themes,
             dock_autohide: boolean("dock_autohide")?,
             dock_reveal_height: bounded_integer(get("dock_reveal_height"), "dock_reveal_height", 1, 128)?,
             dock_current_monitor_only: boolean("dock_current_monitor_only")?,
@@ -200,7 +235,7 @@ impl Config {
             dock_icon_size,
             dock_open_ms: duration("dock_open_ms")?,
             dock_close_ms: duration("dock_close_ms")?,
-            dock_animation: string("dock_animation")?,
+            dock_animation,
             hide_taskbar: boolean("hide_taskbar")?,
             window_list,
         })
@@ -208,9 +243,76 @@ impl Config {
 }
 
 fn valid_color(color: &str) -> bool {
-    color
-        .strip_prefix('#')
-        .is_some_and(|hex| hex.len() == 6 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    crate::dock_gradient::parse_color(color).is_some()
+}
+
+pub fn gradient_color([red, green, blue]: [u8; 3]) -> String {
+    format!("#{red:02X}{green:02X}{blue:02X}")
+}
+
+pub fn direction_key(direction: Direction) -> &'static str {
+    match direction {
+        Direction::LeftToRight => "left-to-right",
+        Direction::TopToBottom => "top-to-bottom",
+        Direction::Diagonal => "diagonal",
+    }
+}
+
+fn read_gradient(item: &Item) -> Result<Gradient, String> {
+    let table = item.as_table_like().ok_or("A dock gradient must be a table.")?;
+    let text = |key| {
+        table
+            .get(key)
+            .and_then(Item::as_str)
+            .ok_or_else(|| format!("Gradient {key} must be text."))
+    };
+    let transparency = table
+        .get("transparency")
+        .and_then(Item::as_integer)
+        .ok_or("Gradient transparency must be a whole number.")?;
+    Gradient::parse(text("start")?, text("end")?, text("direction")?, transparency).map_err(str::to_owned)
+}
+
+fn gradient_value(gradient: Gradient) -> Value {
+    let mut table = InlineTable::new();
+    for (key, value) in gradient_fields(gradient) {
+        table.insert(key, value);
+    }
+    Value::InlineTable(table)
+}
+
+fn write_gradient(doc: &mut DocumentMut, next: Gradient) {
+    if let Some(gradient) = doc.get_mut("dock_gradient").and_then(Item::as_table_like_mut) {
+        // Edit known fields in place to preserve comments and unknown fields.
+        for (name, mut value) in gradient_fields(next) {
+            if let Some(old) = gradient.get(name).and_then(Item::as_value) {
+                if old
+                    .as_str()
+                    .zip(value.as_str())
+                    .is_some_and(|(old, value)| old.eq_ignore_ascii_case(value))
+                    || old
+                        .as_integer()
+                        .zip(value.as_integer())
+                        .is_some_and(|(old, value)| old == value)
+                {
+                    continue;
+                }
+                *value.decor_mut() = old.decor().clone();
+            }
+            gradient.insert(name, Item::Value(value));
+        }
+    } else {
+        doc["dock_gradient"] = Item::Value(gradient_value(next));
+    }
+}
+
+fn gradient_fields(gradient: Gradient) -> [(&'static str, Value); 4] {
+    [
+        ("start", gradient_color(gradient.start).into()),
+        ("end", gradient_color(gradient.end).into()),
+        ("direction", direction_key(gradient.direction).into()),
+        ("transparency", i64::from(gradient.transparency).into()),
+    ]
 }
 
 fn bounded_integer(item: &Item, key: &str, min: i64, max: i64) -> Result<i64, String> {
@@ -288,23 +390,82 @@ impl Store {
 
     pub fn set(&self, key: &str, mut value: Value) -> Result<Config, String> {
         validate_edit(key, &value)?;
+        self.edit(key, |doc| {
+            if let Some(old) = doc.get(key).and_then(Item::as_value) {
+                if let (Some(previous), Some(next)) = (old.as_array(), value.as_array_mut()) {
+                    // Keep comments and quoting on folder names that remain in the list.
+                    for entry in next.iter_mut() {
+                        if let Some(existing) = previous.iter().find(|existing| existing.as_str() == entry.as_str()) {
+                            *entry = existing.clone();
+                        }
+                    }
+                    next.set_trailing(previous.trailing().clone());
+                    next.set_trailing_comma(previous.trailing_comma());
+                }
+                *value.decor_mut() = old.decor().clone();
+            }
+            doc[key] = Item::Value(value);
+            Ok(())
+        })
+    }
+
+    pub fn update_gradient(&self, update: impl FnOnce(Gradient) -> Gradient) -> Result<Config, String> {
+        self.edit("dock_gradient", |doc| {
+            let previous = doc
+                .get("dock_gradient")
+                .map(read_gradient)
+                .transpose()?
+                .unwrap_or_default();
+            let next = update(previous);
+            write_gradient(doc, next);
+            Ok(())
+        })
+    }
+
+    pub fn apply_gradient_theme(&self, name: &str) -> Result<Config, String> {
+        self.edit("dock_gradient", |doc| {
+            let theme = doc
+                .get("dock_gradient_themes")
+                .and_then(Item::as_table_like)
+                .and_then(|themes| themes.get(name))
+                .ok_or("The saved theme is no longer available.")?;
+            let gradient = read_gradient(theme)?;
+            write_gradient(doc, gradient);
+            Ok(())
+        })
+    }
+
+    pub fn save_gradient_theme(&self, name: &str) -> Result<Config, String> {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            return Err("Enter a theme name with 1 to 64 characters.".into());
+        }
+
+        self.edit("dock_gradient_themes", |doc| {
+            let gradient = doc
+                .get("dock_gradient")
+                .map(read_gradient)
+                .transpose()?
+                .unwrap_or_default();
+            if !doc.contains_key("dock_gradient_themes") {
+                doc["dock_gradient_themes"] = Item::Value(Value::InlineTable(InlineTable::new()));
+            }
+            let themes = doc["dock_gradient_themes"]
+                .as_table_like_mut()
+                .ok_or("dock_gradient_themes must be a table.")?;
+            if themes.contains_key(name) {
+                return Err("A saved theme already uses that name.".into());
+            }
+            themes.insert(name, Item::Value(gradient_value(gradient)));
+            Ok(())
+        })
+    }
+
+    fn edit(&self, key: &str, change: impl FnOnce(&mut DocumentMut) -> Result<(), String>) -> Result<Config, String> {
         let mut doc = self.document()?;
         // Refuse to replace a config whose existing fields have invalid types.
         Config::from_document(&doc)?;
-        if let Some(old) = doc.get(key).and_then(Item::as_value) {
-            if let (Some(previous), Some(next)) = (old.as_array(), value.as_array_mut()) {
-                // Keep comments and quoting on folder names that remain in the list.
-                for entry in next.iter_mut() {
-                    if let Some(existing) = previous.iter().find(|existing| existing.as_str() == entry.as_str()) {
-                        *entry = existing.clone();
-                    }
-                }
-                next.set_trailing(previous.trailing().clone());
-                next.set_trailing_comma(previous.trailing_comma());
-            }
-            *value.decor_mut() = old.decor().clone();
-        }
-        doc[key] = Item::Value(value);
+        change(&mut doc)?;
         let config = self.config(&doc)?;
         match key {
             "hotkey" => validate_shortcut(&config.hotkey, &config.quit_hotkey)?,
@@ -364,6 +525,7 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
             return Err("Choose an opacity between 0 and 100%.".into());
         }
         "theme"
+        | "dock_background"
         | "topbar"
         | "topbar_island_blur"
         | "topbar_height"
@@ -407,6 +569,86 @@ fn validate_edit(key: &str, value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dock_gradient_defaults_to_shared_and_persists_saved_themes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("config.toml"));
+        store.ensure_exists().unwrap();
+        let first_run = store.load().unwrap();
+        assert_eq!(first_run.dock_background, "shared-material");
+        assert_eq!(first_run.dock_gradient, Gradient::default());
+        assert!(first_run.dock_gradient_themes.is_empty());
+
+        std::fs::write(
+            &store.path,
+            "# Keep note\nbackdrop='glass'\nfuture=42\n\n[dock_gradient]\nstart='#202943' # Color note\nend='#382B45'\ndirection='left-to-right'\ntransparency=15\nfuture=7\n",
+        ).unwrap();
+        assert_eq!(store.load().unwrap().dock_background, "shared-material");
+        assert_eq!(
+            store.set("dock_background", "gradient".into()).unwrap().backdrop,
+            "glass"
+        );
+        let changed = store
+            .update_gradient(|gradient| Gradient {
+                start: [0x12, 0x34, 0x3A],
+                direction: Direction::Diagonal,
+                transparency: 100,
+                ..gradient
+            })
+            .unwrap()
+            .dock_gradient;
+        let named = store.save_gradient_theme("  Evening. Window  ").unwrap();
+        assert_eq!(named.dock_gradient_themes, [("Evening. Window".to_owned(), changed)]);
+        assert!(store.save_gradient_theme("Evening. Window").is_err());
+        assert!(store.save_gradient_theme(" ").is_err());
+        assert!(
+            store
+                .update_gradient(|gradient| Gradient {
+                    transparency: 101,
+                    ..gradient
+                })
+                .is_err()
+        );
+
+        assert_eq!(
+            store.update_gradient(|_| Gradient::default()).unwrap().dock_gradient,
+            Gradient::default()
+        );
+        assert_eq!(
+            store.apply_gradient_theme("Evening. Window").unwrap().dock_gradient,
+            changed
+        );
+        assert_eq!(
+            store
+                .set("dock_background", "shared-material".into())
+                .unwrap()
+                .dock_gradient,
+            changed
+        );
+        let saved = std::fs::read_to_string(&store.path).unwrap();
+        assert!(saved.contains("# Keep note") && saved.contains("future=42"));
+        assert!(saved.contains("# Color note") && saved.contains("future=7"));
+        assert_eq!(store.load().unwrap().dock_gradient, changed);
+    }
+
+    #[test]
+    fn each_dock_animation_style_is_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::new(directory.path().join("config.toml"));
+        for style in [
+            "slide",
+            "fade",
+            "rise-fade",
+            "scale-fade",
+            "soft-rise",
+            "bottom-reveal",
+            "soft-scale",
+        ] {
+            assert_eq!(store.set("dock_animation", style.into()).unwrap().dock_animation, style);
+        }
+        assert!(store.set("dock_animation", "unknown".into()).is_err());
+    }
+
     #[test]
     fn automatic_update_preference_is_off_until_saved() {
         let directory = tempfile::tempdir().unwrap();

@@ -1249,6 +1249,7 @@ impl Launcher {
                 self.config.backdrop,
                 &self.config.backdrop_color,
                 self.config.material_options(),
+                self.config.dock_gradient(),
             );
             dock.pace_frames();
             dock.set_apps(&self.apps, &self.icons);
@@ -1468,6 +1469,7 @@ impl Launcher {
                 self.config.backdrop,
                 &self.config.backdrop_color,
                 self.config.material_options(),
+                self.config.dock_gradient(),
             );
         }
         self.invalidate();

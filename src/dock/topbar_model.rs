@@ -1,6 +1,60 @@
 //! Pure top-bar layout and motion, kept independent of native windows.
 
 pub use crate::animation::Spring;
+use std::time::{Duration, Instant};
+
+pub const TITLE_DURATION: Duration = Duration::from_secs(5);
+pub const EQUALIZER_BAR_COUNT: usize = 4;
+pub const EQUALIZER_BAR_WIDTH: f32 = 2.;
+pub const EQUALIZER_BAR_STEP: f32 = 4.;
+pub const EQUALIZER_IDLE: [f32; EQUALIZER_BAR_COUNT] = [4.; EQUALIZER_BAR_COUNT];
+
+#[derive(Default)]
+pub struct TrackTitle {
+    pending: bool,
+    pub deadline: Option<Instant>,
+}
+impl TrackTitle {
+    pub fn reset(&mut self, has_track: bool) {
+        self.pending = has_track;
+        self.deadline = None;
+    }
+    pub fn refresh(&mut self, now: Instant, visible: bool) -> bool {
+        if self.pending && visible {
+            self.pending = false;
+            self.deadline = Some(now + TITLE_DURATION);
+            return true;
+        }
+        if self.deadline.is_some_and(|deadline| now >= deadline) {
+            self.deadline = None;
+            return true;
+        }
+        false
+    }
+}
+
+pub fn equalizer_bars(playing: bool, levels: Option<[f32; EQUALIZER_BAR_COUNT]>) -> [f32; EQUALIZER_BAR_COUNT] {
+    if !playing {
+        return EQUALIZER_IDLE;
+    }
+    levels.map_or([6., 11., 8., 5.], |levels| {
+        levels.map(|level| 4. + (32. * level.clamp(0., 1.)).round() / 4.)
+    })
+}
+
+pub fn artwork_color(bgra: &[u8]) -> Option<[f32; 3]> {
+    let (pixels, _) = bgra.as_chunks::<4>();
+    let step = (pixels.len() / 256).max(1);
+    let [b, g, r, a] = pixels.iter().step_by(step).fold([0_u32; 4], |[b, g, r, a], pixel| {
+        [
+            b + u32::from(pixel[0]),
+            g + u32::from(pixel[1]),
+            r + u32::from(pixel[2]),
+            a + u32::from(pixel[3]),
+        ]
+    });
+    (a > 0).then(|| [r, g, b].map(|channel| (channel as f32 / a as f32).clamp(0., 1.)))
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SurfaceVisual {
@@ -102,18 +156,54 @@ pub struct IslandLayout {
     pub clock: f32,
     pub controls: [f32; 3],
     pub button: f32,
-    pub title_right: Option<f32>,
+    media_right: f32,
+}
+pub struct MediaLayout {
+    pub artwork: bool,
+    pub equalizer_left: Option<f32>,
+    pub title: Option<(f32, f32)>,
 }
 impl IslandLayout {
+    const LEFT: f32 = 8.;
+    const ARTWORK_SLOT: f32 = 26.;
+    const EQUALIZER_WIDTH: f32 = (EQUALIZER_BAR_COUNT - 1) as f32 * EQUALIZER_BAR_STEP + EQUALIZER_BAR_WIDTH;
+    const TITLE_GAP: f32 = 6.;
+    const MEDIA_GAP: f32 = 8.;
+    const MIN_TITLE_WIDTH: f32 = 32.;
+
+    fn button_width(compact: bool) -> f32 {
+        if compact { 24. } else { 28. }
+    }
+    pub fn music_width(compact: bool, time_width: f32, artwork: bool, title_width: Option<f32>) -> f32 {
+        14. + time_width
+            + 12.
+            + Self::button_width(compact) * 3.
+            + Self::MEDIA_GAP
+            + Self::LEFT
+            + Self::EQUALIZER_WIDTH
+            + if artwork { Self::ARTWORK_SLOT } else { 0. }
+            + title_width.map_or(0., |width| Self::TITLE_GAP + width)
+            + 1. // Allow for rounding to the physical window width.
+    }
     pub fn new(width: f32, compact: bool, time_width: f32) -> Self {
-        let button = if compact { 24. } else { 28. };
+        let button = Self::button_width(compact);
         let clock = width - 14. - time_width;
         let start = clock - 12. - button * 3.;
         Self {
             clock,
             controls: [start, start + button, start + 2. * button],
             button,
-            title_right: (!compact).then_some((start - 10.).max(36.)),
+            media_right: start - Self::MEDIA_GAP,
+        }
+    }
+    pub fn media(&self, has_artwork: bool) -> MediaLayout {
+        let artwork = has_artwork && Self::LEFT + Self::ARTWORK_SLOT + Self::EQUALIZER_WIDTH <= self.media_right;
+        let left = Self::LEFT + if artwork { Self::ARTWORK_SLOT } else { 0. };
+        let title_left = left + Self::EQUALIZER_WIDTH + Self::TITLE_GAP;
+        MediaLayout {
+            artwork,
+            equalizer_left: (left + Self::EQUALIZER_WIDTH <= self.media_right).then_some(left),
+            title: (title_left + Self::MIN_TITLE_WIDTH <= self.media_right).then_some((title_left, self.media_right)),
         }
     }
     pub fn media_hit(&self, x: f32) -> Option<Hit> {
@@ -319,6 +409,52 @@ mod tests {
             }
             assert!(l.clock >= 0. && l.clock + 48. <= width);
         }
+    }
+    #[test]
+    fn compact_island_uses_available_space_for_title() {
+        let layout = IslandLayout::new(285., true, 48.);
+        let media = layout.media(true);
+        assert!(media.artwork);
+        assert!(media.title.unwrap().1 < layout.controls[0]);
+
+        let width = IslandLayout::music_width(true, 48., true, None);
+        let compact = IslandLayout::new(width, true, 48.).media(true);
+        assert!(compact.artwork && compact.equalizer_left.is_some());
+        assert!(compact.title.is_none());
+        let narrow = IslandLayout::new(180., true, 48.).media(true);
+        assert!(!narrow.artwork && narrow.equalizer_left.is_some());
+        let too_narrow = IslandLayout::new(174., true, 48.).media(true);
+        assert!(too_narrow.equalizer_left.is_none());
+    }
+    #[test]
+    fn equalizer_maps_each_band_independently_and_has_static_accessible_states() {
+        assert_eq!(equalizer_bars(false, Some([1.; 4])), [4.; 4]);
+        assert_eq!(equalizer_bars(true, None), [6., 11., 8., 5.]);
+        assert_eq!(equalizer_bars(true, Some([0.; 4])), [4.; 4]);
+        assert_eq!(equalizer_bars(true, Some([0., 0.25, 0.5, 1.])), [4., 6., 8., 12.]);
+        assert_eq!(equalizer_bars(true, Some([0., 1., 0.5, 1.])), [4., 12., 8., 12.]);
+    }
+    #[test]
+    fn title_expires_five_seconds_after_first_visible_frame() {
+        let mut title = TrackTitle::default();
+        let start = Instant::now();
+        title.reset(true);
+        assert!(!title.refresh(start, false));
+        assert!(title.refresh(start, true));
+        assert_eq!(title.deadline, Some(start + Duration::from_secs(5)));
+        assert!(!title.refresh(start + Duration::from_millis(4999), true));
+        assert!(title.refresh(start + Duration::from_secs(5), true));
+        assert!(title.deadline.is_none());
+        assert!(!title.refresh(start + Duration::from_secs(6), true));
+
+        title.reset(true);
+        assert!(title.refresh(start + Duration::from_secs(6), true));
+        assert_eq!(title.deadline, Some(start + Duration::from_secs(11)));
+    }
+    #[test]
+    fn artwork_color_uses_bgra_and_ignores_transparent_pixels() {
+        assert_eq!(artwork_color(&[0, 64, 128, 128, 0, 0, 0, 0]), Some([1., 0.5, 0.]));
+        assert_eq!(artwork_color(&[0, 0, 0, 0]), None);
     }
     #[test]
     fn layout_anchors_are_continuous_through_music_morph() {

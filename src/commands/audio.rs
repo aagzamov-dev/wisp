@@ -1,4 +1,4 @@
-//! Volume, mute and the default output device, through Core Audio.
+//! Volume, mute, the default output device and its frequency levels, through Core Audio.
 //!
 //! Windows has no public API to change the default output device. Sound
 //! settings and most audio switchers use the undocumented IPolicyConfig
@@ -6,6 +6,10 @@
 
 // IPolicyConfig keeps the Windows method names.
 #![allow(non_snake_case)]
+
+#[path = "audio_spectrum.rs"]
+mod spectrum;
+pub use spectrum::Spectrum;
 
 use windows::{
     Win32::{

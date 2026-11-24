@@ -12,6 +12,8 @@ The optional config keys are `backdrop_transparency` (a whole percentage from 0 
 
 Shared material applies to the dock, Start, launcher, Controls, tray, window previews and Wisp-owned popups. The topbar strip and activity island retain their independent tint and blur preferences. Native Windows and third-party menus retain their own appearance.
 
+The dock can use a static two-color gradient in place of Shared material. The gradient has its own direction and background transparency. Icons and labels retain full opacity, and the dock follows Windows accessibility and transparency preferences.
+
 Independent compact search uses the same painted rounded background and persistent native material path as the other Wisp menus, with a matching 12 DIP window clip. Its opening/closing opacity is separate from background transparency. The shared-dock capture morph retains its existing material path.
 
 ## Implementation rules

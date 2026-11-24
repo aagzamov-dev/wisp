@@ -55,9 +55,64 @@ use windows::core::{BOOL, Error, GUID, Result, w};
 
 use crate::commands::open_windows::{self, Window};
 use crate::config::{Backdrop, DockAnimation, WindowListMode};
+use crate::dock_gradient::Gradient;
 use crate::indexer::{AppEntry, IconPixels};
 use crate::theme::Palette;
 use crate::tray_host::{self, Action, TrayHost};
+
+fn gradient_uses_light_text(gradient: Gradient) -> bool {
+    let luminance = |[red, green, blue]: [u8; 3]| {
+        let linear = |channel: u8| {
+            let value = f32::from(channel) / 255.;
+            if value <= 0.04045 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(red) + 0.7152 * linear(green) + 0.0722 * linear(blue)
+    };
+    (luminance(gradient.start) + luminance(gradient.end)) / 2. < 0.18
+}
+
+struct SlideFrame {
+    height: i32,
+    offset: i32,
+    scale: f32,
+    clip_top: i32,
+    alpha: u8,
+}
+
+impl SlideFrame {
+    fn new(preset: DockAnimation, height: i32, margin: i32, dpi_scale: f32, progress: f32) -> Self {
+        let hidden = 1. - progress;
+        let distance = match preset {
+            DockAnimation::Slide => (height + margin) as f32,
+            DockAnimation::RiseFade => (12. * dpi_scale).round(),
+            DockAnimation::SoftRise => 6. * dpi_scale,
+            _ => 0.,
+        };
+        Self {
+            height,
+            offset: (distance * hidden).round() as i32,
+            scale: match preset {
+                DockAnimation::ScaleFade => 1. - 0.08 * hidden,
+                DockAnimation::SoftScale => 1. - 0.02 * hidden,
+                _ => 1.,
+            },
+            clip_top: if preset == DockAnimation::BottomReveal {
+                (height as f32 * hidden).round() as i32
+            } else {
+                0
+            },
+            alpha: if matches!(preset, DockAnimation::Slide | DockAnimation::BottomReveal) {
+                255
+            } else {
+                (progress * 255.).round() as u8
+            },
+        }
+    }
+}
 
 pub const WM_SHOW_LAUNCHER: u32 = WM_APP + 20;
 const WM_REFRESH: u32 = WM_APP + 21;
@@ -368,6 +423,9 @@ struct State {
     backdrop: Backdrop,
     backdrop_color: String,
     material_options: crate::theme::MaterialOptions,
+    gradient_preference: Option<Gradient>,
+    gradient: Option<Gradient>,
+    shared: bool,
     dark: bool,
     window_list_mode: WindowListMode,
     app_icon_size: f32,
@@ -409,7 +467,10 @@ struct State {
     open_ms: u32,
     close_ms: u32,
     animation: DockAnimation,
-    layered: bool,
+    slide_alpha: u8,
+    window_rect: Option<RECT>,
+    window_clip: Option<(i32, i32, i32, i32)>,
+    presented_scale: f32,
     tray_interaction: Option<(u32, Instant)>,
     sound: HWND,
     sound_identity: Option<sound::Identity>,
@@ -546,6 +607,9 @@ impl Dock {
             backdrop: Backdrop::Acrylic,
             backdrop_color: String::new(),
             material_options: Default::default(),
+            gradient_preference: None,
+            gradient: None,
+            shared,
             dark: true,
             window_list_mode: WindowListMode::default(),
             app_icon_size: logic::DEFAULT_APP_ICON_SIZE,
@@ -581,7 +645,10 @@ impl Dock {
             open_ms: 180,
             close_ms: 140,
             animation: DockAnimation::Slide,
-            layered: false,
+            slide_alpha: 255,
+            window_rect: None,
+            window_clip: None,
+            presented_scale: 1.,
             tray_interaction: None,
             sound: HWND::default(),
             sound_identity: None,
@@ -769,7 +836,7 @@ impl Dock {
             state.data.tray_anchor.set(hwnd);
             DOCK_DATA.with_borrow_mut(|data| *data = Rc::downgrade(&state.data));
         }
-        dock.apply_theme(true, Backdrop::Acrylic, "", Default::default());
+        dock.apply_theme(true, Backdrop::Acrylic, "", Default::default(), None);
         if !primary {
             dock.state.borrow_mut().sync_tray();
         }
@@ -916,6 +983,7 @@ impl Dock {
     pub fn resume(&mut self) {
         let mut s = self.state.borrow_mut();
         s.suspended = false;
+        s.window_rect = None;
         s.surface_rect = None;
         s.revealed = true;
         s.visible = true;
@@ -988,7 +1056,13 @@ impl Dock {
         let mut s = self.state.borrow_mut();
         s.open_ms = open_ms;
         s.close_ms = close_ms;
-        s.animation = animation;
+        if s.animation != animation {
+            s.animation = animation;
+            if s.slide.is_some() {
+                let progress = s.sampled_slide().value;
+                s.apply_slide(progress);
+            }
+        }
     }
 
     pub fn sound_window(&self, id: usize) -> Option<HWND> {
@@ -1166,11 +1240,20 @@ impl Dock {
         self.topbars.iter().find(|bar| bar.id() == id)?.take_action()
     }
 
-    pub fn apply_theme(&mut self, dark: bool, backdrop: Backdrop, color: &str, options: crate::theme::MaterialOptions) {
+    pub fn apply_theme(
+        &mut self,
+        dark: bool,
+        backdrop: Backdrop,
+        color: &str,
+        options: crate::theme::MaterialOptions,
+        gradient: Option<Gradient>,
+    ) {
         for dock in &mut self.secondary {
-            dock.apply_theme(dark, backdrop, color, options);
+            dock.apply_theme(dark, backdrop, color, options, gradient);
         }
-        self.state.borrow_mut().apply_material(dark, backdrop, color, options);
+        let mut state = self.state.borrow_mut();
+        state.gradient_preference = gradient;
+        state.apply_material(dark, backdrop, color, options);
     }
 
     /// Hosts the notification area in the dock while `enabled`, which
@@ -1457,7 +1540,7 @@ impl State {
     fn paint(&mut self, rt: Option<&windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget>) -> Result<()> {
         let hwnd = self.hwnd;
         let parts = self.parts();
-        let animation_scale = self.animation_scale();
+        let animation_scale = self.presented_scale;
         let sound_open = self.sound_open();
         let drag = self.drag_frame();
         let State {
@@ -1476,10 +1559,14 @@ impl State {
             tray,
             inline,
             flyout_open,
+            gradient,
+            slide_alpha,
             ..
         } = self;
         let frame = &render::Frame {
             animation_scale,
+            gradient: *gradient,
+            alpha: *slide_alpha,
             dpi: *dpi,
             palette,
             items,
@@ -1505,6 +1592,30 @@ impl State {
         }
     }
 
+    fn paint_window(&mut self) -> Result<()> {
+        let prepared = self.paint(None);
+        if let Err(ref error) = prepared
+            && self.gradient.take().is_some()
+        {
+            crate::logging::error("dock.gradient", format_args!("stage=present {error}"));
+            self.renderer.clear_dock_target();
+            self.set_dock_layered(false)?;
+            crate::theme::restore_native_nonclient(self.hwnd);
+            self.slide_alpha = 255;
+            self.palette = crate::theme::apply_backdrop(
+                self.hwnd,
+                self.dark,
+                self.backdrop,
+                true,
+                &self.backdrop_color,
+                self.material_options,
+            );
+            self.finish_slide();
+            return self.paint(None);
+        }
+        prepared
+    }
+
     fn apply_material(&mut self, dark: bool, backdrop: Backdrop, color: &str, options: crate::theme::MaterialOptions) {
         self.material_version = self.material_version.wrapping_add(1);
         let _ = unsafe { PostMessageW(Some(self.hwnd), WM_SURFACE_MATERIAL, WPARAM(0), LPARAM(0)) };
@@ -1512,7 +1623,45 @@ impl State {
         self.backdrop = backdrop;
         self.backdrop_color = color.to_owned();
         self.dark = dark;
-        self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true, color, options);
+        let gradient = (!self.shared && !crate::theme::high_contrast())
+            .then_some(self.gradient_preference)
+            .flatten()
+            .map(|mut gradient| {
+                if !crate::theme::transparency_available() {
+                    gradient.transparency = 0;
+                }
+                gradient
+            });
+        if self.gradient != gradient {
+            self.renderer.clear_dock_target();
+        }
+        if self.gradient.is_some() != gradient.is_some() {
+            // ULW and constant opacity cannot share a layered style lifetime.
+            let _ = self.set_dock_layered(false);
+            let _ = self.set_dock_layered(gradient.is_some());
+            if gradient.is_none() {
+                crate::theme::restore_native_nonclient(self.hwnd);
+            }
+            self.slide_alpha = 255;
+            self.window_clip = None;
+        }
+        self.gradient = gradient;
+        if let Some(gradient) = gradient {
+            crate::theme::prepare_layered(self.hwnd);
+            self.window_clip = None;
+            self.palette = Palette::new(gradient_uses_light_text(gradient), false);
+        } else {
+            self.palette = crate::theme::apply_backdrop(self.hwnd, dark, backdrop, true, color, options);
+        }
+        // Theme and power changes can reset the native region.
+        if self.slide.is_some() {
+            self.apply_slide(self.sampled_slide().value);
+        } else {
+            let _ = self.update_slide_geometry(1.);
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
         for (hwnd, palette) in [
             (self.flyout, &mut self.flyout_palette),
             (self.tip, &mut self.tip_palette),
@@ -1641,15 +1790,16 @@ impl State {
         if self.fullscreen {
             self.hide_for_fullscreen();
         }
+        let show = self.visible && (self.revealed || self.slide.is_some()) && !self.fullscreen;
+        if show
+            && self.gradient.is_some()
+            && !unsafe { IsWindowVisible(self.hwnd) }.as_bool()
+            && let Err(error) = self.paint_window()
+        {
+            crate::logging::error("dock.paint", format_args!("stage=prepare {error}"));
+        }
         unsafe {
-            let _ = ShowWindow(
-                self.hwnd,
-                if self.visible && (self.revealed || self.slide.is_some()) && !self.fullscreen {
-                    SW_SHOWNOACTIVATE
-                } else {
-                    SW_HIDE
-                },
-            );
+            let _ = ShowWindow(self.hwnd, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
@@ -1819,115 +1969,179 @@ impl State {
         self.slide_motion
             .retarget_duration(to < 0.5, if animate { self.slide_ms } else { 0 });
         self.slide = self.slide_motion.active().then(Instant::now);
-        if self.slide.is_none() {
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
-                if !self.revealed {
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
-                }
-            }
-            self.set_slide_alpha(255);
-            return;
-        }
-        self.apply_slide();
-        if !self.frame_paced {
+        self.step_slide();
+        if self.slide.is_some() && !self.frame_paced {
             unsafe {
                 if SetTimer(Some(self.hwnd), SLIDE_TIMER, crate::animation::LOCAL_INTERVAL, None) == 0 {
-                    self.slide_motion.settle();
-                    self.slide = None;
-                    self.apply_slide();
-                    if !self.revealed {
-                        let _ = ShowWindow(self.hwnd, SW_HIDE);
-                    }
+                    self.finish_slide();
                 }
             }
         }
     }
 
     fn stop_slide(&mut self) {
-        self.slide = None;
         self.slide_motion = crate::animation::Motion::at(1.);
         self.slide_to = 0.0;
-        self.set_slide_alpha(255);
+        self.slide = None;
+        let _ = self.update_slide_geometry(1.);
+        let _ = self.set_slide_alpha(255);
         unsafe {
             let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
         }
     }
 
-    fn slide_offset(&self, height: i32) -> i32 {
-        let distance = match self.animation {
-            DockAnimation::Slide => {
-                height
-                    + (logic::margin(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32
-            }
-            DockAnimation::RiseFade => (12.0 * self.dpi as f32 / 96.0).round() as i32,
-            DockAnimation::Fade | DockAnimation::ScaleFade => 0,
-        };
-        (distance as f32 * self.slide_value()).round() as i32
-    }
-
-    fn animation_scale(&self) -> f32 {
-        if self.animation == DockAnimation::ScaleFade && self.slide.is_some() {
-            1.0 - 0.08 * self.slide_value()
-        } else {
-            1.0
-        }
-    }
-
-    fn set_slide_alpha(&mut self, alpha: u8) {
-        let layered = alpha < 255;
+    fn finish_slide(&mut self) {
+        self.slide_motion.settle();
+        self.slide = None;
         unsafe {
-            if self.layered != layered {
-                let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
-                let flag = WS_EX_LAYERED.0 as isize;
-                SetWindowLongPtrW(
-                    self.hwnd,
-                    GWL_EXSTYLE,
-                    if layered { style | flag } else { style & !flag },
-                );
-                self.layered = layered;
-                if !layered {
+            let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
+            if !self.revealed {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+        let _ = self.update_slide_geometry(1.);
+        let _ = self.set_slide_alpha(255);
+    }
+
+    fn slide_frame(&self, progress: f32) -> SlideFrame {
+        let scale = logic::layout_scale(self.app_icon_size);
+        let dpi_scale = self.dpi as f32 / 96.;
+        SlideFrame::new(
+            self.animation,
+            (logic::height(scale) * dpi_scale).round() as i32,
+            (logic::margin(scale) * dpi_scale).round() as i32,
+            dpi_scale,
+            progress,
+        )
+    }
+
+    fn set_dock_layered(&self, layered: bool) -> Result<()> {
+        unsafe {
+            let style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            let flag = WS_EX_LAYERED.0 as isize;
+            let next = if layered { style | flag } else { style & !flag };
+            if next != style {
+                SetLastError(WIN32_ERROR(0));
+                if SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, next) == 0 && GetLastError() != WIN32_ERROR(0) {
+                    return Err(Error::from_thread());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_slide_alpha(&mut self, alpha: u8) -> Result<()> {
+        if alpha == self.slide_alpha {
+            return Ok(());
+        }
+        if self.gradient.is_some() {
+            if !self.renderer.present_cached_dock(self.hwnd, self.dpi, alpha)? {
+                unsafe {
                     let _ = InvalidateRect(Some(self.hwnd), None, false);
                 }
             }
-            if self.layered {
-                let _ = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA);
+        } else {
+            if (self.slide_alpha < 255) != (alpha < 255) {
+                self.set_dock_layered(alpha < 255)?;
+            }
+            unsafe {
+                if alpha < 255 {
+                    if let Err(error) = SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA) {
+                        let _ = self.set_dock_layered(false);
+                        return Err(error);
+                    }
+                } else {
+                    let _ = InvalidateRect(Some(self.hwnd), None, false);
+                }
             }
         }
+        self.slide_alpha = alpha;
+        Ok(())
     }
 
-    fn apply_slide(&mut self) {
-        let height = (logic::height(logic::layout_scale(self.app_icon_size)) * self.dpi as f32 / 96.0).round() as i32;
-        let factor = self.animation_scale();
-        let width = (self.width as f32 * factor).round() as i32;
-        let scaled_height = (height as f32 * factor).round() as i32;
-        let x = self.left + (self.width - width) / 2;
-        let y = self.top + self.slide_offset(height) + height - scaled_height;
+    fn update_dock_clip(&mut self, width: i32, height: i32, radius: i32, top: i32) -> Result<()> {
+        let clip = (width, height, radius, top);
+        if self.window_clip == Some(clip) {
+            return Ok(());
+        }
         unsafe {
-            let mut rect = RECT::default();
-            if width > 0
-                && height > 0
-                && GetWindowRect(self.hwnd, &mut rect).is_ok()
-                && (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top) != (x, y, width, scaled_height)
-            {
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    x,
-                    y,
-                    width,
-                    scaled_height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                self.publish_rects();
+            let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius);
+            if region.is_invalid() {
+                return Err(Error::from_thread());
+            }
+            if top > 0 {
+                let viewport = CreateRectRgn(0, top, width + 1, height + 1);
+                let combined = !viewport.is_invalid()
+                    && CombineRgn(Some(region), Some(region), Some(viewport), RGN_AND).0 != ERROR;
+                if !viewport.is_invalid() {
+                    let _ = DeleteObject(viewport.into());
+                }
+                if !combined {
+                    let _ = DeleteObject(region.into());
+                    return Err(Error::from_thread());
+                }
+            }
+            let redraw = self.gradient.is_none()
+                && IsWindowVisible(self.hwnd).as_bool()
+                && self
+                    .window_clip
+                    .is_some_and(|(_, _, _, previous_top)| previous_top > top);
+            if SetWindowRgn(self.hwnd, Some(region), redraw) == 0 {
+                let _ = DeleteObject(region.into());
+                return Err(Error::from_thread());
             }
         }
-        let alpha = if self.animation == DockAnimation::Slide {
-            255
-        } else {
-            ((1.0 - self.slide_value()) * 255.0).round() as u8
+        self.window_clip = Some(clip);
+        Ok(())
+    }
+
+    fn update_slide_geometry(&mut self, progress: f32) -> Result<()> {
+        if self.width <= 0 || self.suspended {
+            return Ok(());
+        }
+        let frame = self.slide_frame(progress);
+        let width = (self.width as f32 * frame.scale).round() as i32;
+        let height = (frame.height as f32 * frame.scale).round() as i32;
+        let x = self.left + (self.width - width) / 2;
+        let y = self.top + frame.offset + frame.height - height;
+        let rect = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
         };
-        self.set_slide_alpha(alpha);
+        let radius =
+            (16. * logic::layout_scale(self.app_icon_size) * self.dpi as f32 / 96. * frame.scale).round() as i32;
+        let scale_changed = self.presented_scale != frame.scale;
+        if self.window_rect != Some(rect) {
+            unsafe {
+                SetWindowPos(self.hwnd, None, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE)?;
+            }
+            self.window_rect = Some(rect);
+            self.presented_scale = frame.scale;
+            self.publish_rects();
+        }
+        self.update_dock_clip(width, height, radius, frame.clip_top)?;
+        self.presented_scale = frame.scale;
+        if scale_changed {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_slide(&mut self, progress: f32) {
+        if self
+            .update_slide_geometry(progress)
+            .and_then(|()| self.set_slide_alpha(self.slide_frame(progress).alpha))
+            .is_err()
+        {
+            self.finish_slide();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
     }
 
     fn step_slide(&mut self) {
@@ -1936,19 +2150,10 @@ impl State {
         let tick = Instant::now();
         let elapsed = self.slide.map_or(0.0, |s| s.elapsed().as_secs_f64() * 1000.0);
         let sampled = self.sampled_slide();
-        let finished = !sampled.active();
-        if finished {
-            self.slide = None;
-        }
-        self.apply_slide();
-        if finished {
-            unsafe {
-                let _ = KillTimer(Some(self.hwnd), SLIDE_TIMER);
-                if !self.revealed {
-                    let _ = ShowWindow(self.hwnd, SW_HIDE);
-                    self.set_slide_alpha(255);
-                }
-            }
+        if sampled.active() {
+            self.apply_slide(sampled.value);
+        } else {
+            self.finish_slide();
         }
         if crate::util::perf::hook_on("WISP_FRAME_TIMING") {
             std::eprintln!(
@@ -2087,6 +2292,7 @@ impl State {
             // Move first, then query the window's new monitor DPI. Skipped on the
             // same monitor, where the jump would show.
             if MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONULL) != monitor {
+                self.window_rect = None;
                 let _ = SetWindowPos(
                     self.hwnd,
                     Some(HWND_TOPMOST),
@@ -2136,24 +2342,24 @@ impl State {
             self.scroll = self.scroll.min(self.items.len().saturating_sub(self.capacity));
             let running = self.count();
             let width = (logic::total_width_scaled(running, &parts, layout_scale) * scale).ceil() as i32;
-            let height = (logic::height(layout_scale) * scale).round() as i32;
             let x = info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width) / 2;
             self.top = logic::resting_top(info.rcMonitor.bottom, self.dpi, self.app_icon_size);
             self.left = x;
             self.width = width;
-            let factor = self.animation_scale();
-            let scaled_width = (width as f32 * factor).round() as i32;
-            let scaled_height = (height as f32 * factor).round() as i32;
-            let y = self.top + self.slide_offset(height) + height - scaled_height;
-            crate::theme::shape(self.hwnd, width, height, 8.0 * layout_scale, self.dpi);
+            let progress = self.slide.map_or(1., |_| self.sampled_slide().value);
+            if self.update_slide_geometry(progress).is_err() {
+                self.finish_slide();
+            }
+            // Refresh Z-order independently of motion; active native menus can
+            // temporarily own the dock order.
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
-                x + (width - scaled_width) / 2,
-                y,
-                scaled_width,
-                scaled_height,
-                SWP_NOACTIVATE | order,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | order,
             );
         }
         if previous != (self.dpi, self.left, self.top, self.width, self.scroll, self.capacity) {
@@ -2194,48 +2400,41 @@ impl State {
 
     /// A part's rectangle on screen where the dock rests, in physical pixels.
     fn part_rect(&self, part: logic::Part) -> Option<RECT> {
-        let scale = self.dpi as f32 / 96.0;
-        let running = self.count();
-        let left = logic::part_left_scaled(part, running, &self.parts(), logic::layout_scale(self.app_icon_size))?;
-        let px = |dip: f32| (dip * scale).round() as i32;
-        let rect = self.surface_rect;
-        let x = |dip| match rect {
-            Some(rect) => {
-                rect.left + (px(dip) as f32 * (rect.right - rect.left) as f32 / self.width.max(1) as f32).round() as i32
-            }
-            None => self.left + px(dip),
-        };
         let layout_scale = logic::layout_scale(self.app_icon_size);
-        let height = logic::height(layout_scale);
-        let top = rect.map_or(self.top + self.slide_offset(px(height)), |r| r.bottom - px(height));
-        Some(RECT {
-            left: x(left),
-            top,
-            right: x(left + part.width_scaled(layout_scale)),
-            bottom: top + px(height),
-        })
+        let left = logic::part_left_scaled(part, self.count(), &self.parts(), layout_scale)?;
+        Some(self.slot_rect(left, part.width_scaled(layout_scale)))
     }
 
-    /// An app slot's rectangle on screen where the dock rests, in physical pixels.
+    /// An app slot's rectangle on screen, in physical pixels.
     fn item_rect(&self, slot: usize) -> RECT {
-        let scale = self.dpi as f32 / 96.0;
-        let px = |dip: f32| (dip * scale).round() as i32;
-        let rect = self.surface_rect;
-        let x = |dip| match rect {
-            Some(rect) => {
-                rect.left + (px(dip) as f32 * (rect.right - rect.left) as f32 / self.width.max(1) as f32).round() as i32
-            }
-            None => self.left + px(dip),
-        };
         let layout_scale = logic::layout_scale(self.app_icon_size);
-        let height = logic::height(layout_scale);
-        let left = logic::left_scaled(slot, layout_scale);
-        let top = rect.map_or(self.top + self.slide_offset(px(height)), |r| r.bottom - px(height));
+        self.slot_rect(logic::left_scaled(slot, layout_scale), logic::slot(layout_scale))
+    }
+
+    fn slot_rect(&self, left: f32, width: f32) -> RECT {
+        let dpi_scale = self.dpi as f32 / 96.;
+        let height = logic::height(logic::layout_scale(self.app_icon_size));
+        let (x, top, scale_x, scale_y) = if let Some(rect) = self.surface_rect {
+            (
+                rect.left,
+                rect.bottom - (height * dpi_scale).round() as i32,
+                (rect.right - rect.left) as f32 / self.width.max(1) as f32,
+                1.,
+            )
+        } else {
+            let rect = self.window_rect.unwrap_or(RECT {
+                left: self.left,
+                top: self.top,
+                ..Default::default()
+            });
+            (rect.left, rect.top, self.presented_scale, self.presented_scale)
+        };
+        let px = |dip: f32, scale: f32| (dip * dpi_scale * scale).round() as i32;
         RECT {
-            left: x(left),
+            left: x + px(left, scale_x),
             top,
-            right: x(left + logic::slot(layout_scale)),
-            bottom: top + px(height),
+            right: x + px(left + width, scale_x),
+            bottom: top + px(height, scale_y),
         }
     }
 
@@ -3107,7 +3306,7 @@ impl State {
     }
 
     fn hit(&self, lp: LPARAM) -> Option<usize> {
-        let scale = self.dpi as f32 / 96.0 * self.animation_scale();
+        let scale = self.dpi as f32 / 96.0 * self.presented_scale;
         let running = self.count();
         logic::hit_scaled(
             (lp.0 as i16) as f32 / scale,
@@ -3118,7 +3317,7 @@ impl State {
     }
 
     fn hit_part(&self, lp: LPARAM) -> Option<logic::Part> {
-        let scale = self.dpi as f32 / 96.0 * self.animation_scale();
+        let scale = self.dpi as f32 / 96.0 * self.presented_scale;
         let running = self.count();
         logic::part_hit_scaled(
             (lp.0 as i16) as f32 / scale,
@@ -3301,7 +3500,7 @@ impl State {
         Some(render::DragFrame {
             from,
             to: self.drop_target(&press.id, pointer).map(|(slot, _)| slot),
-            offset: (mouse_point(pointer).x - press.start.x) as f32 / (self.dpi as f32 / 96. * self.animation_scale()),
+            offset: (mouse_point(pointer).x - press.start.x) as f32 / (self.dpi as f32 / 96. * self.presented_scale),
         })
     }
 
@@ -4466,6 +4665,58 @@ unsafe extern "system" fn window_event(
 }
 
 #[cfg(test)]
+mod slide_frame_tests {
+    use super::*;
+
+    #[test]
+    fn soft_presets_settle_at_identical_geometry_and_full_opacity() {
+        for animation in [
+            DockAnimation::SoftRise,
+            DockAnimation::BottomReveal,
+            DockAnimation::SoftScale,
+        ] {
+            let opened = SlideFrame::new(animation, 78, 4, 1.5, 1.);
+            assert_eq!(
+                (opened.offset, opened.scale, opened.clip_top, opened.alpha),
+                (0, 1., 0, 255)
+            );
+        }
+        let rise = SlideFrame::new(DockAnimation::SoftRise, 78, 4, 1.5, 0.);
+        assert_eq!((rise.offset, rise.scale, rise.alpha), (9, 1., 0));
+        let scale = SlideFrame::new(DockAnimation::SoftScale, 78, 4, 1.5, 0.);
+        assert_eq!((scale.offset, scale.scale, scale.alpha), (0, 0.98, 0));
+    }
+
+    #[test]
+    fn bottom_reveal_only_clips_stationary_slots_after_reversal() {
+        let mut motion = crate::animation::Motion::at(0.);
+        motion.retarget_duration(true, 180);
+        motion.tick(0.045);
+        let frame = |value| SlideFrame::new(DockAnimation::BottomReveal, 52, 3, 1., value);
+        let opening = frame(motion.value);
+        motion.retarget_duration(false, 140);
+        let reversing = frame(motion.value);
+        assert_eq!((reversing.offset, reversing.scale, reversing.alpha), (0, 1., 255));
+        assert_eq!(reversing.clip_top, opening.clip_top);
+        assert!((1..52).contains(&reversing.clip_top));
+        motion.tick(0.3);
+        assert_eq!(frame(motion.value).clip_top, 52);
+        motion.retarget_duration(true, 0);
+        assert_eq!(frame(motion.value).clip_top, 0);
+    }
+
+    #[test]
+    fn dark_gradient_presets_use_light_dock_text_independent_of_system_theme() {
+        let gradient = Gradient::default();
+        assert!(gradient_uses_light_text(gradient));
+        assert!(!gradient_uses_light_text(Gradient::preset(
+            [238, 240, 255],
+            [213, 228, 245]
+        )));
+    }
+}
+
+#[cfg(test)]
 mod material_message_tests {
     use super::*;
     #[test]
@@ -4552,7 +4803,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         {
             match msg {
                 WM_SETTINGCHANGE | WM_POWERBROADCAST | WM_THEMECHANGED => {
-                    let dark = s.palette.text.r > 0.5;
+                    let dark = s.dark;
                     let backdrop = s.backdrop;
                     let color = s.backdrop_color.clone();
                     let options = s.material_options;
@@ -4812,7 +5063,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 WM_PAINT => {
                     let mut paint = PAINTSTRUCT::default();
                     let _ = BeginPaint(hwnd, &mut paint);
-                    if let Err(error) = s.paint(None) {
+                    if let Err(error) = s.paint_window() {
                         eprintln!("Dock paint: {error}");
                     }
                     let _ = EndPaint(hwnd, &paint);

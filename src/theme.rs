@@ -156,7 +156,7 @@ pub fn apply_topbar(hwnd: windows::Win32::Foundation::HWND, opacity: u32, _islan
 
 /// ULW owns the complete visible shape. Native materials, frame, corners and
 /// shadows must not draw a second rectangular surface behind its ARGB pixels.
-fn prepare_layered(hwnd: windows::Win32::Foundation::HWND) {
+pub(crate) fn prepare_layered(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::{Graphics::Dwm::*, Graphics::Gdi::SetWindowRgn, UI::Controls::MARGINS};
     let policy = layered_policy();
     unsafe {
@@ -181,6 +181,14 @@ fn layered_policy() -> LayeredPolicy {
         system_backdrop: DWMSBT_NONE.0,
         nonclient: DWMNCRP_DISABLED.0,
         accent: 0,
+    }
+}
+
+pub(crate) fn restore_native_nonclient(hwnd: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Dwm::*;
+    let policy = DWMNCRP_USEWINDOWSTYLE.0;
+    unsafe {
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY, (&raw const policy).cast(), 4);
     }
 }
 
@@ -269,7 +277,7 @@ pub fn apply_layered_surface(
     material_palette(dark, backdrop, color, island_blur_available(), false, options)
 }
 
-fn high_contrast() -> bool {
+pub(crate) fn high_contrast() -> bool {
     use windows::Win32::UI::{Accessibility::*, WindowsAndMessaging::*};
     let mut value = HIGHCONTRASTW {
         cbSize: size_of::<HIGHCONTRASTW>() as u32,
@@ -582,12 +590,21 @@ pub fn paint_background(
     palette: &Palette,
     radius: f32,
 ) {
+    unsafe { rt.Clear(Some(&palette.background)) };
+    paint_background_border(rt, brush, palette, radius);
+}
+
+pub(crate) fn paint_background_border(
+    rt: &windows::Win32::Graphics::Direct2D::ID2D1RenderTarget,
+    brush: &windows::Win32::Graphics::Direct2D::ID2D1SolidColorBrush,
+    palette: &Palette,
+    radius: f32,
+) {
     let size = unsafe { rt.GetSize() };
     let (width, height) = (size.width, size.height);
     use windows::Win32::Graphics::Direct2D::Common::*;
     use windows::Win32::Graphics::Direct2D::D2D1_ROUNDED_RECT;
     unsafe {
-        rt.Clear(Some(&palette.background));
         let (mut dpi, mut dpi_y) = (96.0, 96.0);
         rt.GetDpi(&mut dpi, &mut dpi_y);
         let pixel = 96.0 / dpi;

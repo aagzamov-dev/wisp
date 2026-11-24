@@ -2,6 +2,15 @@
 
 User-facing changes in each release. Each release on GitHub lists these notes and its pull requests.
 
+## Unreleased
+
+## 0.7.0 - 2026-11-24
+
+- Add Soft Rise, Bottom Reveal and Soft Scale dock animations.
+- Add a dock-only gradient with four built-in themes, editable colors, direction and transparency, a live Settings preview and saved custom themes.
+- Reuse the calendar grid when focus or selection moves within the displayed month, and skip redraws when wheel scrolling reaches a limit.
+- Show four audio-reactive bars in the top-bar island, tinted with the cover art when readable, and show the track title for five seconds when a track appears or changes.
+
 ## 0.6.0 - 2026-11-23
 
 - Check for and install stable Wisp updates from **Settings → About**. Optional automatic updates are off by default.
