@@ -57,9 +57,6 @@ jobs:
       - name: Package
         shell: pwsh
         run: ./scripts/package-release.ps1
-      - name: Test packages
-        shell: pwsh
-        run: ./scripts/test-installer.ps1
       - uses: actions/upload-artifact@v4
         id: upload
         with:
@@ -67,8 +64,27 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  publish:
+  installer:
     needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Test packages
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
+
+  publish:
+    needs: [build, installer]
     runs-on: windows-latest
     permissions:
       contents: write

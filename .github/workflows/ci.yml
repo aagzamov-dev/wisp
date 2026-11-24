@@ -10,6 +10,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,12 +30,28 @@ jobs:
       - name: Package
         shell: pwsh
         run: ./scripts/package-release.ps1
-      - name: Test packages
-        shell: pwsh
-        run: ./scripts/test-installer.ps1
       - uses: actions/upload-artifact@v4
+        id: upload
         with:
           name: wisp-candidate-${{ github.run_attempt }}
           path: dist/
           if-no-files-found: error
           retention-days: 7
+
+  installer:
+    needs: check
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.check.outputs.artifact-id }}
+          merge-multiple: true
+          path: dist
+      - name: Test packages
+        shell: pwsh
+        run: ./scripts/test-installer.ps1
