@@ -31,7 +31,9 @@ function Get-WispRegistration {
 }
 
 function Get-WispAutorun {
-    Get-ItemPropertyValue -LiteralPath $runKey -Name Wisp -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $runKey) {
+        (Get-Item -LiteralPath $runKey).GetValue('Wisp')
+    }
 }
 
 foreach ($path in (@($install, $data) + @($links.Values))) {
@@ -161,8 +163,11 @@ Invoke-Installer $setup upgrade
 $uninstaller = Assert-Installed
 Assert-DataPreserved
 if ((Get-WispAutorun) -ne $runValue) { throw 'Upgrade changed Start with Windows' }
+Write-Host 'v0.7.0 upgrade passed'
 
+Write-Host 'Checking uninstall after upgrade'
 Invoke-Installer $uninstaller upgrade-uninstall
 Assert-Uninstalled
 Assert-DataPreserved
 if (Get-WispAutorun) { throw 'Uninstall left Start with Windows pointing to the removed launcher' }
+Write-Host 'Uninstall after upgrade passed'
